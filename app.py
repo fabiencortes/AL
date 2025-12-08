@@ -1156,7 +1156,7 @@ def render_tab_quick_day_mobile():
     df = get_planning(
         start_date=sel_date,
         end_date=sel_date,
-        chauffeur=None,
+        chauffeur=None,      # on prend TOUT le monde
         type_filter=None,
         search="",
         max_rows=2000,
@@ -1166,64 +1166,28 @@ def render_tab_quick_day_mobile():
         st.info("Aucune navette pour cette journée.")
         return
 
-    chs = get_chauffeurs()
-    if not chs:
-        chs = CH_CODES
+    df = df.copy()
+    cols = df.columns
 
-    # Tri par heure
-    if "HEURE" in df.columns:
-        def _key_time(v):
-            txt = normalize_time_string(v)
-            try:
-                return datetime.strptime(txt, "%H:%M").time()
-            except Exception:
-                return datetime.min.time()
+    # ==========================
+    #   Préparation des colonnes
+    # ==========================
 
-        df = df.copy()
-        df["_sort_time"] = df["HEURE"].apply(_key_time)
-        if "DATE" in df.columns:
-            sort_cols = ["DATE", "_sort_time"]
-            if "id" in df.columns:
-                sort_cols.append("id")
-            df = df.sort_values(by=sort_cols)
-        else:
-            df = df.sort_values(by=["_sort_time"])
+    # CH au propre
+    df["CH_STR"] = df.get("CH", "").astype(str).str.strip()
 
-    st.caption("Vue pensée pour ton GSM : un bloc par navette, change le chauffeur et clique sur 💾.")
+    # Heure pour tri
+    def _key_time(v):
+        txt = normalize_time_string(v)
+        try:
+            return datetime.strptime(txt, "%H:%M").time()
+        except Exception:
+            return datetime.min.time()
 
-    for _, row in df.iterrows():
-        rid = int(row.get("id", 0) or 0)
-        if not rid:
-            continue
+    df["_sort_time"] = df.get("HEURE", "").apply(_key_time)
 
-        # Valeurs de base
-        d_val = row.get("DATE", "")
-        if isinstance(d_val, (datetime, date)):
-            d_txt = d_val.strftime("%d/%m/%Y")
-        else:
-            d_txt = str(d_val or "").strip()
-
-        h_txt = normalize_time_string(row.get("HEURE", "")) or "??:??"
-        ch_original = str(row.get("CH", "") or "").strip()
-        nom_client = str(row.get("NOM", "") or "").strip()
-        adr = str(row.get("ADRESSE", "") or "").strip()
-        cp = str(row.get("CP", "") or "").strip()
-        loc = str(row.get("Localité", "") or row.get("LOCALITE", "") or "").strip()
-        adr_full = " ".join(x for x in [adr, cp, loc] if x)
-
-        # Sens DE / VERS et aéroport / origine
-        sens = str(row.get("DESIGNATION", "") or "").strip()  # souvent "DE" ou "VERS"
-        origine = str(row.get("Origine", "") or row.get("ORIGINE", "") or "").strip()
-        aeroport = str(
-            row.get("DESTINATION", "")
-            or row.get("DEST", "")
-            or row.get("H South", "")
-            or ""
-        ).strip()
-
-        cols = df.columns
-
-        # Même logique que dans Vue Chauffeur : DESIGNATION + Unnamed: 8
+    # DEST_FULL comme dans la vue chauffeur : "DE/VERS ..." + route
+    def compute_dest_full(row):
         designation = str(row.get("DESIGNATION", "") or "").strip()
         route_text = ""
         for cand in ["Unnamed: 8", "DESIGNATION"]:
@@ -1232,9 +1196,97 @@ def render_tab_quick_day_mobile():
                 break
 
         if route_text and designation and designation not in route_text:
-            dest_full = f"{route_text} ({designation})"
+            return f"{route_text} ({designation})"
         else:
-            dest_full = route_text or designation or ""
+            return route_text or designation or ""
+
+    df["DEST_FULL"] = df.apply(compute_dest_full, axis=1)
+
+    # Sens DE / VERS / AUTRE (pour le tri)
+    def compute_sens(row):
+        designation = str(row.get("DESIGNATION", "") or "").strip().upper()
+        if designation.startswith("DE"):
+            return "DE"
+        if designation.startswith("VERS"):
+            return "VERS"
+        return "AUTRE"
+
+    df["SENS"] = df.apply(compute_sens, axis=1)
+
+    # ==========================
+    #   Contrôles de tri
+    # ==========================
+
+    chs = get_chauffeurs()
+    if not chs:
+        chs = CH_CODES
+
+    col_tri1, col_tri2 = st.columns(2)
+    with col_tri1:
+        sort_by = st.selectbox(
+            "Trier par",
+            ["Heure", "Chauffeur", "Destination", "DE / VERS"],
+            key="quick_sort",
+        )
+    with col_tri2:
+        # plus tard, on pourra ajouter un tri asc/desc si tu veux
+        pass
+
+    # Application du tri
+    if sort_by == "Heure":
+        sort_cols = []
+        if "DATE" in df.columns:
+            sort_cols.append("DATE")
+        sort_cols.append("_sort_time")
+        if "CH_STR" in df.columns:
+            sort_cols.append("CH_STR")
+        if "id" in df.columns:
+            sort_cols.append("id")
+        df = df.sort_values(by=sort_cols)
+    elif sort_by == "Chauffeur":
+        sort_cols = ["CH_STR", "_sort_time"]
+        if "id" in df.columns:
+            sort_cols.append("id")
+        df = df.sort_values(by=sort_cols)
+    elif sort_by == "Destination":
+        sort_cols = ["DEST_FULL", "_sort_time"]
+        if "id" in df.columns:
+            sort_cols.append("id")
+        df = df.sort_values(by=sort_cols)
+    elif sort_by == "DE / VERS":
+        sort_cols = ["SENS", "_sort_time"]
+        if "id" in df.columns:
+            sort_cols.append("id")
+        df = df.sort_values(by=sort_cols)
+
+    st.caption("Vue pensée pour ton GSM : un bloc par navette, triable par chauffeur / destination / DE-VERS.")
+
+    # ==========================
+    #   Affichage des navettes
+    # ==========================
+
+    for _, row in df.iterrows():
+        rid = int(row.get("id", 0) or 0)
+        if not rid:
+            continue
+
+        # Date + heure
+        d_val = row.get("DATE", "")
+        if isinstance(d_val, (datetime, date)):
+            d_txt = d_val.strftime("%d/%m/%Y")
+        else:
+            d_txt = str(d_val or "").strip()
+
+        h_txt = normalize_time_string(row.get("HEURE", "")) or "??:??"
+
+        ch_original = str(row.get("CH", "") or "").strip()
+        nom_client = str(row.get("NOM", "") or "").strip()
+        adr = str(row.get("ADRESSE", "") or "").strip()
+        cp = str(row.get("CP", "") or "").strip()
+        loc = str(row.get("Localité", "") or row.get("LOCALITE", "") or "").strip()
+        adr_full = " ".join(x for x in [adr, cp, loc] if x)
+
+        dest_full = str(row.get("DEST_FULL", "") or "").strip()
 
         pax = row.get("PAX", "")
         try:
@@ -1246,10 +1298,10 @@ def render_tab_quick_day_mobile():
         groupage = str(row.get("GROUPAGE", "") or "").strip()
         partage = str(row.get("PARTAGE", "") or "").strip()
 
-        # Chauffeur courant affiché = valeur du select si déjà modifiée
+        # Valeur actuelle du select (si déjà modifiée dans la session)
         ch_current_value = st.session_state.get(f"quick_ch_{rid}", ch_original or "")
 
-        # HEADER : Heure – CH – PAX – DE/VERS ...
+        # HEADER : Heure – CH – PAX – DE/VERS ... (DEST_FULL)
         header = f"**{h_txt}**"
         if ch_current_value:
             header += f" — CH **{ch_current_value}**"
@@ -1257,8 +1309,6 @@ def render_tab_quick_day_mobile():
             header += f" — {pax_txt} pax"
         if dest_full:
             header += f" — {dest_full}"
-
-
 
         with st.container():
             st.markdown(header)
@@ -1272,7 +1322,7 @@ def render_tab_quick_day_mobile():
             if line2_parts:
                 st.markdown("  \n".join(line2_parts))
 
-            # Ligne 3 : infos GO / groupage / partage
+            # Ligne 3 : GO / groupage / partagée
             info_badges = []
             if go:
                 info_badges.append(f"🧾 GO : {go}")
@@ -1287,7 +1337,6 @@ def render_tab_quick_day_mobile():
             col_ch, col_btn1, col_btn2 = st.columns([3, 1, 2])
 
             with col_ch:
-                # Select chauffeur compact
                 try:
                     idx = chs.index(ch_current_value) if ch_current_value in chs else (
                         chs.index(ch_original) if ch_original in chs else 0
@@ -1308,11 +1357,10 @@ def render_tab_quick_day_mobile():
                 if st.button("💾", key=f"quick_save_{rid}"):
                     ch_new_clean = str(ch_new or "").strip()
                     if ch_new_clean and ch_new_clean != ch_original:
-                        # Mise à jour DB
                         update_planning_row(rid, {"CH": ch_new_clean})
                         st.success("Chauffeur mis à jour.")
 
-                        # Notification WhatsApp au chauffeur (si n° dispo)
+                        # Option : notification WhatsApp chauffeur (si tu as déjà le helper)
                         tel_ch, _ = get_chauffeur_contact(ch_new_clean)
                         if tel_ch:
                             msg = build_chauffeur_change_message(row, ch_new_clean)
@@ -1320,20 +1368,25 @@ def render_tab_quick_day_mobile():
                             st.markdown(f"[📲 Prévenir {ch_new_clean} sur WhatsApp]({wa_url})")
 
             with col_btn2:
-                # Accès rapide Waze / WhatsApp client
+                # Waze + WhatsApp client
                 client_phone = get_client_phone_from_row(row)
                 actions = []
                 if adr_full:
                     waze_url = build_waze_link(adr_full)
                     actions.append(f"[🧭 Waze]({waze_url})")
                 if client_phone:
-                    msg_client = build_client_sms_from_driver(row, ch_current_value or ch_original, "")
+                    msg_client = build_client_sms_from_driver(
+                        row,
+                        ch_current_value or ch_original,
+                        "",
+                    )
                     wa_client_url = build_whatsapp_link(client_phone, msg_client)
                     actions.append(f"[💬 Client]({wa_client_url})")
                 if actions:
                     st.markdown("  \n".join(actions))
 
         st.markdown("---")
+
 
 
 # ============================================================
@@ -3098,3 +3151,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
