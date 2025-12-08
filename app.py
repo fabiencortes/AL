@@ -1211,12 +1211,25 @@ def render_tab_quick_day_mobile():
         loc = str(row.get("Localité", "") or row.get("LOCALITE", "") or "").strip()
         adr_full = " ".join(x for x in [adr, cp, loc] if x)
 
-        dest = str(
-            row.get("DESIGNATION", "")
-            or row.get("DESINATION", "")
-            or row.get("DESTINATION", "")
+        # Sens DE / VERS et aéroport / origine
+        sens = str(row.get("DESIGNATION", "") or "").strip()  # souvent "DE" ou "VERS"
+        origine = str(row.get("Origine", "") or row.get("ORIGINE", "") or "").strip()
+        aeroport = str(
+            row.get("DESTINATION", "")
+            or row.get("DEST", "")
+            or row.get("H South", "")
             or ""
         ).strip()
+
+        # Texte "DE ...", "VERS ..." comme dans les autres vues
+        if sens.upper().startswith("DE") and aeroport:
+            sens_txt = f"DE {aeroport}"
+        elif sens.upper().startswith("VERS") and aeroport:
+            sens_txt = f"VERS {aeroport}"
+        elif sens and aeroport:
+            sens_txt = f"{sens} {aeroport}"
+        else:
+            sens_txt = sens or aeroport
 
         pax = row.get("PAX", "")
         try:
@@ -1231,13 +1244,15 @@ def render_tab_quick_day_mobile():
         # Chauffeur courant affiché = valeur du select si déjà modifiée
         ch_current_value = st.session_state.get(f"quick_ch_{rid}", ch_original or "")
 
+        # HEADER : Heure – CH – PAX – DE/VERS ...
         header = f"**{h_txt}**"
         if ch_current_value:
             header += f" — CH **{ch_current_value}**"
         if pax_txt:
             header += f" — {pax_txt} pax"
-        if dest:
-            header += f" → {dest}"
+        if sens_txt:
+            header += f" — {sens_txt}"
+
 
         with st.container():
             st.markdown(header)
