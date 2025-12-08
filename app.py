@@ -1153,17 +1153,36 @@ def render_tab_quick_day_mobile():
         key="quick_day_date",
     )
 
+    # ------------------------
+    #  Filtre chauffeur (DO -> DO, DO*, DOFA, ...)
+    # ------------------------
+    chs_all = get_chauffeurs()
+    if not chs_all:
+        chs_all = CH_CODES
+
+    ch_filter = st.selectbox(
+        "Chauffeur (filtre)",
+        ["(Tous)"] + chs_all,
+        key="quick_day_ch_filter",
+    )
+
+    if ch_filter == "(Tous)":
+        chauffeur_arg = None
+    else:
+        chauffeur_arg = ch_filter
+
+    # Chargement du planning avec la logique chauffeur existante
     df = get_planning(
         start_date=sel_date,
         end_date=sel_date,
-        chauffeur=None,      # on prend TOUT le monde
+        chauffeur=chauffeur_arg,  # 🔥 ici : DO -> DO, DO*, DOFA, etc.
         type_filter=None,
         search="",
         max_rows=2000,
     )
 
     if df.empty:
-        st.info("Aucune navette pour cette journée.")
+        st.info("Aucune navette pour cette journée (avec ce filtre).")
         return
 
     df = df.copy()
@@ -1172,6 +1191,7 @@ def render_tab_quick_day_mobile():
     # ==========================
     #   Préparation des colonnes
     # ==========================
+
 
     # CH au propre
     df["CH_STR"] = df.get("CH", "").astype(str).str.strip()
@@ -1216,10 +1236,10 @@ def render_tab_quick_day_mobile():
     # ==========================
     #   Contrôles de tri
     # ==========================
+  
+    # On réutilise la même liste pour le select de chauffeur sur chaque navette
+    chs = chs_all
 
-    chs = get_chauffeurs()
-    if not chs:
-        chs = CH_CODES
 
     col_tri1, col_tri2 = st.columns(2)
     with col_tri1:
@@ -3151,4 +3171,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
