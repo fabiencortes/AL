@@ -1221,15 +1221,20 @@ def render_tab_quick_day_mobile():
             or ""
         ).strip()
 
-        # Texte "DE ...", "VERS ..." comme dans les autres vues
-        if sens.upper().startswith("DE") and aeroport:
-            sens_txt = f"DE {aeroport}"
-        elif sens.upper().startswith("VERS") and aeroport:
-            sens_txt = f"VERS {aeroport}"
-        elif sens and aeroport:
-            sens_txt = f"{sens} {aeroport}"
+        cols = df.columns
+
+        # Même logique que dans Vue Chauffeur : DESIGNATION + Unnamed: 8
+        designation = str(row.get("DESIGNATION", "") or "").strip()
+        route_text = ""
+        for cand in ["Unnamed: 8", "DESIGNATION"]:
+            if cand in cols and row.get(cand):
+                route_text = str(row[cand]).strip()
+                break
+
+        if route_text and designation and designation not in route_text:
+            dest_full = f"{route_text} ({designation})"
         else:
-            sens_txt = sens or aeroport
+            dest_full = route_text or designation or ""
 
         pax = row.get("PAX", "")
         try:
@@ -1250,8 +1255,9 @@ def render_tab_quick_day_mobile():
             header += f" — CH **{ch_current_value}**"
         if pax_txt:
             header += f" — {pax_txt} pax"
-        if sens_txt:
-            header += f" — {sens_txt}"
+        if dest_full:
+            header += f" — {dest_full}"
+
 
 
         with st.container():
