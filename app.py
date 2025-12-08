@@ -54,9 +54,9 @@ st.set_page_config(
 # ============================================================
 
 USERS = {
-    "fab":  {"password": "fab",  "role": "admin"},
-    "oli":  {"password": "oli",  "role": "admin"},
-    "leon": {"password": "leon", "role": "restricted"},
+    "fab":  {"password": "AL2025",  "role": "admin"},
+    "oli":  {"password": "AL2025",  "role": "admin"},
+    "leon": {"password": "GL2025", "role": "restricted"},
 
     # Comptes chauffeurs pour GSM
     "gg": {"password": "gg", "role": "driver", "chauffeur_code": "GG"},
@@ -262,6 +262,19 @@ def build_whatsapp_link(phone: str, message: str) -> str:
         return "#"
     return f"https://wa.me/{num}?text={urllib.parse.quote(message)}"
 
+def build_waze_link(address: str) -> str:
+    """Construit un lien Waze vers une adresse texte."""
+    import urllib.parse
+
+    addr = (address or "").strip()
+    if not addr:
+        return "#"
+
+    query = urllib.parse.quote(addr)
+    # Sur GSM, ce lien ouvre directement l'appli Waze si elle est installée
+    return f"https://waze.com/ul?q={query}&navigate=yes"
+
+
 
 def build_mailto_link(to_email: str, subject: str, body: str) -> str:
     import urllib.parse
@@ -398,6 +411,45 @@ def build_client_sms(row: pd.Series, tel_chauffeur: str) -> str:
         f"Votre chauffeur sera {ch_code} (GSM {tel_chauffeur}).\n"
         f"Merci pour votre confiance."
     )
+def build_client_sms_from_driver(row: pd.Series, ch_code: str, tel_chauffeur: str) -> str:
+    """
+    Message WhatsApp envoyé par le chauffeur au client,
+    SANS mentionner l'adresse du point de rendez-vous.
+    """
+
+    # DATE
+    d_val = row.get("DATE", "")
+    if isinstance(d_val, date):
+        d_txt = d_val.strftime("%d/%m/%Y")
+    else:
+        try:
+            d_txt = pd.to_datetime(d_val, dayfirst=True, errors="coerce").strftime("%d/%m/%Y")
+        except Exception:
+            d_txt = str(d_val or "").strip()
+
+    # HEURE
+    heure = normalize_time_string(row.get("HEURE", "")) or "??:??"
+
+    # Nom du client
+    nom_client = str(row.get("NOM", "") or "").strip()
+    if nom_client:
+        bonjour = f"Bonjour {nom_client}, c'est votre chauffeur {ch_code} pour Airports-Lines."
+    else:
+        bonjour = f"Bonjour, c'est votre chauffeur {ch_code} pour Airports-Lines."
+
+    # Message SANS adresse
+    lignes = [
+        bonjour,
+        f"Je serai bien à l'heure prévue le {d_txt} à {heure}.",
+    ]
+
+    if tel_chauffeur:
+        lignes.append(f"Voici mon numéro : {tel_chauffeur}.")
+
+    lignes.append("En cas de problème, n’hésitez pas à me prévenir.")
+
+    return "\n".join(lignes)
+
 def show_client_messages_for_period(df_base: pd.DataFrame, start: date, nb_days: int):
     """
     Prépare et affiche la liste des messages clients (WhatsApp/SMS)
@@ -2197,8 +2249,31 @@ def render_tab_vue_chauffeur(forced_ch=None):
         if remarque:
             bloc_lines.append(f"💬 {remarque}")
 
+        # ================================
+        #   Actions GSM : Waze + WhatsApp
+        # ================================
+        actions = []
+
+        # 1) Lien Waze sur l'adresse
+        if adr_full:
+            waze_url = build_waze_link(adr_full)
+            if waze_url and waze_url != "#":
+                actions.append(f"[🧭 Ouvrir Waze]({waze_url})")
+
+        # 2) WhatsApp vers le client (si on a son numéro + GSM chauffeur)
+        client_phone = get_client_phone_from_row(row)
+        if client_phone and tel_ch:
+            msg_client = build_client_sms_from_driver(row, ch_selected, tel_ch)
+            wa_client_url = build_whatsapp_link(client_phone, msg_client)
+            actions.append(f"[💬 WhatsApp client]({wa_client_url})")
+
+        if actions:
+            bloc_lines.append(" | ".join(actions))
+
+        # Affichage final du bloc
         st.markdown("\n".join(bloc_lines))
         st.markdown("---")
+
 # ======================================================================
 #  ONGLET — Demandes d’indispo côté chauffeur
 # ======================================================================
