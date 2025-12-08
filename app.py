@@ -1142,6 +1142,179 @@ def render_tab_planning():
                     nb_done += 1
                 st.success(f"{nb_done} navette(s) supprimée(s).")
                 st.rerun()
+def render_tab_quick_day_mobile():
+    """Vue compacte de la journée pour dispatch rapide (optimisée GSM)."""
+    st.subheader("⚡ Vue compacte journée (dispatch)")
+
+    today = date.today()
+    sel_date = st.date_input(
+        "Jour à afficher :",
+        value=today,
+        key="quick_day_date",
+    )
+
+    df = get_planning(
+        start_date=sel_date,
+        end_date=sel_date,
+        chauffeur=None,
+        type_filter=None,
+        search="",
+        max_rows=2000,
+    )
+
+    if df.empty:
+        st.info("Aucune navette pour cette journée.")
+        return
+
+    chs = get_chauffeurs()
+    if not chs:
+        chs = CH_CODES
+
+    # Tri par heure
+    if "HEURE" in df.columns:
+        def _key_time(v):
+            txt = normalize_time_string(v)
+            try:
+                return datetime.strptime(txt, "%H:%M").time()
+            except Exception:
+                return datetime.min.time()
+
+        df = df.copy()
+        df["_sort_time"] = df["HEURE"].apply(_key_time)
+        if "DATE" in df.columns:
+            sort_cols = ["DATE", "_sort_time"]
+            if "id" in df.columns:
+                sort_cols.append("id")
+            df = df.sort_values(by=sort_cols)
+        else:
+            df = df.sort_values(by=["_sort_time"])
+
+    st.caption("Vue pensée pour ton GSM : un bloc par navette, change le chauffeur et clique sur 💾.")
+
+    for _, row in df.iterrows():
+        rid = int(row.get("id", 0) or 0)
+        if not rid:
+            continue
+
+        # Valeurs de base
+        d_val = row.get("DATE", "")
+        if isinstance(d_val, (datetime, date)):
+            d_txt = d_val.strftime("%d/%m/%Y")
+        else:
+            d_txt = str(d_val or "").strip()
+
+        h_txt = normalize_time_string(row.get("HEURE", "")) or "??:??"
+        ch_original = str(row.get("CH", "") or "").strip()
+        nom_client = str(row.get("NOM", "") or "").strip()
+        adr = str(row.get("ADRESSE", "") or "").strip()
+        cp = str(row.get("CP", "") or "").strip()
+        loc = str(row.get("Localité", "") or row.get("LOCALITE", "") or "").strip()
+        adr_full = " ".join(x for x in [adr, cp, loc] if x)
+
+        dest = str(
+            row.get("DESIGNATION", "")
+            or row.get("DESINATION", "")
+            or row.get("DESTINATION", "")
+            or ""
+        ).strip()
+
+        pax = row.get("PAX", "")
+        try:
+            pax_txt = str(int(pax)) if pax not in ("", None) else ""
+        except Exception:
+            pax_txt = str(pax or "")
+
+        go = str(row.get("GO", "") or "").strip()
+        groupage = str(row.get("GROUPAGE", "") or "").strip()
+        partage = str(row.get("PARTAGE", "") or "").strip()
+
+        # Chauffeur courant affiché = valeur du select si déjà modifiée
+        ch_current_value = st.session_state.get(f"quick_ch_{rid}", ch_original or "")
+
+        header = f"**{h_txt}**"
+        if ch_current_value:
+            header += f" — CH **{ch_current_value}**"
+        if pax_txt:
+            header += f" — {pax_txt} pax"
+        if dest:
+            header += f" → {dest}"
+
+        with st.container():
+            st.markdown(header)
+
+            # Ligne 2 : client + adresse
+            line2_parts = []
+            if nom_client:
+                line2_parts.append(f"👤 {nom_client}")
+            if adr_full:
+                line2_parts.append(f"📍 {adr_full}")
+            if line2_parts:
+                st.markdown("  \n".join(line2_parts))
+
+            # Ligne 3 : infos GO / groupage / partage
+            info_badges = []
+            if go:
+                info_badges.append(f"🧾 GO : {go}")
+            if groupage not in ("", "0", "0.0"):
+                info_badges.append("👥 Groupage")
+            if partage not in ("", "0", "0.0"):
+                info_badges.append("🔗 Partagée")
+            if info_badges:
+                st.markdown(" | ".join(info_badges))
+
+            # Ligne action : choix chauffeur + boutons
+            col_ch, col_btn1, col_btn2 = st.columns([3, 1, 2])
+
+            with col_ch:
+                # Select chauffeur compact
+                try:
+                    idx = chs.index(ch_current_value) if ch_current_value in chs else (
+                        chs.index(ch_original) if ch_original in chs else 0
+                    )
+                except Exception:
+                    idx = 0
+
+                ch_new = st.selectbox(
+                    "Chauffeur",
+                    chs,
+                    index=idx,
+                    key=f"quick_ch_{rid}",
+                    label_visibility="collapsed",
+                )
+
+            with col_btn1:
+                st.write("")
+                if st.button("💾", key=f"quick_save_{rid}"):
+                    ch_new_clean = str(ch_new or "").strip()
+                    if ch_new_clean and ch_new_clean != ch_original:
+                        # Mise à jour DB
+                        update_planning_row(rid, {"CH": ch_new_clean})
+                        st.success("Chauffeur mis à jour.")
+
+                        # Notification WhatsApp au chauffeur (si n° dispo)
+                        tel_ch, _ = get_chauffeur_contact(ch_new_clean)
+                        if tel_ch:
+                            msg = build_chauffeur_change_message(row, ch_new_clean)
+                            wa_url = build_whatsapp_link(tel_ch, msg)
+                            st.markdown(f"[📲 Prévenir {ch_new_clean} sur WhatsApp]({wa_url})")
+
+            with col_btn2:
+                # Accès rapide Waze / WhatsApp client
+                client_phone = get_client_phone_from_row(row)
+                actions = []
+                if adr_full:
+                    waze_url = build_waze_link(adr_full)
+                    actions.append(f"[🧭 Waze]({waze_url})")
+                if client_phone:
+                    msg_client = build_client_sms_from_driver(row, ch_current_value or ch_original, "")
+                    wa_client_url = build_whatsapp_link(client_phone, msg_client)
+                    actions.append(f"[💬 Client]({wa_client_url})")
+                if actions:
+                    st.markdown("  \n".join(actions))
+
+        st.markdown("---")
+
+
 # ============================================================
 #   ONGLET 📊 TABLEAU / ÉDITION — SÉLECTION + FICHE DÉTAILLÉE
 # ============================================================
@@ -1979,6 +2152,55 @@ def build_chauffeur_new_planning_message(ch: str, from_date: date) -> str:
         f"Merci de te connecter à l'application et de cliquer sur "
         f"« J'ai bien reçu mon planning » pour confirmer. 👍"
     )
+def build_chauffeur_change_message(row: pd.Series, ch_code: str) -> str:
+    """
+    Message WhatsApp envoyé AU CHAUFFEUR quand tu modifies une navette
+    dans la vue compacte.
+    """
+    # Date
+    d_val = row.get("DATE", "")
+    if isinstance(d_val, (datetime, date)):
+        d_txt = d_val.strftime("%d/%m/%Y")
+    else:
+        try:
+            d_txt = pd.to_datetime(d_val, dayfirst=True, errors="coerce").strftime("%d/%m/%Y")
+        except Exception:
+            d_txt = str(d_val or "").strip()
+
+    # Heure
+    h_txt = normalize_time_string(row.get("HEURE", "")) or "??:??"
+
+    nom_client = str(row.get("NOM", "") or "").strip()
+    dest = str(
+        row.get("DESIGNATION", "")
+        or row.get("DESINATION", "")
+        or row.get("DESTINATION", "")
+        or ""
+    ).strip()
+    pax = row.get("PAX", "")
+    try:
+        pax_txt = str(int(pax)) if pax not in ("", None) else ""
+    except Exception:
+        pax_txt = str(pax or "")
+
+    lignes = [
+        f"Bonjour {ch_code},",
+        "Tu as une (nouvelle) navette :",
+        f"- Date : {d_txt}",
+        f"- Heure : {h_txt}",
+    ]
+
+    if nom_client:
+        lignes.append(f"- Client : {nom_client}")
+    if pax_txt:
+        lignes.append(f"- PAX : {pax_txt}")
+    if dest:
+        lignes.append(f"- Destination : {dest}")
+
+    lignes.append("")
+    lignes.append("Merci de confirmer si problème 🙏")
+
+    return "\n".join(lignes)
 
 # ============================================================
 #   ONGLET 🚖 VUE CHAUFFEUR (PC + GSM)
@@ -2756,9 +2978,10 @@ def main():
     # ====================== ADMIN ===========================
     # ====================== ADMIN ===========================
     if role == "admin":
-        tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
+        tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(
             [
                 "📅 Planning",
+                "⚡ Vue jour (mobile)",
                 "📊 Tableau / Édition",
                 "🔍 Clients / Historique",
                 "🚖 Vue Chauffeur",
@@ -2769,33 +2992,36 @@ def main():
                 "🚫 Indispos chauffeurs",
             ]
         )
-
         with tab1:
             render_tab_planning()
 
         with tab2:
-            render_tab_table()
+            render_tab_quick_day_mobile()
 
         with tab3:
-            render_tab_clients()
+            render_tab_table()
 
         with tab4:
-            render_tab_vue_chauffeur()
+            render_tab_clients()
 
         with tab5:
-            render_tab_chauffeurs()
+            render_tab_vue_chauffeur()
 
         with tab6:
-            render_tab_feuil3()
+            render_tab_chauffeurs()
 
         with tab7:
-            render_tab_admin_transferts()
+            render_tab_feuil3()
 
         with tab8:
-            render_tab_excel_sync()
+            render_tab_admin_transferts()
 
         with tab9:
+            render_tab_excel_sync()
+
+        with tab10:
             render_tab_indispo_admin()
+
 
 
     # ==================== RESTRICTED (LEON) =================
