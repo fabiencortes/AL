@@ -8,6 +8,7 @@ import io
 from datetime import datetime, date, timedelta
 from typing import Dict, Any, List
 
+import math
 import smtplib
 from email.mime.text import MIMEText
 import pandas as pd
@@ -67,8 +68,6 @@ USERS = {
     "fa1": {"password": "fa1", "role": "driver", "chauffeur_code": "FA1"},
     "gd": {"password": "gd", "role": "driver", "chauffeur_code": "GD"},
     "om": {"password": "om", "role": "driver", "chauffeur_code": "OM"},
-    "au": {"password": "au", "role": "driver", "chauffeur_code": "AU"},
-    "ad": {"password": "ad", "role": "driver", "chauffeur_code": "AD"},
 }
 
 # Fallback si Feuil2 ne contient rien
@@ -1159,6 +1158,14 @@ def render_tab_table():
 
     df = get_planning(start_date=start_date, end_date=None, max_rows=2000)
 
+    # On mémorise le tableau original pour pouvoir détecter les modifications
+    if (
+        "table_original_df" not in st.session_state
+        or st.session_state.get("table_original_start") != start_date
+    ):
+        st.session_state["table_original_df"] = df.copy()
+        st.session_state["table_original_start"] = start_date
+
     if df.empty:
         st.warning("Aucune navette à partir de cette date.")
         return
@@ -1193,6 +1200,53 @@ def render_tab_table():
         num_rows="fixed",
         key="table_editor",
     )
+
+    # ========= MISE À JOUR DIRECTE DEPUIS LE TABLEAU =========
+
+    # On reconstruit un DataFrame complet avec la colonne id
+    df_edited_full = edited.drop(columns=["_SELECT"]).copy()
+    df_edited_full.insert(0, "id", ids)
+
+    if st.button("💾 Mettre à jour les modifications du tableau"):
+        original = st.session_state.get("table_original_df")
+        if original is None or len(original) != len(df_edited_full):
+            st.error("Impossible de comparer les modifications (recharge la page ou rechoisis la date).")
+        else:
+            # On compare ligne par ligne en texte pour voir ce qui a changé
+            orig_str = original.set_index("id").astype(str)
+            edit_str = df_edited_full.set_index("id").astype(str)
+
+            nb_done = 0
+            for rid in ids:
+                o = orig_str.loc[rid]
+                n = edit_str.loc[rid]
+                if not o.equals(n):
+                    # Cette ligne a été modifiée dans le tableau
+                    row_new = df_edited_full[df_edited_full["id"] == rid].iloc[0].to_dict()
+                    row_new.pop("id", None)
+
+                    # Nettoyage des NaN
+                    clean: Dict[str, Any] = {}
+                    for k, v in row_new.items():
+                        if isinstance(v, float) and math.isnan(v):
+                            clean[k] = ""
+                        else:
+                            clean[k] = v
+
+                    update_planning_row(int(rid), clean)
+                    nb_done += 1
+
+            if nb_done:
+                st.success(f"{nb_done} navette(s) mise(s) à jour depuis le tableau.")
+                st.rerun()
+            else:
+                st.info("Aucun changement détecté dans le tableau.")
+
+    # ========= SÉLECTION POUR LA FICHE DÉTAILLÉE =========
+
+    # Indices cochés
+    selected_indices = edited.index[edited["_SELECT"] == True].tolist()
+
 
     # Indices cochés
     selected_indices = edited.index[edited["_SELECT"] == True].tolist()
@@ -2797,4 +2851,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
