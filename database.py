@@ -703,3 +703,83 @@ def set_chauffeur_last_ack(chauffeur: str, dt: Optional[datetime] = None) -> Non
             (chauffeur.upper(), value),
         )
         conn.commit()
+def init_flight_alerts_table(conn):
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS flight_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            flight_number TEXT NOT NULL,
+            flight_date TEXT NOT NULL,
+            chauffeur TEXT,
+            alerted_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+from datetime import datetime
+
+def has_flight_alert_been_sent(conn, flight_number, flight_date, chauffeur):
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT 1 FROM flight_alerts
+        WHERE flight_number = ?
+          AND flight_date = ?
+          AND chauffeur = ?
+        LIMIT 1
+    """, (flight_number, flight_date, chauffeur))
+    return cur.fetchone() is not None
+
+
+def record_flight_alert(conn, flight_number, flight_date, chauffeur):
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO flight_alerts (flight_number, flight_date, chauffeur, alerted_at)
+        VALUES (?, ?, ?, ?)
+    """, (
+        flight_number,
+        flight_date,
+        chauffeur,
+        datetime.now().isoformat()
+    ))
+    conn.commit()
+def init_flight_alerts_table():
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS flight_alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date_txt TEXT NOT NULL,
+                ch TEXT NOT NULL,
+                vol TEXT NOT NULL,
+                last_status TEXT,
+                last_delay_min INTEGER,
+                notified_at TEXT,
+                UNIQUE(date_txt, ch, vol)
+            )
+        """)
+        conn.commit()
+
+
+def flight_alert_exists(date_txt: str, ch: str, vol: str) -> bool:
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM flight_alerts WHERE date_txt=? AND ch=? AND vol=? LIMIT 1",
+            (date_txt, ch, vol),
+        )
+        return cur.fetchone() is not None
+
+
+def upsert_flight_alert(date_txt: str, ch: str, vol: str, status: str, delay_min: int) -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO flight_alerts(date_txt, ch, vol, last_status, last_delay_min, notified_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(date_txt, ch, vol)
+            DO UPDATE SET
+                last_status=excluded.last_status,
+                last_delay_min=excluded.last_delay_min,
+                notified_at=excluded.notified_at
+        """, (date_txt, ch, vol, status, int(delay_min or 0), now))
+        conn.commit()

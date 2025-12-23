@@ -2,7 +2,7 @@
 #   AIRPORTS LINES – APP.PLANNING – VERSION OPTIMISÉE 2025
 #   BLOC 1/7 : IMPORTS, CONFIG, HELPERS, SESSION
 # ============================================================
-
+DEBUG_SAFE_MODE = True
 import os
 import io
 from datetime import datetime, date, timedelta
@@ -36,9 +36,119 @@ from database import (
     init_chauffeur_ack_table,
     get_chauffeur_last_ack,
     set_chauffeur_last_ack,
+    init_flight_alerts_table,
+
 )
 
 from import_excel_to_db import EXCEL_FILE, import_planning_from_feuil1
+import requests
+def flight_badge(status: str, delay_min: int = 0) -> str:
+    status = (status or "").upper()
+    delay_min = int(delay_min or 0)
+
+    if status == "ON_TIME":
+        return "🟢 À l’heure"
+    if status == "DELAYED":
+        if delay_min >= 30:
+            return f"🔴 Retard {delay_min} min"
+        return f"🟠 Retard {delay_min} min"
+    if status == "CANCELLED":
+        return "🔴 Annulé"
+    if status == "LANDED":
+        return "✅ Atterri"
+    return "⚪ Statut inconnu"
+def extract_vol_val(row, columns):
+    """
+    Extrait le numéro de vol depuis une ligne,
+    robuste aux variantes de nom de colonne.
+    """
+    for col in ["N° Vol", "N° Vol ", "Num Vol", "VOL", "Vol"]:
+        if col in columns:
+            v = str(row.get(col, "") or "").strip()
+            if v:
+                return v
+    return ""
+AVIATIONSTACK_KEY = "e5cb6733f9d69693e880c982795ba27d"
+import requests
+import streamlit as st
+
+@st.cache_data(ttl=900)
+def get_flight_status_cached(flight_number: str):
+    """
+    Retourne TOUJOURS un tuple :
+    (status, delay_min)
+    """
+    if not flight_number:
+        return "", 0
+
+    try:
+        r = requests.get(
+            "http://api.aviationstack.com/v1/flights",
+            params={
+                "access_key": AVIATIONSTACK_KEY,
+                "flight_iata": flight_number
+            },
+            timeout=5
+        )
+        data = r.json()
+
+        if not data.get("data"):
+            return "", 0
+
+        f = data["data"][0]
+        status_raw = (f.get("flight_status") or "").lower()
+
+        # mapping statut
+        if status_raw in ("scheduled", "active"):
+            status = "ON_TIME"
+        elif status_raw == "delayed":
+            status = "DELAYED"
+        elif status_raw == "cancelled":
+            status = "CANCELLED"
+        elif status_raw == "landed":
+            status = "LANDED"
+        else:
+            status = ""
+
+        # calcul du retard (si dispo)
+        delay_min = 0
+        try:
+            sched = f.get("departure", {}).get("scheduled")
+            est = f.get("departure", {}).get("estimated")
+            if sched and est:
+                dt_sched = pd.to_datetime(sched)
+                dt_est = pd.to_datetime(est)
+                delay_min = int((dt_est - dt_sched).total_seconds() / 60)
+        except Exception:
+            delay_min = 0
+
+        return status, delay_min
+
+    except Exception:
+        return "", 0
+
+# ============================================================
+#   MAPPING ABRÉVIATIONS CLIENTS / SITES
+# ============================================================
+
+CLIENT_ALIASES = {
+    "KI HQ": {
+        "name": "Knauf Insulation",
+        "site": "Headquarters",
+        "city": "Visé",
+    },
+    "JCO": {
+        "name": "John Cockerill",
+        "site": "Site industriel",
+        "city": "Seraing",
+    },
+    "JCC": {
+        "name": "John Cockerill",
+        "site": "Site château",
+        "city": "Seraing",
+    },
+}
+
 
 # ============================================================
 #   CONFIG STREAMLIT
@@ -193,6 +303,29 @@ def normalize_time_string(val) -> str:
 
     return s
 
+def resolve_client_alias(text: str) -> str:
+    """
+    Remplace une abréviation connue par sa description complète.
+    (Pour affichage : vue chauffeur, vue mobile, PDF, WhatsApp, etc.)
+    """
+    if not text:
+        return ""
+
+    raw = str(text).strip()
+    key = raw.upper()
+
+    info = CLIENT_ALIASES.get(key)
+    if not info:
+        return raw
+
+    parts = [info.get("name", "").strip()]
+    if info.get("site"):
+        parts.append(str(info["site"]).strip())
+    if info.get("city"):
+        parts.append(str(info["city"]).strip())
+
+    parts = [p for p in parts if p]
+    return " – ".join(parts) if parts else raw
 
 # ============================================================
 #   HELPERS – BOOL FLAG
@@ -824,6 +957,20 @@ def create_chauffeur_pdf(df_ch: pd.DataFrame, ch_selected: str, day_label: str) 
         if infos_vol:
             c.drawString(2 * cm, y, " | ".join(infos_vol))
             y -= 0.5 * cm
+        # ✈️ Numéro de vol (PDF)
+        vol_val = ""
+        for col in ["N° Vol", "N° Vol ", "Num Vol", "VOL", "Vol"]:
+            if col in df_ch.columns:
+                v = str(row.get(col, "") or "").strip()
+                if v:
+                    vol_val = v
+                    break
+        
+        if vol_val:
+            status, delay_min = get_flight_status_cached(vol_val)
+            badge = flight_badge(status, delay_min)
+
+
 
         # Paiement / caisse
         infos_pay = []
@@ -873,6 +1020,8 @@ def build_chauffeur_day_message(df_ch: pd.DataFrame, ch_selected: str, day_label
             dest = f"{route} ({designation})"
         else:
             dest = route or designation or "Navette"
+
+        dest = resolve_client_alias(dest)
 
         nom = str(row.get("NOM", "") or "")
 
@@ -948,67 +1097,53 @@ def render_tab_planning():
             st.session_state.planning_end = dimanche_next
             st.rerun()
 
-    # ----------------- Sélection de période -----------------
+    # ----------------- Sélection période -----------------
     colf1, colf2 = st.columns(2)
     with colf1:
         start_date = st.date_input(
             "Date de début",
             value=st.session_state.planning_start,
-            key="planning_start_widget",
         )
     with colf2:
         end_date = st.date_input(
             "Date de fin",
             value=st.session_state.planning_end,
-            key="planning_end_widget",
         )
 
     st.session_state.planning_start = start_date
     st.session_state.planning_end = end_date
 
-    # ----------------- Chauffeur / type / recherche ---------
+    # ----------------- Chauffeur / type / recherche -----------------
     chs = get_chauffeurs_for_ui()
-
 
     colf3, colf4 = st.columns([1, 2])
     with colf3:
-        ch_value = st.selectbox(
-            "Chauffeur (CH)",
-            ["(Tous)"] + chs,
-            key="planning_ch",
-        )
+        ch_value = st.selectbox("Chauffeur (CH)", ["(Tous)"] + chs)
         if ch_value == "(Tous)":
             ch_value = None
     with colf4:
         type_choice = st.selectbox(
             "Type de transferts",
             ["Tous", "AL (hors GO/GL)", "GO / GL"],
-            key="planning_type",
         )
 
     if type_choice == "Tous":
         type_filter = None
     elif type_choice.startswith("AL"):
-        type_filter = "AL"      # GO/GL exclus
+        type_filter = "AL"
     else:
-        type_filter = "GO_GL"   # uniquement GO/GL
+        type_filter = "GO_GL"
 
     colf5, colf6 = st.columns([3, 1])
     with colf5:
-        search = st.text_input(
-            "Recherche (client, désignation, vol, remarque…)",
-            "",
-            key="planning_search",
-        )
+        search = st.text_input("Recherche (client, désignation, vol, remarque…)", "")
     with colf6:
         sort_choice = st.selectbox(
             "Tri",
             ["Date + heure", "Chauffeur + date + heure", "Aucun"],
-            key="planning_sort_choice_select",
         )
-        st.session_state.planning_sort_choice = sort_choice
 
-    # ----------------- Lecture DB planning ------------------
+    # ----------------- Lecture DB -----------------
     df = get_planning(
         start_date=start_date,
         end_date=end_date,
@@ -1022,52 +1157,43 @@ def render_tab_planning():
         st.warning("Aucune navette pour ces paramètres.")
         return
 
-    # Sécurité : max 40 colonnes, MAIS on garde les colonnes importantes
-    if df.shape[1] > 40:
-        priority = ["id", "DATE", "HEURE", "CH", "GO", "GROUPAGE", "PARTAGE"]
-        core_cols = [c for c in priority if c in df.columns]
-        other_cols = [c for c in df.columns if c not in core_cols]
-        max_cols = 40
-        keep_cols = core_cols + other_cols[: max_cols - len(core_cols)]
-        df = df[keep_cols]
-
-
-    # ----------------- Tri ------------------
+    # ----------------- Tri -----------------
     sort_cols = []
     if sort_choice == "Date + heure":
-        if "DATE" in df.columns:
-            sort_cols.append("DATE")
-        if "HEURE" in df.columns:
-            sort_cols.append("HEURE")
+        sort_cols = [c for c in ["DATE", "HEURE"] if c in df.columns]
     elif sort_choice == "Chauffeur + date + heure":
-        if "CH" in df.columns:
-            sort_cols.append("CH")
-        if "DATE" in df.columns:
-            sort_cols.append("DATE")
-        if "HEURE" in df.columns:
-            sort_cols.append("HEURE")
+        sort_cols = [c for c in ["CH", "DATE", "HEURE"] if c in df.columns]
 
     if sort_cols:
         df = df.sort_values(sort_cols)
 
-    # ----------------- Stats rapides ------------------
-    nb_navettes = len(df)
-    nb_go_gl = 0
-    if "GO" in df.columns:
-        go_series = df["GO"].astype(str).str.upper().str.strip()
-        nb_go_gl = go_series.isin(["GO", "GL"]).sum()
-
+    # ----------------- Stats -----------------
     colm1, colm2 = st.columns(2)
-    with colm1:
-        st.metric("🚐 Navettes", int(nb_navettes))
-    with colm2:
-        st.metric("🎯 GO / GL", int(nb_go_gl))
+    colm1.metric("🚐 Navettes", len(df))
+    if "GO" in df.columns:
+        nb_go_gl = df["GO"].astype(str).str.upper().isin(["GO", "GL"]).sum()
+        colm2.metric("🎯 GO / GL", int(nb_go_gl))
 
-    # ----------------- Tableau avec couleurs ------------------
+    # ----------------- Préparation affichage -----------------
     df_display = df.copy()
     if "id" in df_display.columns:
         df_display = df_display.drop(columns=["id"])
 
+    # ❌ masquer PARTAGE et GROUPAGE
+    df_display = df_display.drop(
+        columns=[c for c in ["PARTAGE", "GROUPAGE"] if c in df_display.columns],
+        errors="ignore"
+    )
+
+    # 🔁 mettre GO avant Num BDC
+    if "GO" in df_display.columns and "Num BDC" in df_display.columns:
+        cols = list(df_display.columns)
+        cols.remove("GO")
+        idx = cols.index("Num BDC")
+        cols.insert(idx, "GO")
+        df_display = df_display[cols]
+
+    # ----------------- Affichage tableau -----------------
     try:
         styled = style_groupage_partage(df_display)
         st.dataframe(styled, use_container_width=True, height=500)
@@ -1078,11 +1204,11 @@ def render_tab_planning():
     st.markdown("### 🔁 Actions de groupe (dupliquer / supprimer les navettes sélectionnées)")
 
     if "id" not in df.columns:
-        st.info("La colonne `id` est nécessaire pour les actions (dupliquer/supprimer).")
+        st.info("La colonne `id` est nécessaire pour les actions.")
         return
 
-    # ----------------- Sélection multiple ------------------
-    labels_by_id: Dict[int, str] = {}
+    # ----------------- Sélection multiple -----------------
+    labels_by_id = {}
     for _, row in df.iterrows():
         rid = int(row["id"])
         d_txt = str(row.get("DATE", "") or "")
@@ -1101,47 +1227,26 @@ def render_tab_planning():
         "Sélectionne une ou plusieurs navettes",
         options=list(labels_by_id.keys()),
         format_func=lambda x: labels_by_id.get(x, str(x)),
-        key="planning_group_ids",
     )
 
     colg1, colg2 = st.columns(2)
 
-    # ----------------- Dupliquer ------------------
     with colg1:
-        if st.button("📋 Dupliquer les navettes sélectionnées"):
-            if not selected_ids:
-                st.warning("Aucune navette sélectionnée.")
-            else:
-                nb_done = 0
-                for rid in selected_ids:
-                    row_g = get_row_by_id(int(rid))
-                    if not row_g:
-                        continue
-                    if role_allows_go_gl_only() and not leon_allowed_for_row(row_g.get("GO")):
-                        continue
+        if st.button("📋 Dupliquer", key="planning_duplicate"):
+            for rid in selected_ids:
+                row_g = get_row_by_id(int(rid))
+                if row_g:
                     clone = {k: v for k, v in row_g.items() if k != "id"}
                     insert_planning_row(clone)
-                    nb_done += 1
-                st.success(f"{nb_done} navette(s) dupliquée(s).")
-                st.rerun()
+            st.rerun()
 
-    # ----------------- Supprimer ------------------
     with colg2:
-        if st.button("🗑️ Supprimer les navettes sélectionnées"):
-            if not selected_ids:
-                st.warning("Aucune navette sélectionnée.")
-            else:
-                nb_done = 0
-                for rid in selected_ids:
-                    row_g = get_row_by_id(int(rid))
-                    if not row_g:
-                        continue
-                    if role_allows_go_gl_only() and not leon_allowed_for_row(row_g.get("GO")):
-                        continue
-                    delete_planning_row(int(rid))
-                    nb_done += 1
-                st.success(f"{nb_done} navette(s) supprimée(s).")
-                st.rerun()
+        if st.button("🗑️ Supprimer", key="planning_delete"):
+            for rid in selected_ids:
+                delete_planning_row(int(rid))
+            st.rerun()
+
+
 def render_tab_quick_day_mobile():
     """Vue compacte de la journée pour dispatch rapide (optimisée GSM)."""
     st.subheader("⚡ Vue compacte journée (dispatch)")
@@ -1219,6 +1324,7 @@ def render_tab_quick_day_mobile():
             return f"{route_text} ({designation})"
         else:
             return route_text or designation or ""
+        return resolve_client_alias(dest)
 
     df["DEST_FULL"] = df.apply(compute_dest_full, axis=1)
 
@@ -2271,6 +2377,7 @@ def build_chauffeur_change_message(row: pd.Series, ch_code: str) -> str:
         or row.get("DESTINATION", "")
         or ""
     ).strip()
+    dest = resolve_client_alias(dest)
     pax = row.get("PAX", "")
     try:
         pax_txt = str(int(pax)) if pax not in ("", None) else ""
@@ -2556,6 +2663,8 @@ def render_tab_vue_chauffeur(forced_ch=None):
         else:
             dest_full = route_text or designation or ""
 
+        dest_full = resolve_client_alias(dest_full)
+
         groupage_flag = bool_from_flag(row.get("GROUPAGE", "0")) if "GROUPAGE" in cols else False
         partage_flag = bool_from_flag(row.get("PARTAGE", "0")) if "PARTAGE" in cols else False
 
@@ -2596,6 +2705,54 @@ def render_tab_vue_chauffeur(forced_ch=None):
         adr_full = " ".join(x for x in [adresse, cp, loc] if x)
         if adr_full:
             bloc_lines.append(f"📍 {adr_full}")
+        # ✈️ Numéro de vol (si présent)
+        # ✈️ Numéro de vol + statut (si présent)
+        vol_val = ""
+        for col in ["N° Vol", "N° Vol ", "Num Vol", "VOL", "Vol"]:
+            if col in df_ch.columns:
+                v = str(row.get(col, "") or "").strip()
+                if v:
+                    vol_val = v
+                    break
+
+        if vol_val:
+            # 1) Numéro de vol
+            bloc_lines.append(f"✈️ Vol {vol_val}")
+
+            # 2) Statut du vol via API (avec cache)
+            status, delay_min = get_flight_status_cached(vol_val)
+            badge = flight_badge(status, delay_min)
+
+            if badge:
+               bloc_lines.append(f"📡 Statut : {badge}")
+
+            msg = None
+
+            # 3) 🔔 Alerte chauffeur si RETARD (anti-spam DB)
+            if status == "DELAYED":
+                ch_txt = str(row.get("CH", "") or ch_selected).strip().upper()
+
+                if date_txt and ch_txt and not flight_alert_exists(date_txt, ch_txt, vol_val):
+                    msg = (
+                        f"⚠️ RETARD VOL {vol_val}\n"
+                        f"{date_txt} {heure_txt}\n"
+                        f"Destination : {dest_full}\n"
+                        f"Retard estimé : {delay_min} min"
+                    )
+
+                    if tel_ch:
+                        wa = build_whatsapp_link(tel_ch, msg)
+                        bloc_lines.append(
+                            f"🔔 [Prévenir le chauffeur (WhatsApp)]({wa})"
+                        )
+                    else:
+                        send_mail_admin("Retard vol", msg)
+
+                    upsert_flight_alert(date_txt, ch_txt, vol_val, status, delay_min)
+
+
+
+
 
         pax = str(row.get("PAX", "") or "").strip()
         paiement = str(row.get("PAIEMENT", "") or "").strip()
@@ -3055,6 +3212,7 @@ def main():
     ensure_planning_updated_at_column()
     init_indispo_table()
     init_chauffeur_ack_table()
+    init_flight_alerts_table()  # ✅ OK maintenant
 
     # init session
     init_session_state()
@@ -3064,10 +3222,11 @@ def main():
         login_screen()
         return
 
-    # Barre du haut (titre + info utilisateur + bouton déconnexion)
+    # Barre du haut
     render_top_bar()
 
     role = st.session_state.role
+    ...
 
     # ====================== ADMIN ===========================
     # ====================== ADMIN ===========================
