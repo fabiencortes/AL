@@ -758,6 +758,62 @@ def init_flight_alerts_table():
         """)
         conn.commit()
 
+def ensure_flight_alerts_time_columns() -> None:
+    """
+    Ajoute les colonnes last_sched_time / last_est_time à flight_alerts
+    si elles n'existent pas encore.
+    """
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(flight_alerts)")
+        cols = [r[1] for r in cur.fetchall()]
+
+        if "last_sched_time" not in cols:
+            cur.execute('ALTER TABLE flight_alerts ADD COLUMN "last_sched_time" TEXT')
+
+        if "last_est_time" not in cols:
+            cur.execute('ALTER TABLE flight_alerts ADD COLUMN "last_est_time" TEXT')
+
+        conn.commit()
+
+def should_notify_flight_change(
+    date_txt: str,
+    ch: str,
+    vol: str,
+    status: str,
+    delay_min: int,
+    sched_time: str,
+    est_time: str,
+) -> bool:
+    """
+    Retourne True uniquement si quelque chose a changé
+    (statut / retard / heure estimée).
+    """
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT last_status, last_delay_min, last_sched_time, last_est_time
+            FROM flight_alerts
+            WHERE date_txt=? AND ch=? AND vol=?
+            LIMIT 1
+            """,
+            (date_txt, ch, vol),
+        )
+        row = cur.fetchone()
+
+    if not row:
+        return True  # jamais notifié → on peut notifier
+
+    old_status, old_delay, old_sched, old_est = row
+    if (old_status or "") != (status or ""):
+        return True
+    if int(old_delay or 0) != int(delay_min or 0):
+        return True
+    if (old_est or "") != (est_time or ""):
+        return True
+
+    return False
 
 def flight_alert_exists(date_txt: str, ch: str, vol: str) -> bool:
     with get_connection() as conn:
@@ -769,20 +825,48 @@ def flight_alert_exists(date_txt: str, ch: str, vol: str) -> bool:
         return cur.fetchone() is not None
 
 
-def upsert_flight_alert(date_txt: str, ch: str, vol: str, status: str, delay_min: int) -> None:
+def upsert_flight_alert(
+    date_txt: str,
+    ch: str,
+    vol: str,
+    status: str,
+    delay_min: int,
+    sched_time: str = "",
+    est_time: str = "",
+) -> None:
     now = datetime.now().isoformat(timespec="seconds")
     with get_connection() as conn:
         cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO flight_alerts(date_txt, ch, vol, last_status, last_delay_min, notified_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+        cur.execute(
+            """
+            INSERT INTO flight_alerts(
+                date_txt, ch, vol,
+                last_status, last_delay_min,
+                last_sched_time, last_est_time,
+                notified_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(date_txt, ch, vol)
             DO UPDATE SET
                 last_status=excluded.last_status,
                 last_delay_min=excluded.last_delay_min,
+                last_sched_time=excluded.last_sched_time,
+                last_est_time=excluded.last_est_time,
                 notified_at=excluded.notified_at
-        """, (date_txt, ch, vol, status, int(delay_min or 0), now))
+            """,
+            (
+                date_txt,
+                ch,
+                vol,
+                status,
+                int(delay_min or 0),
+                sched_time or "",
+                est_time or "",
+                now,
+            ),
+        )
         conn.commit()
+
 def ensure_km_time_columns():
     """
     Ajoute les colonnes KM_EST et TEMPS_EST à la table planning

@@ -38,6 +38,9 @@ from database import (
     get_chauffeur_last_ack,
     set_chauffeur_last_ack,
     init_flight_alerts_table,
+    ensure_flight_alerts_time_columns,
+    should_notify_flight_change,
+    upsert_flight_alert,
 
 )
 
@@ -77,24 +80,22 @@ import streamlit as st
 def get_flight_status_cached(flight_number: str):
     """
     Retourne TOUJOURS un tuple :
-    (status, delay_min)
+    (status, delay_min, sched_dt, est_dt)
+    sched_dt / est_dt = datetime pandas (ou None)
     """
     if not flight_number:
-        return "", 0
+        return "", 0, None, None
 
     try:
         r = requests.get(
             "http://api.aviationstack.com/v1/flights",
-            params={
-                "access_key": AVIATIONSTACK_KEY,
-                "flight_iata": flight_number
-            },
-            timeout=5
+            params={"access_key": AVIATIONSTACK_KEY, "flight_iata": flight_number},
+            timeout=5,
         )
         data = r.json()
 
         if not data.get("data"):
-            return "", 0
+            return "", 0, None, None
 
         f = data["data"][0]
         status_raw = (f.get("flight_status") or "").lower()
@@ -111,22 +112,21 @@ def get_flight_status_cached(flight_number: str):
         else:
             status = ""
 
-        # calcul du retard (si dispo)
-        delay_min = 0
-        try:
-            sched = f.get("departure", {}).get("scheduled")
-            est = f.get("departure", {}).get("estimated")
-            if sched and est:
-                dt_sched = pd.to_datetime(sched)
-                dt_est = pd.to_datetime(est)
-                delay_min = int((dt_est - dt_sched).total_seconds() / 60)
-        except Exception:
-            delay_min = 0
+        # ⚠️ on prend ici ARRIVAL (arrivée) : scheduled / estimated
+        sched = f.get("arrival", {}).get("scheduled")
+        est = f.get("arrival", {}).get("estimated")
 
-        return status, delay_min
+        sched_dt = pd.to_datetime(sched) if sched else None
+        est_dt = pd.to_datetime(est) if est else None
+
+        delay_min = 0
+        if sched_dt is not None and est_dt is not None:
+            delay_min = int((est_dt - sched_dt).total_seconds() / 60)
+
+        return status, delay_min, sched_dt, est_dt
 
     except Exception:
-        return "", 0
+        return "", 0, None, None
 
 # ============================================================
 #   MAPPING ABRÉVIATIONS CLIENTS / SITES
@@ -347,12 +347,12 @@ def get_chauffeurs_for_ui() -> List[str]:
 #  CONFIG NOTIFICATIONS EMAIL
 # ===========================
 
-SMTP_HOST = "smtp.office365.com"
+SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
-SMTP_USER = "info@airports-lines.com"
-SMTP_PASSWORD = " TLAM777A@1rp0rt5"
+SMTP_USER = "airportslinesbureau@gmail.com"
+SMTP_PASSWORD = "xnib fwba oisn aadk"
 
-ADMIN_NOTIFICATION_EMAIL = "info@airports-lines.com"
+ADMIN_NOTIFICATION_EMAIL = "airportslinesbureau@gmail.com"
 FROM_EMAIL = SMTP_USER
 # ============================================================
 #   HELPERS — NORMALISATION DES HEURES
@@ -1066,7 +1066,7 @@ def create_chauffeur_pdf(df_ch: pd.DataFrame, ch_selected: str, day_label: str) 
                     break
         
         if vol_val:
-            status, delay_min = get_flight_status_cached(vol_val)
+            status, delay_min, sched_dt, est_dt = get_flight_status_cached(vol_val)
             badge = flight_badge(status, delay_min)
 
 
@@ -1407,11 +1407,16 @@ def render_tab_quick_day_mobile():
             continue
 
         # Date
-        date_val = row.get("DATE", "")
+        date_val = row.get("DATE")
         if isinstance(date_val, (datetime, date)):
             date_txt = date_val.strftime("%d/%m/%Y")
         else:
-            date_txt = str(date_val or "").strip()
+            date_val = row.get("DATE")
+            if isinstance(date_val, (datetime, date)):
+                date_txt = date_val.strftime("%d/%m/%Y")
+            else:
+                dtmp = pd.to_datetime(date_val, dayfirst=True, errors="coerce")
+                date_txt = dtmp.strftime("%d/%m/%Y") if not pd.isna(dtmp) else ""
 
         # Heure
         heure_txt = normalize_time_string(row.get("HEURE", "")) or "??:??"
@@ -1442,12 +1447,72 @@ def render_tab_quick_day_mobile():
         paiement = str(row.get("PAIEMENT", "") or "").strip()
         bdc = str(row.get("Num BDC", "") or "").strip()
 
-        # Vol + badge (si dispo)
+        # Vol + badge + alerte admin (UNE SEULE FOIS)
         vol = extract_vol_val(row, cols)
         badge = ""
+
         if vol:
-            statut, delay = get_flight_status_cached(vol)
-            badge = flight_badge(statut, delay)
+            status, delay_min, sched_dt, est_dt = get_flight_status_cached(vol)
+
+            badge = flight_badge(status, delay_min)
+
+        # ============================
+        # ✈️ ÉTAPE 6 — ALERTE VOL ADMIN
+        # ============================
+
+        vol = extract_vol_val(row, cols)
+
+        if vol:
+            status, delay_min, sched_dt, est_dt = get_flight_status_cached(vol)
+
+            # Sécurisation des heures (anti faux changements)
+            if sched_dt is not None:
+                sched_dt = sched_dt.replace(second=0, microsecond=0)
+            if est_dt is not None:
+                est_dt = est_dt.replace(second=0, microsecond=0)
+
+            sched_txt = sched_dt.strftime("%H:%M") if sched_dt is not None else ""
+            est_txt = est_dt.strftime("%H:%M") if est_dt is not None else ""
+
+            ch_txt = str(row.get("CH", "") or "").strip()
+
+            if should_notify_flight_change(
+                date_txt,
+                ch_txt,
+                vol,
+                status,
+                delay_min,
+                sched_txt,
+                est_txt,
+            ):
+                msg = (
+                    f"✈️ ALERTE VOL\n\n"
+                    f"Vol : {vol}\n"
+                    f"Date : {date_txt}\n"
+                    f"Chauffeur : {ch_txt}\n\n"
+                    f"Statut : {status}\n"
+                    f"Heure prévue : {sched_txt or '??:??'}\n"
+                    f"Heure estimée : {est_txt or '??:??'}\n"
+                    f"Variation : {delay_min:+} min\n"
+                )
+
+                send_mail_admin(
+                    subject=f"✈️ Changement vol {vol}",
+                    body=msg,
+                )
+
+                upsert_flight_alert(
+                    date_txt,
+                    ch_txt,
+                    vol,
+                    status,
+                    delay_min,
+                    sched_txt,
+                    est_txt,
+                )
+
+
+
 
         # ------- Ligne compacte -------
         line = f"📆 {date_txt} | ⏱ {heure_txt} | 👤 {ch_current} → {dest}"
@@ -2865,7 +2930,7 @@ def render_tab_vue_chauffeur(forced_ch=None):
             bloc_lines.append(f"✈️ Vol {vol_val}")
 
             # 2) Statut du vol via API (avec cache)
-            status, delay_min = get_flight_status_cached(vol_val)
+            status, delay_min, sched_dt, est_dt = get_flight_status_cached(vol_val)
             badge = flight_badge(status, delay_min)
 
             if badge:
@@ -3359,6 +3424,7 @@ def main():
     ensure_km_time_columns()
     init_chauffeur_ack_table()
     init_flight_alerts_table()  # ✅ OK maintenant
+    ensure_flight_alerts_time_columns()
 
     # init session
     init_session_state()
