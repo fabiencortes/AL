@@ -33,6 +33,7 @@ from database import (
     get_indispo_requests,
     set_indispo_status,
     ensure_planning_updated_at_column,
+    ensure_km_time_columns,
     init_chauffeur_ack_table,
     get_chauffeur_last_ack,
     set_chauffeur_last_ack,
@@ -150,6 +151,103 @@ CLIENT_ALIASES = {
 }
 
 
+# ==========================
+#  KM / TEMPS (OpenRouteService)
+# ==========================
+ORS_API_KEY = "5b3ce3597851110001cf62480ac03479d6074e1ebda549044ad14608"
+
+AIRPORT_ALIASES = {
+    "CRL": "Brussels South Charleroi Airport, Belgium",
+    "CHARLEROI": "Brussels South Charleroi Airport, Belgium",
+    "BRU": "Brussels Airport, Zaventem, Belgium",
+    "BRUXELLES": "Brussels Airport, Zaventem, Belgium",
+    "ZAVENTEM": "Brussels Airport, Zaventem, Belgium",
+    "LUX": "Luxembourg Airport, Luxembourg",
+    "LUXEMBOURG": "Luxembourg Airport, Luxembourg",
+}
+
+def _pick_first(row, candidates):
+    for c in candidates:
+        if c in row.index:
+            v = str(row.get(c, "") or "").strip()
+            if v and v.lower() != "nan":
+                return v
+    return ""
+
+def build_full_address_from_row(row: pd.Series) -> str:
+    # Essaye de reconstruire "Adresse + CP + Ville"
+    adr = _pick_first(row, ["ADRESSE", "Adresse", "ADRESSE RDV", "Adresse RDV", "RUE", "Rue"])
+    cp  = _pick_first(row, ["CP", "Code postal", "CODE POSTAL", "Postal", "ZIP"])
+    vil = _pick_first(row, ["Localité", "LOCALITE", "Ville", "VILLE", "COMMUNE"])
+    parts = [p for p in [adr, cp, vil] if p]
+    return " ".join(parts).strip()
+
+def resolve_destination_text(row: pd.Series) -> str:
+    # Colonne destination/route dans ton fichier : tu utilises déjà "DE/VERS" et parfois "Unnamed: 8"
+    dest = _pick_first(row, ["DE/VERS", "DESTINATION", "Destination", "Unnamed: 8", "ROUTE"])
+    if not dest:
+        return ""
+    key = dest.strip().upper()
+    for k, full in AIRPORT_ALIASES.items():
+        if k in key:
+            return full
+    return dest
+
+@st.cache_data(ttl=24*3600)
+def ors_route_km_min(origin_text: str, dest_text: str):
+    """
+    Retourne (km, minutes) via ORS directions.
+    Cache 24h pour éviter de brûler la clé.
+    """
+    if not ORS_API_KEY:
+        return None, None
+    if not origin_text or not dest_text:
+        return None, None
+
+    # ORS: on passe par géocodage Nominatim-like ? => ORS a aussi /geocode/search.
+    # Pour rester simple et robuste: ORS Geocode puis Directions.
+    try:
+        # 1) Geocode origin
+        r1 = requests.get(
+            "https://api.openrouteservice.org/geocode/search",
+            params={"api_key": ORS_API_KEY, "text": origin_text},
+            timeout=8
+        ).json()
+        if not r1.get("features"):
+            return None, None
+        o_lon, o_lat = r1["features"][0]["geometry"]["coordinates"]
+
+        # 2) Geocode dest
+        r2 = requests.get(
+            "https://api.openrouteservice.org/geocode/search",
+            params={"api_key": ORS_API_KEY, "text": dest_text},
+            timeout=8
+        ).json()
+        if not r2.get("features"):
+            return None, None
+        d_lon, d_lat = r2["features"][0]["geometry"]["coordinates"]
+
+        # 3) Directions driving-car
+        r3 = requests.post(
+            "https://api.openrouteservice.org/v2/directions/driving-car",
+            headers={"Authorization": ORS_API_KEY, "Content-Type": "application/json"},
+            json={"coordinates": [[o_lon, o_lat], [d_lon, d_lat]]},
+            timeout=10
+        ).json()
+
+        feat = (r3.get("features") or [None])[0]
+        if not feat:
+            return None, None
+
+        seg = feat["properties"]["segments"][0]
+        dist_m = float(seg.get("distance", 0.0))
+        dur_s  = float(seg.get("duration", 0.0))
+
+        km = round(dist_m / 1000.0, 1)
+        minutes = int(round(dur_s / 60.0))
+        return km, minutes
+    except Exception:
+        return None, None
 # ============================================================
 #   CONFIG STREAMLIT
 # ============================================================
@@ -1564,6 +1662,17 @@ def render_tab_table():
 
     # Colonne de sélection
     df_view.insert(0, "_SELECT", False)
+    # --- Affichage KM / TEMPS depuis la DB ---
+    if "KM_EST" in df.columns:
+        df_view["_KM_EST"] = df["KM_EST"].fillna("").astype(str)
+    else:
+        df_view["_KM_EST"] = ""
+
+    if "TEMPS_EST" in df.columns:
+        df_view["_TEMPS_EST"] = df["TEMPS_EST"].fillna("").astype(str)
+    else:
+        df_view["_TEMPS_EST"] = ""
+
 
     st.markdown("#### Aperçu (coche une ligne pour l’éditer en bas)")
     edited = st.data_editor(
@@ -1573,11 +1682,72 @@ def render_tab_table():
         num_rows="fixed",
         key="table_editor",
     )
+    # ==================================================
+    #  EXÉCUTION DU CALCUL KM / TEMPS + SAUVEGARDE DB
+    # ==================================================
+    if st.session_state.get("km_time_run"):
+        selected_indices = edited.index[edited["_SELECT"] == True].tolist()
+        selected_ids = [int(ids[i]) for i in selected_indices]
+
+        mode = st.session_state.get("km_time_last_mode", "✅ Lignes cochées (_SELECT)")
+        targets = selected_ids if mode.startswith("✅") else [int(x) for x in ids]
+
+        for rid in targets:
+            row = df[df["id"] == rid].iloc[0]
+
+            # ⛔️ Ne pas recalculer si déjà présent
+            if row.get("KM_EST") and row.get("TEMPS_EST"):
+                continue
+
+            origin = (
+                build_full_address_from_row(row)
+                or st.session_state.get("km_base_address", "Liège, Belgique")
+            )
+            dest = resolve_destination_text(row)
+
+            km, mn = ors_route_km_min(origin, dest)
+            if km is not None and mn is not None:
+                update_planning_row(
+                    rid,
+                    {
+                        "KM_EST": str(km),
+                        "TEMPS_EST": str(mn),
+                    }
+                )
+
+        st.session_state["km_time_run"] = False
+        st.success("KM et temps calculés et sauvegardés ✅")
+        st.rerun()
+
+
+    # ==========================
+    #  KM/TEMPS à la demande (affichage seulement)
+    # ==========================
+    with st.expander("📏 KM & temps (à la demande)", expanded=False):
+        st.caption("Calcule et sauvegarde les KM + temps estimés (réutilisés pour les prochains transferts).")
+
+        base_default = st.session_state.get("km_base_address", "Liège, Belgique")
+        base_addr = st.text_input("Adresse de départ par défaut (si adresse RDV vide)", value=base_default)
+        st.session_state["km_base_address"] = base_addr
+
+        calc_mode = st.radio(
+            "Calculer pour :",
+            ["✅ Lignes cochées (_SELECT)", "📄 Toutes les lignes affichées"],
+            horizontal=True
+        )
+
+        if not ORS_API_KEY:
+            st.warning("ORS_API_KEY manquante (variable d’environnement ORS_API_KEY). Le calcul ne peut pas tourner.")
+
+        if st.button("🚀 Calculer KM + temps", key="btn_calc_km_time"):
+            st.session_state["km_time_by_id"] = {}  # dict {id: (km, min)}
+            st.session_state["km_time_last_mode"] = calc_mode
+            st.session_state["km_time_run"] = True
 
     # ========= MISE À JOUR DIRECTE DEPUIS LE TABLEAU =========
 
     # On reconstruit un DataFrame complet avec la colonne id
-    df_edited_full = edited.drop(columns=["_SELECT"]).copy()
+    df_edited_full = edited.drop(columns=["_SELECT", "_KM_EST", "_TEMPS_EST"], errors="ignore").copy()
     df_edited_full.insert(0, "id", ids)
 
     if st.button("💾 Mettre à jour les modifications du tableau"):
@@ -1903,6 +2073,33 @@ def render_tab_clients():
     ids = df["id"].tolist()
     df_view = df.drop(columns=["id"]).copy().reset_index(drop=True)
     df_view.insert(0, "_SELECT", False)
+    if "KM_EST" in df.columns:
+        df_view["_KM_EST"] = df["KM_EST"].fillna("").astype(str)
+    if "TEMPS_EST" in df.columns:
+        df_view["_TEMPS_EST"] = df["TEMPS_EST"].fillna("").astype(str)
+    # --- Affichage KM / TEMPS depuis la DB ---
+    if "KM_EST" in df.columns:
+        df_view["_KM_EST"] = df["KM_EST"].fillna("").astype(str)
+    else:
+        df_view["_KM_EST"] = ""
+
+    if "TEMPS_EST" in df.columns:
+        df_view["_TEMPS_EST"] = df["TEMPS_EST"].fillna("").astype(str)
+    else:
+        df_view["_TEMPS_EST"] = ""
+
+    # Injecter KM / MIN si on a déjà calculé
+    km_map = st.session_state.get("km_time_by_id", {}) or {}
+    km_col = []
+    min_col = []
+    for rid in ids:
+        km, mn = km_map.get(int(rid), (None, None))
+        km_col.append("" if km is None else f"{km} km")
+        min_col.append("" if mn is None else f"{mn} min")
+
+    # Colonnes d'affichage (préfixe "_" pour éviter confusion avec colonnes Excel)
+    df_view["_KM_EST"] = km_col
+    df_view["_TEMPS_EST"] = min_col
 
     st.markdown("#### Sélectionne une navette modèle")
     edited = st.data_editor(
@@ -1912,6 +2109,55 @@ def render_tab_clients():
         num_rows="fixed",
         key="client_editor",
     )
+    # ==================================================
+    # D) Exécuter le calcul KM / TEMPS (à la demande)
+    # ==================================================
+    if st.session_state.get("km_time_run"):
+        selected_indices = edited.index[edited["_SELECT"] == True].tolist()
+        selected_ids = [int(ids[i]) for i in selected_indices]
+
+        mode = st.session_state.get("km_time_last_mode", "✅ Lignes cochées (_SELECT)")
+        targets = selected_ids if mode.startswith("✅") else [int(x) for x in ids]
+
+        for rid in targets:
+            row = df[df["id"] == rid].iloc[0]
+
+            if row.get("KM_EST") and row.get("TEMPS_EST"):
+                continue
+
+            origin = (
+                build_full_address_from_row(row)
+                or st.session_state.get("km_base_address", "Liège, Belgique")
+            )
+            dest = resolve_destination_text(row)
+
+            km, mn = ors_route_km_min(origin, dest)
+            if km is not None and mn is not None:
+                update_planning_row(
+                    rid,
+                    {
+                        "KM_EST": str(km),
+                        "TEMPS_EST": str(mn),
+                    }
+                )
+
+        # ✅ CES LIGNES DOIVENT ÊTRE ICI
+        st.session_state["km_time_run"] = False
+        st.success("KM et temps calculés et sauvegardés ✅")
+        st.rerun()
+
+  
+        # 🔒 IMPORTANT : couper le flag AVANT rerun
+        st.session_state["km_time_run"] = False
+        st.session_state["km_time_last_mode"] = None
+
+        st.success("KM et temps calculés et sauvegardés ✅")
+
+        # rerun propre (une seule fois)
+        st.experimental_rerun()
+
+
+
 
     selected_indices = edited.index[edited["_SELECT"] == True].tolist()
     if selected_indices:
@@ -3211,6 +3457,7 @@ def main():
     # s'assurer que la colonne updated_at existe et que la table d'ack est prête
     ensure_planning_updated_at_column()
     init_indispo_table()
+    ensure_km_time_columns()
     init_chauffeur_ack_table()
     init_flight_alerts_table()  # ✅ OK maintenant
 

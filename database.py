@@ -783,3 +783,20 @@ def upsert_flight_alert(date_txt: str, ch: str, vol: str, status: str, delay_min
                 notified_at=excluded.notified_at
         """, (date_txt, ch, vol, status, int(delay_min or 0), now))
         conn.commit()
+def ensure_km_time_columns():
+    """
+    Ajoute les colonnes KM_EST et TEMPS_EST à la table planning
+    si elles n'existent pas encore.
+    """
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(planning)")
+        cols = [r[1] for r in cur.fetchall()]
+
+        if "KM_EST" not in cols:
+            cur.execute('ALTER TABLE planning ADD COLUMN "KM_EST" TEXT')
+
+        if "TEMPS_EST" not in cols:
+            cur.execute('ALTER TABLE planning ADD COLUMN "TEMPS_EST" TEXT')
+
+        conn.commit()
