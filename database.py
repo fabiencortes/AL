@@ -1,13 +1,35 @@
 import sqlite3
 from datetime import date, datetime
 from typing import Optional, Dict, Any, List
-
+import streamlit as st
 import pandas as pd
+import hashlib
+
+def sqlite_safe(val):
+    if val is None:
+        return None
+
+    # datetime.time
+    if hasattr(val, "hour") and hasattr(val, "minute"):
+        return f"{val.hour:02d}:{val.minute:02d}"
+
+    # datetime / date / pandas
+    try:
+        import pandas as pd
+        from datetime import datetime, date
+        if isinstance(val, (pd.Timestamp, datetime, date)):
+            return val.strftime("%d/%m/%Y")
+    except Exception:
+        pass
+
+    return str(val)
+
 
 # =========================
 #   CONFIG BASE DE DONNÉES
 # =========================
 DB_PATH = "airportslines.db"
+ACTIONS_DB_PATH = "planning_actions.db"
 
 
 # =========================
@@ -126,105 +148,135 @@ def _load_planning_df() -> pd.DataFrame:
 #   LECTURE PLANNING
 # =========================
 
+@st.cache_data(ttl=300)
+# =========================
+#   LECTURE PLANNING
+# =========================
+
+@st.cache_data(ttl=300)
 def get_planning(
-    start_date: Optional[date] = None,
-    end_date: Optional[date] = None,
-    chauffeur: Optional[str] = None,
-    type_filter: Optional[str] = None,  # None, "AL", "GO_GL"
-    search: str = "",
-    max_rows: int = 2000,
+    start_date=None,
+    end_date=None,
+    chauffeur=None,
+    type_filter=None,
+    search="",
+    max_rows=2000,
+    source="7j",   # "day" | "7j" | "full"
 ) -> pd.DataFrame:
     """
-    Retourne un DataFrame filtré de la table planning.
+    Retourne un DataFrame filtré depuis la DB.
 
-    - start_date / end_date : dates Python (inclusives)
-    - chauffeur : code CH (FA, GG, NP, ...)
-    - type_filter :
-        None      -> tous
-        "AL"      -> uniquement AL (ou vide)
-        "GO_GL"   -> uniquement GO/GL
-    - search : texte à chercher dans NOM / ADRESSE / REMARQUE / N° Vol / Num BDC
+    source :
+        - "day"  -> planning_day   (vue jour mobile)
+        - "7j"   -> planning_7j    (planning / édition / chauffeur)
+        - "full" -> planning_full  (admin / clients / historique)
     """
-    df = _load_planning_df()
+
+    # =========================
+    # Choix de la table
+    # =========================
+    if source == "day":
+        table = "planning_day"
+    elif source == "full":
+        table = "planning_full"
+    else:
+        table = "planning_7j"
+
+    # =========================
+    # Lecture DB
+    # =========================
+    try:
+        with get_connection() as conn:
+            df = pd.read_sql_query(
+                f"""
+                SELECT *
+                FROM {table}
+                ORDER BY DATE, HEURE
+                LIMIT ?
+                """,
+                conn,
+                params=(max_rows,),
+            )
+    except Exception as e:
+        print(f"❌ Erreur lecture {table} :", e)
+        return pd.DataFrame()
+
     if df.empty:
         return df
 
-    # Filtre date
+    # =========================
+    # Conversion DATE propre
+    # =========================
+    if "DATE" in df.columns:
+        df["DATE"] = pd.to_datetime(
+            df["DATE"],
+            dayfirst=True,
+            errors="coerce"
+        ).dt.date
+
+    # =========================
+    # Filtre date (si demandé)
+    # =========================
     if start_date or end_date:
         if "DATE" in df.columns:
             def _keep_date(d):
-                # 1) ignorer les valeurs vides / NaT
                 if pd.isna(d):
                     return False
-
-                # 2) si c'est un Timestamp pandas, on prend juste la date
-                if isinstance(d, pd.Timestamp):
-                    d2 = d.date()
-                else:
-                    d2 = d
-
-                # 3) on ne garde que les vraies dates Python
-                if not isinstance(d2, date):
+                if not isinstance(d, date):
                     return False
-
-                if start_date and d2 < start_date:
+                if start_date and d < start_date:
                     return False
-                if end_date and d2 > end_date:
+                if end_date and d > end_date:
                     return False
                 return True
 
-            mask = df["DATE"].apply(_keep_date)
-            df = df[mask].copy()
+            df = df[df["DATE"].apply(_keep_date)].copy()
 
+    # =========================
     # Filtre chauffeur
-    # Filtre chauffeur
+    # =========================
     if chauffeur and "CH" in df.columns:
         ch = chauffeur.strip().upper()
         ch_series = df["CH"].astype(str).str.strip().str.upper()
 
-        # Si on choisit un code avec étoile (AD*, FA*, ...), on filtre strictement sur ce code
         if ch.endswith("*"):
-            df = ch_series[ch_series == ch].to_frame().join(df, how="right").dropna(subset=["CH"])
-            df = df[df["CH"].astype(str).str.strip().str.upper() == ch].copy()
+            df = df[ch_series == ch].copy()
         else:
-            # 1) égalité exacte
             mask_exact = ch_series == ch
-
-            # 2) + toutes les lignes dont le CH commence par ce code,
-            #    mais SANS inclure celles où le caractère suivant est un chiffre.
-            #    Exemples :
-            #      - chauffeur = "AD"  -> AD, AD*, ADNP, ADGO...
-            #      - chauffeur = "FA"  -> FA, FA*, FADO..., mais PAS FA1, FA1*
-            #      - chauffeur = "FA1" -> FA1, FA1*, FA1NP...
             starts_with = ch_series.str.startswith(ch)
             next_char = ch_series.str.slice(len(ch), len(ch) + 1)
-            # next_char == ""  (code exactement égal) ou non chiffré
             mask_non_digit_after = (next_char == "") | (~next_char.str.match(r"\d"))
-
             mask_prefix = starts_with & mask_non_digit_after
 
             df = df[mask_exact | mask_prefix].copy()
 
-
-    # Filtre type AL / GO_GL selon colonne GO
+    # =========================
+    # Filtre type AL / GO_GL
+    # =========================
     if "GO" in df.columns and type_filter:
         go_series = df["GO"].astype(str).str.strip().str.upper()
+
         if type_filter == "AL":
-            # tout ce qui n'est pas GO/GL (donc vide ou AL ou autre)
             df = df[~go_series.isin(["GO", "GL"])].copy()
         elif type_filter == "GO_GL":
             df = df[go_series.isin(["GO", "GL"])].copy()
 
-    # Filtre texte
+    # =========================
+    # Recherche texte libre
+    # =========================
     if search:
-        s_low = search.strip().lower()
-        if s_low:
-            mask = False
-            candidates = ["NOM", "ADRESSE", "REMARQUE", "N° Vol", "Num BDC", "DESIGNATION"]
-            for col in candidates:
-                if col in df.columns:
-                    mask = mask | df[col].astype(str).str.lower().str.contains(s_low, na=False)
-            df = df[mask].copy()
+        s = search.lower()
+
+        def _row_match(row):
+            for col in ["NOM", "ADRESSE", "REMARQUE", "VOL", "NUM_BDC"]:
+                if col in row and s in str(row[col]).lower():
+                    return True
+            return False
+
+        df = df[df.apply(_row_match, axis=1)].copy()
+
+    return df
+
 
     # Tri par DATE + HEURE
     if "HEURE" in df.columns:
@@ -360,13 +412,63 @@ def get_chauffeur_planning(
 #   RECHERCHE CLIENT
 # =========================
 
-def search_client(client_name_part: str, max_rows: int = 500) -> pd.DataFrame:
+def search_client(query, max_rows=500):
     """
-    Recherche un client par nom (partiel) dans la table planning.
+    Recherche client dans TOUT l'historique (planning_full),
+    colonnes dynamiques (robuste aux changements Excel),
+    avec TRI DATE correct (passé + futur).
     """
-    df = _load_planning_df()
-    if df.empty:
-        return df
+    q = f"%{query.strip()}%"
+
+    with get_connection() as conn:
+        # 1) récupérer les colonnes réelles de la table
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(planning_full)")
+        cols = [row[1] for row in cur.fetchall()]
+
+        if not cols:
+            return pd.DataFrame()
+
+        # 2) colonnes candidates à la recherche (ordre logique)
+        preferred = [
+            "NOM",
+            "ADRESSE",
+            "REMARQUE",
+            "NUM_BDC",
+            "CLIENT",
+            "CONTACT",
+            "VILLE",
+        ]
+
+        search_cols = [c for c in preferred if c in cols]
+
+        # fallback de sécurité
+        if not search_cols:
+            search_cols = cols[:3]
+
+        # 3) construction dynamique du WHERE
+        where_sql = " OR ".join([f'"{c}" LIKE ?' for c in search_cols])
+        params = [q] * len(search_cols) + [max_rows]
+
+        # 4) TRI DATE CORRECT (dd/mm/yyyy -> yyyy-mm-dd)
+        sql = f"""
+            SELECT *
+            FROM planning_full
+            WHERE {where_sql}
+            ORDER BY
+                substr(DATE, 7, 4) || '-' ||
+                substr(DATE, 4, 2) || '-' ||
+                substr(DATE, 1, 2) DESC
+            LIMIT ?
+        """
+
+        df = pd.read_sql_query(sql, conn, params=params)
+
+    return df
+
+
+
+
 
     # On ne peut pas filtrer directement sur des dates ici, on renvoie tout ce qui correspond au nom
     # Identification de la colonne NOM (il peut y avoir des variantes, mais chez toi c'est NOM)
@@ -450,7 +552,7 @@ def insert_planning_row(data: Dict[str, Any]) -> int:
     cols = list(data.keys())
     col_list_sql = ",".join(f'"{c}"' for c in cols)
     placeholders = ",".join("?" for _ in cols)
-    values = [data[c] for c in cols]
+    values = [sqlite_safe(data[c]) for c in cols]
 
     with get_connection() as conn:
         cur = conn.cursor()
@@ -481,7 +583,10 @@ def update_planning_row(row_id: int, data: Dict[str, Any]) -> None:
     values: List[Any] = []
     for col, val in data.items():
         set_parts.append(f'"{col}" = ?')
-        values.append(val)
+        values.append(sqlite_safe(val))
+
+    values.append(row_id)
+
 
     values.append(row_id)
     set_clause = ", ".join(set_parts)
@@ -625,17 +730,36 @@ from datetime import datetime
 from typing import Optional
 
 
-def ensure_planning_updated_at_column() -> None:
+def ensure_planning_updated_at_column():
     """
-    Ajoute la colonne updated_at à la table planning si elle n'existe pas encore.
+    Ajoute la colonne updated_at UNIQUEMENT si :
+    - la table planning existe
+    - la colonne n'existe pas encore
     """
     with get_connection() as conn:
         cur = conn.cursor()
+
+        # 1️⃣ Vérifier si la table planning existe
+        cur.execute("""
+            SELECT name
+            FROM sqlite_master
+            WHERE type='table' AND name='planning'
+        """)
+        if cur.fetchone() is None:
+            # ❗ table absente → NE RIEN FAIRE
+            return
+
+        # 2️⃣ Récupérer les colonnes existantes
         cur.execute("PRAGMA table_info(planning)")
-        cols = [row[1].upper() for row in cur.fetchall()]
-        if "UPDATED_AT" not in cols:
-            cur.execute("ALTER TABLE planning ADD COLUMN updated_at TEXT")
+        existing_cols = [row[1] for row in cur.fetchall()]
+
+        # 3️⃣ Ajouter la colonne uniquement si absente
+        if "updated_at" not in existing_cols:
+            cur.execute(
+                "ALTER TABLE planning ADD COLUMN updated_at TEXT"
+            )
             conn.commit()
+
 
 
 def init_chauffeur_ack_table() -> None:
@@ -758,62 +882,93 @@ def init_flight_alerts_table():
         """)
         conn.commit()
 
-def ensure_flight_alerts_time_columns() -> None:
+def ensure_flight_alerts_time_columns():
     """
-    Ajoute les colonnes last_sched_time / last_est_time à flight_alerts
-    si elles n'existent pas encore.
+    Ajoute les colonnes de temps dans flight_alerts
+    UNIQUEMENT si :
+    - la table flight_alerts existe
+    - les colonnes n'existent pas encore
     """
     with get_connection() as conn:
         cur = conn.cursor()
+
+        # 1️⃣ Vérifier si la table flight_alerts existe
+        cur.execute("""
+            SELECT name
+            FROM sqlite_master
+            WHERE type='table' AND name='flight_alerts'
+        """)
+        if cur.fetchone() is None:
+            # ❗ table absente → on ne fait RIEN
+            return
+
+        # 2️⃣ Colonnes existantes
         cur.execute("PRAGMA table_info(flight_alerts)")
-        cols = [r[1] for r in cur.fetchall()]
+        cols = [row[1] for row in cur.fetchall()]
 
-        if "last_sched_time" not in cols:
-            cur.execute('ALTER TABLE flight_alerts ADD COLUMN "last_sched_time" TEXT')
+        # 3️⃣ Ajouts sécurisés
+        if "sched_time" not in cols:
+            cur.execute(
+                'ALTER TABLE flight_alerts ADD COLUMN "sched_time" TEXT'
+            )
 
-        if "last_est_time" not in cols:
-            cur.execute('ALTER TABLE flight_alerts ADD COLUMN "last_est_time" TEXT')
+        if "est_time" not in cols:
+            cur.execute(
+                'ALTER TABLE flight_alerts ADD COLUMN "est_time" TEXT'
+            )
 
         conn.commit()
 
-def should_notify_flight_change(
-    date_txt: str,
-    ch: str,
-    vol: str,
-    status: str,
-    delay_min: int,
-    sched_time: str,
-    est_time: str,
-) -> bool:
+
+def should_notify_flight_change(date_txt, ch_txt, flight_num, sched_time, est_time):
     """
-    Retourne True uniquement si quelque chose a changé
-    (statut / retard / heure estimée).
+    Vérifie si un changement de vol doit être notifié.
+    SAFE même si la DB vient d'être recréée.
     """
     with get_connection() as conn:
         cur = conn.cursor()
+
+        # 1️⃣ Vérifier que la table flight_alerts existe
+        cur.execute("""
+            SELECT name
+            FROM sqlite_master
+            WHERE type='table' AND name='flight_alerts'
+        """)
+        if cur.fetchone() is None:
+            return False
+
+        # 2️⃣ Vérifier les colonnes existantes
+        cur.execute("PRAGMA table_info(flight_alerts)")
+        cols = [row[1] for row in cur.fetchall()]
+
+        # Colonnes requises
+        required = {"last_sched_time", "last_est_time"}
+        if not required.issubset(set(cols)):
+            # DB recréée mais colonnes absentes → pas de notif
+            return False
+
+        # 3️⃣ Lecture sécurisée
         cur.execute(
             """
-            SELECT last_status, last_delay_min, last_sched_time, last_est_time
+            SELECT last_sched_time, last_est_time
             FROM flight_alerts
-            WHERE date_txt=? AND ch=? AND vol=?
-            LIMIT 1
+            WHERE date = ? AND ch = ? AND flight_num = ?
             """,
-            (date_txt, ch, vol),
+            (date_txt, ch_txt, flight_num),
         )
+
         row = cur.fetchone()
+        if row is None:
+            return True  # première fois → notifier
 
-    if not row:
-        return True  # jamais notifié → on peut notifier
+        last_sched, last_est = row
 
-    old_status, old_delay, old_sched, old_est = row
-    if (old_status or "") != (status or ""):
-        return True
-    if int(old_delay or 0) != int(delay_min or 0):
-        return True
-    if (old_est or "") != (est_time or ""):
-        return True
+        # 4️⃣ Comparaison
+        if last_sched != sched_time or last_est != est_time:
+            return True
 
-    return False
+        return False
+
 
 def flight_alert_exists(date_txt: str, ch: str, vol: str) -> bool:
     with get_connection() as conn:
@@ -827,60 +982,475 @@ def flight_alert_exists(date_txt: str, ch: str, vol: str) -> bool:
 
 def upsert_flight_alert(
     date_txt: str,
-    ch: str,
-    vol: str,
-    status: str,
-    delay_min: int,
-    sched_time: str = "",
-    est_time: str = "",
-) -> None:
-    now = datetime.now().isoformat(timespec="seconds")
+    ch_txt: str,
+    flight_num: str,
+    sched_time: str,
+    est_time: str,
+):
+    """
+    Insère ou met à jour une alerte de vol.
+    SAFE si la table ou les colonnes n'existent pas encore.
+    """
+
     with get_connection() as conn:
         cur = conn.cursor()
+
+        # 1️⃣ Vérifier que la table flight_alerts existe
+        cur.execute("""
+            SELECT name
+            FROM sqlite_master
+            WHERE type='table' AND name='flight_alerts'
+        """)
+        if cur.fetchone() is None:
+            # table absente → rien à faire
+            return
+
+        # 2️⃣ Vérifier / créer les colonnes nécessaires
+        cur.execute("PRAGMA table_info(flight_alerts)")
+        cols = [row[1] for row in cur.fetchall()]
+
+        if "date" not in cols:
+            cur.execute('ALTER TABLE flight_alerts ADD COLUMN "date" TEXT')
+        if "ch" not in cols:
+            cur.execute('ALTER TABLE flight_alerts ADD COLUMN "ch" TEXT')
+        if "flight_num" not in cols:
+            cur.execute('ALTER TABLE flight_alerts ADD COLUMN "flight_num" TEXT')
+
+        if "last_sched_time" not in cols:
+            cur.execute(
+                'ALTER TABLE flight_alerts ADD COLUMN "last_sched_time" TEXT'
+            )
+        if "last_est_time" not in cols:
+            cur.execute(
+                'ALTER TABLE flight_alerts ADD COLUMN "last_est_time" TEXT'
+            )
+
+        conn.commit()
+
+        # 3️⃣ Vérifier si une ligne existe déjà
         cur.execute(
             """
-            INSERT INTO flight_alerts(
-                date_txt, ch, vol,
-                last_status, last_delay_min,
-                last_sched_time, last_est_time,
-                notified_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(date_txt, ch, vol)
-            DO UPDATE SET
-                last_status=excluded.last_status,
-                last_delay_min=excluded.last_delay_min,
-                last_sched_time=excluded.last_sched_time,
-                last_est_time=excluded.last_est_time,
-                notified_at=excluded.notified_at
+            SELECT id
+            FROM flight_alerts
+            WHERE date = ? AND ch = ? AND flight_num = ?
             """,
-            (
-                date_txt,
-                ch,
-                vol,
-                status,
-                int(delay_min or 0),
-                sched_time or "",
-                est_time or "",
-                now,
-            ),
+            (date_txt, ch_txt, flight_num),
         )
+        row = cur.fetchone()
+
+        if row is None:
+            # 4️⃣ INSERT
+            cur.execute(
+                """
+                INSERT INTO flight_alerts
+                ("date", "ch", "flight_num", "last_sched_time", "last_est_time")
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (date_txt, ch_txt, flight_num, sched_time, est_time),
+            )
+        else:
+            alert_id = row[0]
+            # 5️⃣ UPDATE
+            cur.execute(
+                """
+                UPDATE flight_alerts
+                SET last_sched_time = ?, last_est_time = ?
+                WHERE id = ?
+                """,
+                (sched_time, est_time, alert_id),
+            )
+
         conn.commit()
+
 
 def ensure_km_time_columns():
     """
-    Ajoute les colonnes KM_EST et TEMPS_EST à la table planning
-    si elles n'existent pas encore.
+    Ajoute les colonnes KM_EST, TIME_EST uniquement si :
+    - la table planning existe
+    - les colonnes n'existent pas encore
     """
     with get_connection() as conn:
         cur = conn.cursor()
-        cur.execute("PRAGMA table_info(planning)")
-        cols = [r[1] for r in cur.fetchall()]
 
+        # 1️⃣ Vérifier si la table planning existe
+        cur.execute("""
+            SELECT name
+            FROM sqlite_master
+            WHERE type='table' AND name='planning'
+        """)
+        if cur.fetchone() is None:
+            # ❗ planning absente → on ne fait RIEN
+            return
+
+        # 2️⃣ Colonnes existantes
+        cur.execute("PRAGMA table_info(planning)")
+        cols = [row[1] for row in cur.fetchall()]
+
+        # 3️⃣ Ajout sécurisé
         if "KM_EST" not in cols:
             cur.execute('ALTER TABLE planning ADD COLUMN "KM_EST" TEXT')
 
-        if "TEMPS_EST" not in cols:
-            cur.execute('ALTER TABLE planning ADD COLUMN "TEMPS_EST" TEXT')
+        if "TIME_EST" not in cols:
+            cur.execute('ALTER TABLE planning ADD COLUMN "TIME_EST" TEXT')
 
         conn.commit()
+
+def init_sync_meta_table():
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sync_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        conn.commit()
+
+
+def get_last_sync_time() -> datetime | None:
+    init_sync_meta_table()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM sync_meta WHERE key = 'last_sync'")
+        row = cur.fetchone()
+        if row and row[0]:
+            try:
+                return datetime.fromisoformat(row[0])
+            except Exception:
+                return None
+    return None
+
+
+def set_last_sync_time(dt: datetime):
+    init_sync_meta_table()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "REPLACE INTO sync_meta (key, value) VALUES ('last_sync', ?)",
+            (dt.isoformat(timespec="seconds"),)
+        )
+        conn.commit()
+
+def delete_planning_from_date(min_date: str):
+    """
+    Supprime toutes les lignes planning à partir d'une date (dd/mm/yyyy)
+    """
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM planning WHERE DATE >= ?",
+            (min_date,)
+        )
+        conn.commit()
+
+def ensure_indexes():
+    """
+    Crée les index SQL essentiels pour les performances
+    """
+    with get_connection() as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_planning_date ON planning (DATE)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_planning_ch ON planning (CH)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_planning_date_ch ON planning (DATE, CH)"
+        )
+
+        conn.commit()
+
+def ensure_indexes():
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_planning_date ON planning (DATE)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_planning_ch ON planning (CH)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_planning_date_ch ON planning (DATE, CH)")
+        conn.commit()
+
+def init_time_rules_table():
+    """Table des règles d'heures (modifiable en admin)."""
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS time_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ch TEXT NOT NULL,            -- ex: 'NP', 'NP*', '*'
+                sens TEXT NOT NULL,          -- 'VERS' ou 'DE'
+                dest TEXT NOT NULL,          -- ex: 'BRU', 'AMS', 'AUTRE'
+                minutes INTEGER NOT NULL     -- durée en minutes
+            )
+        """)
+        conn.commit()
+
+
+def _hhmm_to_minutes(txt: str) -> int:
+    """Accepte '2h30', '2:30', '150', '2h'."""
+    if txt is None:
+        return 0
+    s = str(txt).strip().lower().replace(" ", "")
+    if not s:
+        return 0
+    if s.isdigit():
+        return int(s)
+    s = s.replace("h", ":")
+    if ":" in s:
+        parts = s.split(":")
+        try:
+            hh = int(parts[0]) if parts[0] else 0
+            mm = int(parts[1]) if len(parts) > 1 and parts[1] else 0
+            return hh * 60 + mm
+        except Exception:
+            return 0
+    return 0
+
+
+def _minutes_to_hhmm(minutes: int) -> str:
+    try:
+        m = int(minutes)
+    except Exception:
+        return ""
+    hh = m // 60
+    mm = m % 60
+    return f"{hh}h{mm:02d}" if hh else f"{mm}min"
+
+
+def get_time_rules_df() -> pd.DataFrame:
+    """Retourne les règles en DataFrame (heures affichées en 2h30)."""
+    init_time_rules_table()
+    with get_connection() as conn:
+        df = pd.read_sql_query('SELECT * FROM time_rules ORDER BY ch, sens, dest', conn)
+
+    if df.empty:
+        return df
+
+    df = df.copy()
+    df["heures"] = df["minutes"].apply(_minutes_to_hhmm)
+    df.drop(columns=["minutes"], inplace=True, errors="ignore")
+    return df
+
+
+def save_time_rules_df(edited: pd.DataFrame):
+    """Sauvegarde complète des règles depuis un DataFrame édité."""
+    init_time_rules_table()
+    if edited is None or edited.empty:
+        # autoriser table vide
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM time_rules")
+            conn.commit()
+        return
+
+    df = edited.copy()
+    # colonnes attendues
+    for col in ["ch", "sens", "dest", "heures"]:
+        if col not in df.columns:
+            raise ValueError(f"Colonne manquante: {col}")
+
+    # normalisation
+    df["ch"] = df["ch"].astype(str).str.strip()
+    df["sens"] = df["sens"].astype(str).str.strip().str.upper()
+    df["dest"] = df["dest"].astype(str).str.strip().str.upper()
+    df["heures"] = df["heures"].astype(str).str.strip()
+
+    # calcul minutes
+    df["minutes"] = df["heures"].apply(_hhmm_to_minutes)
+
+    # filtrer lignes invalides
+    df = df[(df["ch"] != "") & (df["sens"].isin(["VERS", "DE"])) & (df["dest"] != "") & (df["minutes"] > 0)].copy()
+
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM time_rules")
+
+        for _, r in df.iterrows():
+            cur.execute(
+                "INSERT INTO time_rules (ch, sens, dest, minutes) VALUES (?, ?, ?, ?)",
+                (r["ch"], r["sens"], r["dest"], int(r["minutes"])),
+            )
+
+        conn.commit()
+
+
+def _detect_sens_dest_from_row(row: dict) -> tuple[str, str]:
+    """
+    Détecte sens (VERS/DE) et destination (code).
+    Dest = mot-clé dans texte (BRU, GUIL, JCO, AMS, etc.)
+    Si rien -> ('', '')
+    """
+    txt = " ".join([
+        str(row.get("DESIGNATION", "") or ""),
+        str(row.get("Unnamed: 8", "") or ""),
+        str(row.get("ROUTE", "") or ""),
+    ]).upper()
+
+    sens = ""
+    if "VERS" in txt:
+        sens = "VERS"
+    elif " DE " in f" {txt} " or txt.startswith("DE "):
+        sens = "DE"
+
+    # destination = le premier code connu trouvé, sinon AUTRE si on a un sens
+    known = ["BRU", "GUIL", "JCO", "AMS"]
+    dest = ""
+    for k in known:
+        if k in txt:
+            dest = k
+            break
+
+    if sens and not dest:
+        dest = "AUTRE"
+
+    return sens, dest
+
+
+def get_rule_minutes(ch: str, sens: str, dest: str) -> int:
+    """
+    Cherche la règle la plus prioritaire :
+    1) ch exact + sens + dest
+    2) '*' + sens + dest
+    3) ch exact + sens + 'AUTRE'
+    4) '*' + sens + 'AUTRE'
+    Sinon 0
+    """
+    init_time_rules_table()
+    ch = (ch or "").strip()
+    sens = (sens or "").strip().upper()
+    dest = (dest or "").strip().upper()
+
+    priorities = [
+        (ch, sens, dest),
+        ("*", sens, dest),
+        (ch, sens, "AUTRE"),
+        ("*", sens, "AUTRE"),
+    ]
+
+    with get_connection() as conn:
+        cur = conn.cursor()
+        for c, s, d in priorities:
+            cur.execute(
+                "SELECT minutes FROM time_rules WHERE ch=? AND sens=? AND dest=? LIMIT 1",
+                (c, s, d),
+            )
+            r = cur.fetchone()
+            if r and r[0]:
+                return int(r[0])
+    return 0
+
+def get_actions_connection():
+    return sqlite3.connect(ACTIONS_DB_PATH, check_same_thread=False)
+
+def init_actions_table():
+    with get_actions_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                row_key TEXT NOT NULL,
+                action_type TEXT NOT NULL,          -- 'CH_CHANGE'
+                old_value TEXT,
+                new_value TEXT,
+                user TEXT,
+                created_at TEXT NOT NULL,
+                needs_excel_update INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_actions_row_key ON actions(row_key)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_actions_needs_excel ON actions(needs_excel_update)")
+        conn.commit()
+
+def make_row_key_from_row(row: dict) -> str:
+    """
+    Clé stable basée sur des champs Feuil1.
+    Plus ces champs sont stables, plus la clé survivra aux rebuilds.
+    """
+    parts = [
+        str(row.get("DATE", "") or ""),
+        str(row.get("HEURE", "") or ""),
+        str(row.get("Num BDC", "") or row.get("NUM BDC", "") or ""),
+        str(row.get("NOM", "") or ""),
+        str(row.get("ADRESSE", "") or ""),
+        str(row.get("CP", "") or ""),
+        str(row.get("Localité", "") or row.get("LOCALITE", "") or ""),
+        str(row.get("Unnamed: 8", "") or ""),   # route
+        str(row.get("DESIGNATION", "") or ""),
+        str(row.get("VOL", "") or row.get("Vol", "") or ""),
+    ]
+    raw = "|".join(p.strip().upper() for p in parts)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+def log_ch_change(row_key: str, old_ch: str, new_ch: str, user: str = ""):
+    init_actions_table()
+    with get_actions_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO actions (row_key, action_type, old_value, new_value, user, created_at, needs_excel_update)
+            VALUES (?, 'CH_CHANGE', ?, ?, ?, ?, 1)
+        """, (row_key, old_ch or "", new_ch or "", user or "", datetime.now().isoformat(timespec="seconds")))
+        conn.commit()
+
+def get_latest_ch_overrides_map(row_keys: list[str]) -> dict:
+    """
+    Retourne {row_key: new_ch} pour les dernières actions CH_CHANGE.
+    """
+    if not row_keys:
+        return {}
+
+    init_actions_table()
+    q_marks = ",".join("?" for _ in row_keys)
+    sql = f"""
+        SELECT a.row_key, a.new_value
+        FROM actions a
+        JOIN (
+            SELECT row_key, MAX(id) AS max_id
+            FROM actions
+            WHERE action_type='CH_CHANGE' AND row_key IN ({q_marks})
+            GROUP BY row_key
+        ) x ON x.row_key = a.row_key AND x.max_id = a.id
+    """
+
+    with get_actions_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, row_keys)
+        rows = cur.fetchall()
+
+    return {rk: (nv or "").strip() for rk, nv in rows}
+
+def list_pending_actions(limit: int = 500):
+    init_actions_table()
+    with get_actions_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, row_key, action_type, old_value, new_value, user, created_at
+            FROM actions
+            WHERE needs_excel_update=1
+            ORDER BY id DESC
+            LIMIT ?
+        """, (limit,))
+        return cur.fetchall()
+
+def mark_actions_done(action_ids: list[int]):
+    if not action_ids:
+        return
+    init_actions_table()
+    q = ",".join("?" for _ in action_ids)
+    with get_actions_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(f"UPDATE actions SET needs_excel_update=0 WHERE id IN ({q})", action_ids)
+        conn.commit()
+
+def mark_row_needs_excel_update(row_key: str):
+    """
+    Marque une ligne comme modifiée dans l'app
+    et nécessitant une mise à jour Excel.
+    """
+    with sqlite3.connect(ACTIONS_DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO planning_actions (row_key, action, created_at)
+            VALUES (?, 'EXCEL_UPDATE_NEEDED', datetime('now'))
+        """, (row_key,))
+        conn.commit()
+

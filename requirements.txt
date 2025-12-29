@@ -1,7 +1,4 @@
 streamlit
 pandas
 openpyxl
-reportlab
-pillow
-python-dateutil
-
+requests

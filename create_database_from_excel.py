@@ -11,7 +11,7 @@ from ftplib import FTP
 FTP_HOST = "ftp.airports-linescom.webhosting.be"
 FTP_USER = "info@airports-linescom"
 FTP_PASSWORD = "A1rp0rts-L1nes"
-FTP_FILE_PATH = "/www/wp-content/uploads/2025/11/Planning-2025.xlsx"
+FTP_FILE_PATH = "/www/wp-content/uploads/2025/11/Planning 2025.xlsx"
 
 # =========================
 #   CONFIG BASE DE DONNÉES

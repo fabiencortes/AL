@@ -7,15 +7,21 @@ import os
 import io
 from datetime import datetime, date, timedelta
 from typing import Dict, Any, List
+from database import init_time_rules_table
+from database import init_actions_table
 
 import math
 import smtplib
 from email.mime.text import MIMEText
 import pandas as pd
+import requests
+import dropbox
+from io import BytesIO
 import streamlit as st
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import cm
+from ftplib import FTP
 
 from database import (
     get_planning,
@@ -41,8 +47,437 @@ from database import (
     ensure_flight_alerts_time_columns,
     should_notify_flight_change,
     upsert_flight_alert,
+    sqlite_safe,
+    get_last_sync_time,
+    set_last_sync_time,
 
 )
+
+# ============================================================
+#   SESSION STATE
+# ============================================================
+
+def init_session_state():
+    defaults = {
+        "logged_in": False,
+        "username": None,
+        "role": None,
+        "chauffeur_code": None,
+        "planning_start": date.today(),
+        "planning_end": date.today() + timedelta(days=6),
+        "planning_sort_choice": "Date + heure",
+    }
+
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+# =========================
+# CONFIG FTP – PLANNING
+# =========================
+FTP_HOST = "ftp.airports-linescom.webhosting.be"
+FTP_USER = "site@airports-linescom"
+FTP_PASS = "siteALGL2025"
+FTP_PLANNING_PATH = "/www/wp-content/uploads/2025/11/Planning%202025.xlsx"
+
+def onedrive_to_ftp_and_rebuild_db():
+    from datetime import date
+    import subprocess
+    import sys
+    import pandas as pd
+    from database import get_connection
+
+    # ==========================
+    # 1️⃣ OneDrive → FTP
+    # ==========================
+    ok = upload_planning_onedrive_to_ftp()
+    if not ok:
+        st.error("❌ Échec copie OneDrive → FTP")
+        return
+
+    st.info("✅ Fichier OneDrive copié sur le FTP")
+
+    # ==========================
+    # 2️⃣ Recréer la DB depuis le FTP
+    # ==========================
+    try:
+        subprocess.run(
+            [sys.executable, "create_database_from_excel.py"],
+            check=True
+        )
+    except Exception as e:
+        st.error(f"❌ Erreur recréation DB : {e}")
+        return
+
+    st.info("✅ Base de données recréée")
+
+    # ==========================
+    # 3️⃣ Vérifier que planning existe
+    # ==========================
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT name
+            FROM sqlite_master
+            WHERE type='table' AND name='planning'
+        """)
+        if cur.fetchone() is None:
+            st.error("❌ Table planning introuvable après recréation")
+            return
+
+    # ==========================
+    # 4️⃣ Charger le planning
+    # ==========================
+    with get_connection() as conn:
+        df = pd.read_sql_query("SELECT * FROM planning", conn)
+
+    if df.empty:
+        st.warning("⚠️ Planning vide après import")
+        return
+
+    # ==========================
+    # 5️⃣ Filtrer à partir d’aujourd’hui
+    # ==========================
+    today = date.today()
+
+    if "DATE" not in df.columns:
+        st.error("❌ Colonne DATE absente dans planning")
+        return
+
+    df["DATE_TMP"] = pd.to_datetime(
+        df["DATE"], dayfirst=True, errors="coerce"
+    ).dt.date
+
+    df = df[
+        df["DATE_TMP"].notna() &
+        (df["DATE_TMP"] >= today)
+    ].copy()
+
+    df.drop(columns=["DATE_TMP"], inplace=True)
+
+    # ==========================
+    # 6️⃣ Réécriture propre de la table planning
+    # ==========================
+    with get_connection() as conn:
+        cur = conn.cursor()
+
+        cur.execute('DROP TABLE IF EXISTS "planning"')
+
+        cols = [c for c in df.columns if c != "id"]
+
+        # ✅ Colonnes protégées (espaces, :, /, unicode, etc.)
+        cols_sql = ", ".join(f'"{c}" TEXT' for c in cols)
+        cols_sql_names = ", ".join(f'"{c}"' for c in cols)
+
+        cur.execute(f"""
+            CREATE TABLE "planning" (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                {cols_sql}
+            )
+        """)
+
+        placeholders = ", ".join("?" for _ in cols)
+
+        # ✅ IMPORTANT : noms de colonnes entre guillemets
+        insert_sql = f"""
+            INSERT INTO "planning" ({cols_sql_names})
+            VALUES ({placeholders})
+        """
+
+        for _, row in df.iterrows():
+            cur.execute(
+                insert_sql,
+                [str(row[c]) if row[c] is not None else "" for c in cols]
+            )
+
+        conn.commit()
+
+    st.success("🎉 DB mise à jour (à partir d’aujourd’hui)")
+    st.cache_data.clear()
+    st.rerun()
+
+
+
+def load_planning_from_ftp() -> pd.DataFrame:
+    """
+    Télécharge Planning 2025.xlsx depuis le FTP
+    et retourne un DataFrame pandas
+    """
+    try:
+        ftp = FTP(FTP_HOST)
+        ftp.login(FTP_USER, FTP_PASS)
+
+        bio = BytesIO()
+        ftp.retrbinary(f"RETR {FTP_PLANNING_PATH}", bio.write)
+        ftp.quit()
+
+        bio.seek(0)
+
+        df = pd.read_excel(bio, engine="openpyxl")
+        return df.fillna("")
+
+    except Exception as e:
+        st.error(f"❌ Erreur lecture FTP : {e}")
+        return pd.DataFrame()
+
+
+ONEDRIVE_PLANNING_PATH = (
+    r"C:\Users\admin\OneDrive - AIRPORTS-LINES\Planning 2025.xlsx"
+)
+
+def upload_planning_onedrive_to_ftp():
+    if not os.path.exists(ONEDRIVE_PLANNING_PATH):
+        st.error(
+            "❌ Fichier OneDrive introuvable :\n"
+            f"{ONEDRIVE_PLANNING_PATH}"
+        )
+        return False
+
+    try:
+        ftp = FTP(FTP_HOST)
+        ftp.login(FTP_USER, FTP_PASS)
+
+        with open(ONEDRIVE_PLANNING_PATH, "rb") as f:
+            ftp.storbinary(f"STOR {FTP_PLANNING_PATH}", f)
+
+        ftp.quit()
+        return True
+
+    except Exception as e:
+        st.error(f"❌ Erreur FTP : {e}")
+        return False
+def rebuild_db_fast(status):
+    import os
+    import shutil
+    from datetime import datetime
+    from database import ensure_indexes
+
+    NEW_DB = "airportslines_NEW.db"
+    MAIN_DB = "airportslines.db"
+    BACKUP_DIR = "db_backups"
+
+    status.update(label="📦 Bascule vers la nouvelle base…")
+
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+
+    if os.path.exists(MAIN_DB):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        shutil.move(
+            MAIN_DB,
+            os.path.join(BACKUP_DIR, f"airportslines_{ts}.db")
+        )
+
+    os.rename(NEW_DB, MAIN_DB)
+
+    ensure_indexes()
+
+    status.update(label="🎉 Base active remplacée", state="complete")
+
+def rebuild_db_from_ftp(status):
+    """
+    Sauvegarde la DB actuelle, la supprime,
+    puis recrée une DB neuve depuis le FTP
+    """
+    import os
+    import subprocess
+    import sys
+    from datetime import datetime
+    import shutil
+
+    DB_PATH = "airportslines.db"
+    BACKUP_DIR = "db_backups"
+
+    # 1) Dossier backup
+    status.update(label="💾 Préparation des sauvegardes…")
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+
+    # 2) Sauvegarde DB existante
+    if os.path.exists(DB_PATH):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = os.path.join(BACKUP_DIR, f"airportslines_{ts}.db")
+        shutil.copy2(DB_PATH, backup_path)
+        status.write(f"✅ Base sauvegardée : {backup_path}")
+
+        os.remove(DB_PATH)
+        status.write("🧹 Ancienne base supprimée")
+    else:
+        status.write("ℹ️ Aucune base existante à sauvegarder")
+
+    # 3) Recréation DB
+    status.update(label="📦 Création de la nouvelle base de données…")
+    subprocess.run(
+        [sys.executable, "create_database_from_excel.py"],
+        check=True
+    )
+    status.write("✅ Nouvelle base créée depuis le FTP")
+
+    # 4) Index SQL
+    status.update(label="⚡ Optimisation de la base (index SQL)…")
+    from database import ensure_indexes
+    ensure_indexes()
+    status.write("✅ Index SQL créés")
+
+    status.update(label="🎉 Reconstruction terminée", state="complete")
+
+def sync_planning_from_ftp():
+
+    # ==========================================================
+    # 1) VERROU ANTI-BOUCLE STREAMLIT
+    # ==========================================================
+    if st.session_state.get("sync_running"):
+        st.warning("⏳ Synchronisation déjà en cours")
+        return
+
+    st.session_state["sync_running"] = True
+
+    try:
+        # ======================================================
+        # 2) Charger le fichier Excel depuis le FTP
+        # ======================================================
+        df_excel = load_planning_from_ftp()
+
+        if df_excel.empty:
+            st.warning("Le planning FTP est vide.")
+            return
+
+        # ======================================================
+        # 3) Filtre SIMPLE et RAPIDE par date
+        #    (aujourd’hui - 2 jours → futur)
+        # ======================================================
+        today = date.today()
+
+        df_excel["DATE_TMP"] = pd.to_datetime(
+            df_excel["DATE"],
+            dayfirst=True,
+            errors="coerce"
+        ).dt.date
+
+        df_excel = df_excel[
+            df_excel["DATE_TMP"].notna() &
+            (df_excel["DATE_TMP"] >= today - timedelta(days=2))
+        ].copy()
+
+        df_excel.drop(columns=["DATE_TMP"], inplace=True)
+
+        if df_excel.empty:
+            st.info("Aucune ligne à synchroniser pour la période sélectionnée.")
+            return
+
+        # ======================================================
+        # 4) Vérifier colonnes obligatoires
+        # ======================================================
+        REQUIRED_COLS = ["DATE", "HEURE", "CH"]
+        for col in REQUIRED_COLS:
+            if col not in df_excel.columns:
+                st.error(f"Colonne manquante dans le fichier FTP : {col}")
+                return
+
+        # ======================================================
+        # 5) Charger UNIQUEMENT ce qui est utile depuis la DB
+        # ======================================================
+        with get_connection() as conn:
+            df_db = pd.read_sql_query(
+                "SELECT id, DATE, HEURE, CH FROM planning",
+                conn
+            )
+
+        # ======================================================
+        # 6) Index DB par clé DATE|HEURE|CH
+        # ======================================================
+        def make_key(row):
+            return (
+                f"{str(row.get('DATE','')).strip()}|"
+                f"{str(row.get('HEURE','')).strip()}|"
+                f"{str(row.get('CH','')).strip()}"
+            )
+
+        db_map = {
+            make_key(r): int(r["id"])
+            for _, r in df_db.iterrows()
+        }
+
+        inserts = 0
+        updates = 0
+
+        # ======================================================
+        # 7) Synchronisation Excel → DB
+        # ======================================================
+        for _, row in df_excel.iterrows():
+            key = make_key(row)
+
+            data = {
+                col: sqlite_safe(row[col])
+                for col in df_excel.columns
+                if col != "id"
+            }
+
+            if key in db_map:
+                update_planning_row(db_map[key], data)
+                updates += 1
+            else:
+                insert_planning_row(data)
+                inserts += 1
+
+        # ======================================================
+        # 8️⃣ Excel = maintenant à jour → on enlève les badges 🟡
+        # ======================================================
+        from database import get_actions_connection
+
+        with get_actions_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("UPDATE actions SET needs_excel_update = 0")
+            conn.commit()
+
+        # ======================================================
+        # 9) Succès + sauvegarde date de synchro
+        # ======================================================
+        st.success(
+            f"FTP → DB terminé ✅ "
+            f"{inserts} ajout(s) • {updates} mise(s) à jour"
+        )
+
+        set_last_sync_time(datetime.now())
+
+    except Exception as e:
+        st.error(f"❌ Erreur synchro FTP → DB : {e}")
+        raise
+
+    finally:
+        # ======================================================
+        # 10) Déverrouillage anti-boucle (TOUJOURS)
+        # ======================================================
+        st.session_state["sync_running"] = False
+
+
+
+from database import make_row_key_from_row, get_latest_ch_overrides_map
+
+def apply_actions_overrides(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    df = df.copy()
+
+    # calc row_key
+    keys = []
+    row_keys = []
+    for _, r in df.iterrows():
+        rk = make_row_key_from_row(r.to_dict())
+        row_keys.append(rk)
+        keys.append(rk)
+
+    df["row_key"] = row_keys
+
+    # overrides
+    mp = get_latest_ch_overrides_map(keys)
+    if mp:
+        df["_CH_ORIG"] = df.get("CH", "")
+        df["CH"] = df.apply(lambda x: mp.get(x["row_key"], x.get("CH", "")), axis=1)
+        df["_needs_excel_update"] = df["row_key"].apply(lambda k: 1 if k in mp else 0)
+    else:
+        df["_needs_excel_update"] = 0
+
+    return df
 
 from import_excel_to_db import EXCEL_FILE, import_planning_from_feuil1
 import requests
@@ -256,6 +691,10 @@ st.set_page_config(
     page_title="Airports-Lines – Planning chauffeurs",
     layout="wide",
 )
+
+# 🔐 INITIALISATION OBLIGATOIRE DU SESSION STATE
+init_session_state()
+
 
 # ============================================================
 #   CONFIG UTILISATEURS
@@ -1250,6 +1689,7 @@ def render_tab_planning():
         type_filter=type_filter,
         search=search,
         max_rows=2000,
+        source="7j"
     )
 
     if df.empty:
@@ -1361,15 +1801,18 @@ def render_tab_quick_day_mobile():
     df = get_planning(
         start_date=sel_date,
         end_date=sel_date,
-        chauffeur=None,          # ✅ IMPORTANT : tous chauffeurs
+        chauffeur=None,
         type_filter=None,
         search="",
         max_rows=3000,
+        source="day",
     )
 
     if df.empty:
         st.info("Aucune navette pour cette journée.")
         return
+    
+    df = apply_actions_overrides(df)
 
     df = df.copy()
     cols = df.columns.tolist()
@@ -1379,7 +1822,7 @@ def render_tab_quick_day_mobile():
     if not chs_ui:
         chs_ui = get_chauffeurs() or CH_CODES
 
-    # 3) Tri par heure (rapide)
+    # 3) Tri par heure
     def _key_time(v):
         txt = normalize_time_string(v)
         try:
@@ -1391,16 +1834,16 @@ def render_tab_quick_day_mobile():
         df["_sort_time"] = df["HEURE"].apply(_key_time)
         df = df.sort_values("_sort_time", ascending=True)
 
-    # 4) Affichage ligne compacte (style "texte compact")
     st.markdown("### 📋 Détail des navettes (texte compact)")
-    st.caption("Vue admin : toutes les navettes du jour. Tu peux remplacer le chauffeur et envoyer WhatsApp.")
+    st.caption("Vue admin : toutes les navettes du jour.")
 
     for _, row in df.iterrows():
+
         # Ignorer les indispos
         if is_indispo_row(row, cols):
             continue
 
-        # ID (obligatoire pour update)
+        # ID
         try:
             row_id = int(row.get("id"))
         except Exception:
@@ -1411,12 +1854,8 @@ def render_tab_quick_day_mobile():
         if isinstance(date_val, (datetime, date)):
             date_txt = date_val.strftime("%d/%m/%Y")
         else:
-            date_val = row.get("DATE")
-            if isinstance(date_val, (datetime, date)):
-                date_txt = date_val.strftime("%d/%m/%Y")
-            else:
-                dtmp = pd.to_datetime(date_val, dayfirst=True, errors="coerce")
-                date_txt = dtmp.strftime("%d/%m/%Y") if not pd.isna(dtmp) else ""
+            dtmp = pd.to_datetime(date_val, dayfirst=True, errors="coerce")
+            date_txt = dtmp.strftime("%d/%m/%Y") if not pd.isna(dtmp) else ""
 
         # Heure
         heure_txt = normalize_time_string(row.get("HEURE", "")) or "??:??"
@@ -1424,19 +1863,15 @@ def render_tab_quick_day_mobile():
         # Chauffeur
         ch_current = str(row.get("CH", "") or "").strip()
 
-        # Destination (même logique que tes autres vues)
+        # Destination
         designation = str(row.get("DESIGNATION", "") or "").strip()
         route_txt = str(row.get("Unnamed: 8", "") or "").strip()
-
-        if route_txt and designation and designation not in route_txt:
-            dest = f"{route_txt} ({designation})"
-        else:
-            dest = route_txt or designation or "Navette"
+        dest = f"{route_txt} ({designation})" if route_txt and designation else route_txt or designation or "Navette"
 
         # Client
         nom = str(row.get("NOM", "") or "").strip()
 
-        # Adresse (optionnel)
+        # Adresse
         adresse = str(row.get("ADRESSE", "") or "").strip()
         cp = str(row.get("CP", "") or "").strip()
         loc = str(row.get("Localité", "") or row.get("LOCALITE", "") or "").strip()
@@ -1447,41 +1882,30 @@ def render_tab_quick_day_mobile():
         paiement = str(row.get("PAIEMENT", "") or "").strip()
         bdc = str(row.get("Num BDC", "") or "").strip()
 
-        # Vol + badge + alerte admin (UNE SEULE FOIS)
+        # ============================
+        # ✈️ ALERTE VOL (ADMIN)
+        # ============================
         vol = extract_vol_val(row, cols)
         badge = ""
 
         if vol:
             status, delay_min, sched_dt, est_dt = get_flight_status_cached(vol)
-
             badge = flight_badge(status, delay_min)
 
-        # ============================
-        # ✈️ ÉTAPE 6 — ALERTE VOL ADMIN
-        # ============================
-
-        vol = extract_vol_val(row, cols)
-
-        if vol:
-            status, delay_min, sched_dt, est_dt = get_flight_status_cached(vol)
-
-            # Sécurisation des heures (anti faux changements)
             if sched_dt is not None:
                 sched_dt = sched_dt.replace(second=0, microsecond=0)
             if est_dt is not None:
                 est_dt = est_dt.replace(second=0, microsecond=0)
 
-            sched_txt = sched_dt.strftime("%H:%M") if sched_dt is not None else ""
-            est_txt = est_dt.strftime("%H:%M") if est_dt is not None else ""
+            sched_txt = sched_dt.strftime("%H:%M") if sched_dt else ""
+            est_txt = est_dt.strftime("%H:%M") if est_dt else ""
 
-            ch_txt = str(row.get("CH", "") or "").strip()
+            ch_txt = ch_current
 
             if should_notify_flight_change(
                 date_txt,
                 ch_txt,
                 vol,
-                status,
-                delay_min,
                 sched_txt,
                 est_txt,
             ):
@@ -1505,16 +1929,13 @@ def render_tab_quick_day_mobile():
                     date_txt,
                     ch_txt,
                     vol,
-                    status,
-                    delay_min,
                     sched_txt,
                     est_txt,
                 )
 
-
-
-
-        # ------- Ligne compacte -------
+        # ============================
+        # AFFICHAGE LIGNE
+        # ============================
         line = f"📆 {date_txt} | ⏱ {heure_txt} | 👤 {ch_current} → {dest}"
         if nom:
             line += f" | 🙂 {nom}"
@@ -1543,21 +1964,44 @@ def render_tab_quick_day_mobile():
                     key=f"qd_newch_{row_id}",
                 )
 
-            # Bouton sauvegarde
+            # Sauvegarde (journal d’actions, PAS écriture DB planning)
             with colB:
                 if new_ch != ch_current:
                     if st.button("💾 Appliquer", key=f"qd_save_{row_id}"):
-                        update_planning_row(row_id, {"CH": new_ch})
-                        st.success("Chauffeur modifié.")
+
+                        from database import log_ch_change, make_row_key_from_row
+
+                        # clé stable basée sur la ligne Excel
+                        row_key = make_row_key_from_row(row.to_dict())
+
+                        old_ch = ch_current
+                        user = (
+                            st.session_state.get("username")
+                            or st.session_state.get("user")
+                            or ""
+                        )
+
+                        # écrire dans la DB actions (persistante)
+                        log_ch_change(
+                            row_key=row_key,
+                            old_ch=old_ch,
+                            new_ch=new_ch,
+                            user=user,
+                        )
+
+                        st.warning(
+                            "⚠️ Chauffeur modifié côté application.\n"
+                            "📄 À reporter dans le planning Excel (Feuil1)."
+                        )
                         st.rerun()
                 else:
                     st.caption("")
 
-            # WhatsApp chauffeur
-            with colC:
-                norm_ch = normalize_ch_for_phone(new_ch if new_ch else ch_current)
-                tel_ch, _mail = get_chauffeur_contact(norm_ch) if norm_ch else ("", "")
 
+            # WhatsApp
+            with colC:
+                norm_ch = normalize_ch_for_phone(new_ch or ch_current)
+                tel_ch, _ = get_chauffeur_contact(norm_ch) if norm_ch else ("", "")
                 if tel_ch:
                     msg = (
                         f"Bonjour {new_ch or ch_current},\n"
@@ -1577,426 +2021,139 @@ def render_tab_quick_day_mobile():
 
 
 
+
 # ============================================================
 #   ONGLET 📊 TABLEAU / ÉDITION — SÉLECTION + FICHE DÉTAILLÉE
 # ============================================================
-
 def render_tab_table():
-    st.subheader("📊 Tableau planning — sélection, édition, groupage")
+    st.subheader("📊 Planning — Édition Excel Online")
 
-    today = date.today()
-    start_date = st.date_input(
-        "Afficher les navettes à partir de :",
-        value=today,
-        key="table_start",
-    )
-
-    df = get_planning(start_date=start_date, end_date=None, max_rows=2000)
-
-    # On mémorise le tableau original pour pouvoir détecter les modifications
-    if (
-        "table_original_df" not in st.session_state
-        or st.session_state.get("table_original_start") != start_date
-    ):
-        st.session_state["table_original_df"] = df.copy()
-        st.session_state["table_original_start"] = start_date
-
-    if df.empty:
-        st.warning("Aucune navette à partir de cette date.")
-        return
-
-    if "id" not in df.columns:
-        st.error("La table `planning` doit contenir une colonne `id` (clé primaire).")
-        return
-
-    # Limiter à 40 colonnes max pour garder une vue lisible,
-    # mais en gardant les colonnes importantes visibles
-    if df.shape[1] > 40:
-        priority = ["id", "DATE", "HEURE", "²²²²", "CH", "GO", "GROUPAGE", "PARTAGE"]
-        core_cols = [c for c in priority if c in df.columns]
-        other_cols = [c for c in df.columns if c not in core_cols]
-        max_cols = 40
-        keep_cols = core_cols + other_cols[: max_cols - len(core_cols)]
-        df = df[keep_cols]
-
-
-    # On garde les id à part
-    ids = df["id"].tolist()
-    df_view = df.drop(columns=["id"]).copy().reset_index(drop=True)
-
-    # Colonne de sélection
-    df_view.insert(0, "_SELECT", False)
-    # --- Affichage KM / TEMPS depuis la DB ---
-    if "KM_EST" in df.columns:
-        df_view["_KM_EST"] = df["KM_EST"].fillna("").astype(str)
-    else:
-        df_view["_KM_EST"] = ""
-
-    if "TEMPS_EST" in df.columns:
-        df_view["_TEMPS_EST"] = df["TEMPS_EST"].fillna("").astype(str)
-    else:
-        df_view["_TEMPS_EST"] = ""
-
-
-    st.markdown("#### Aperçu (coche une ligne pour l’éditer en bas)")
-    edited = st.data_editor(
-        df_view,
-        use_container_width=True,
-        height=400,
-        num_rows="fixed",
-        key="table_editor",
-    )
-    # ==================================================
-    #  EXÉCUTION DU CALCUL KM / TEMPS + SAUVEGARDE DB
-    # ==================================================
-    if st.session_state.get("km_time_run"):
-        selected_indices = edited.index[edited["_SELECT"] == True].tolist()
-        selected_ids = [int(ids[i]) for i in selected_indices]
-
-        mode = st.session_state.get("km_time_last_mode", "✅ Lignes cochées (_SELECT)")
-        targets = selected_ids if mode.startswith("✅") else [int(x) for x in ids]
-
-        for rid in targets:
-            row = df[df["id"] == rid].iloc[0]
-
-            # ⛔️ Ne pas recalculer si déjà présent
-            if row.get("KM_EST") and row.get("TEMPS_EST"):
-                continue
-
-            origin = (
-                build_full_address_from_row(row)
-                or st.session_state.get("km_base_address", "Liège, Belgique")
-            )
-            dest = resolve_destination_text(row)
-
-            km, mn = ors_route_km_min(origin, dest)
-            if km is not None and mn is not None:
-                update_planning_row(
-                    rid,
-                    {
-                        "KM_EST": str(km),
-                        "TEMPS_EST": str(mn),
-                    }
-                )
-
-        st.session_state["km_time_run"] = False
-        st.success("KM et temps calculés et sauvegardés ✅")
-        st.rerun()
-
-
-    # ==========================
-    #  KM/TEMPS à la demande (affichage seulement)
-    # ==========================
-    with st.expander("📏 KM & temps (à la demande)", expanded=False):
-        st.caption("Calcule et sauvegarde les KM + temps estimés (réutilisés pour les prochains transferts).")
-
-        base_default = st.session_state.get("km_base_address", "Liège, Belgique")
-        base_addr = st.text_input("Adresse de départ par défaut (si adresse RDV vide)", value=base_default)
-        st.session_state["km_base_address"] = base_addr
-
-        calc_mode = st.radio(
-            "Calculer pour :",
-            ["✅ Lignes cochées (_SELECT)", "📄 Toutes les lignes affichées"],
-            horizontal=True
-        )
-
-        if not ORS_API_KEY:
-            st.warning("ORS_API_KEY manquante (variable d’environnement ORS_API_KEY). Le calcul ne peut pas tourner.")
-
-        if st.button("🚀 Calculer KM + temps", key="btn_calc_km_time"):
-            st.session_state["km_time_by_id"] = {}  # dict {id: (km, min)}
-            st.session_state["km_time_last_mode"] = calc_mode
-            st.session_state["km_time_run"] = True
-
-    # ========= MISE À JOUR DIRECTE DEPUIS LE TABLEAU =========
-
-    # On reconstruit un DataFrame complet avec la colonne id
-    df_edited_full = edited.drop(columns=["_SELECT", "_KM_EST", "_TEMPS_EST"], errors="ignore").copy()
-    df_edited_full.insert(0, "id", ids)
-
-    if st.button("💾 Mettre à jour les modifications du tableau"):
-        original = st.session_state.get("table_original_df")
-        if original is None or len(original) != len(df_edited_full):
-            st.error("Impossible de comparer les modifications (recharge la page ou rechoisis la date).")
-        else:
-            # On compare ligne par ligne en texte pour voir ce qui a changé
-            orig_str = original.set_index("id").astype(str)
-            edit_str = df_edited_full.set_index("id").astype(str)
-
-            nb_done = 0
-            for rid in ids:
-                o = orig_str.loc[rid]
-                n = edit_str.loc[rid]
-                if not o.equals(n):
-                    # Cette ligne a été modifiée dans le tableau
-                    row_new = df_edited_full[df_edited_full["id"] == rid].iloc[0].to_dict()
-                    row_new.pop("id", None)
-
-                    # Nettoyage des NaN
-                    clean: Dict[str, Any] = {}
-                    for k, v in row_new.items():
-                        if isinstance(v, float) and math.isnan(v):
-                            clean[k] = ""
-                        else:
-                            clean[k] = v
-
-                    update_planning_row(int(rid), clean)
-                    nb_done += 1
-
-            if nb_done:
-                st.success(f"{nb_done} navette(s) mise(s) à jour depuis le tableau.")
-                st.rerun()
-            else:
-                st.info("Aucun changement détecté dans le tableau.")
-
-    # ========= SÉLECTION POUR LA FICHE DÉTAILLÉE =========
-
-    # Indices cochés
-    selected_indices = edited.index[edited["_SELECT"] == True].tolist()
-
-
-    # Indices cochés
-    selected_indices = edited.index[edited["_SELECT"] == True].tolist()
-    if selected_indices:
-        selected_idx = selected_indices[-1]  # dernière ligne cochée
-    else:
-        selected_idx = 0  # par défaut première ligne
-
-    selected_ids_for_group = [int(ids[i]) for i in selected_indices] if selected_indices else []
-    selected_id = int(ids[selected_idx])
-    row_data = get_row_by_id(selected_id)
-
-    # Résumé rapide
-    resume_date = row_data.get("DATE", "")
-    resume_heure = row_data.get("HEURE", "")
-    resume_nom = row_data.get("NOM", "")
     st.markdown(
-        f"**Navette sélectionnée :** id `{selected_id}` — "
-        f"{resume_date} {resume_heure} — {resume_nom}"
+        "Le planning s’édite directement dans **Excel Online** "
+        "(ouverture dans un nouvel onglet)."
     )
 
-    st.markdown("### 📝 Fiche détaillée")
-
-    cols_names = get_planning_columns()
-
-    priority = ["DATE", "HEURE", "²²²²", "CH", "GO", "GROUPAGE", "PARTAGE"]
-    ordered = []
-
-    for c in priority:
-        if c in cols_names and c not in ordered:
-            ordered.append(c)
-
-    for c in cols_names:
-        if c not in ordered:
-            ordered.append(c)
-
-    cols_names = ordered[:40]  # on garde 40 max, mais avec GROUPAGE/PARTAGE dedans
-
-    new_values: Dict[str, Any] = {}
-    cL, cR = st.columns(2)
-
-    for i, col_name in enumerate(cols_names):
-        cont = cL if i % 2 == 0 else cR
-        val = row_data.get(col_name)
-
-        # DATE
-        if col_name == "DATE":
-            default_date = today
-            if isinstance(val, str) and val:
-                try:
-                    default_date = datetime.strptime(val, "%d/%m/%Y").date()
-                except Exception:
-                    pass
-            new_d = cont.date_input(
-                "DATE",
-                value=default_date,
-                key=f"edit_DATE_{selected_id}",
-            )
-            new_values[col_name] = new_d.strftime("%d/%m/%Y")
-            continue
-
-        # GROUPAGE / PARTAGE
-        if col_name in ["GROUPAGE", "PARTAGE"]:
-            b = cont.checkbox(
-                "Groupage" if col_name == "GROUPAGE" else "Navette partagée",
-                value=bool_from_flag(val),
-                key=f"edit_{col_name}_{selected_id}",
-            )
-            new_values[col_name] = "1" if b else "0"
-            continue
-
-        # GO
-        if col_name == "GO":
-            txt = "" if val is None else str(val)
-            t2 = cont.text_input(
-                "GO (vide / AL / GO / GL)",
-                value=txt,
-                key=f"edit_GO_{selected_id}",
-            )
-            new_values[col_name] = t2.strip().upper()
-            continue
-
-        # HEURE
-        if col_name == "HEURE":
-            txt = "" if val is None else str(val)
-            t2 = cont.text_input(
-                "HEURE",
-                value=txt,
-                key=f"edit_HEURE_{selected_id}",
-            )
-            new_values[col_name] = normalize_time_string(t2)
-            continue
-
-        # HEURE DE FIN (²²²²) → on la normalise aussi
-        if col_name == "²²²²":
-            txt = "" if val is None else str(val)
-            t2 = cont.text_input(
-                "Heure fin (²²²²)",
-                value=txt,
-                key=f"edit_2222_{selected_id}",
-            )
-            new_values[col_name] = normalize_time_string(t2)
-            continue
-
-        # Tous les autres champs en simple texte
-        txt = "" if val is None or str(val).lower() == "nan" else str(val)
-        t2 = cont.text_input(col_name, value=txt, key=f"edit_{col_name}_{selected_id}")
-        new_values[col_name] = t2
-
-    st.markdown("#### 🧾 Bloc note")
-    st.text_area(
-        "Texte libre (non enregistré, juste pour copier/coller)",
-        value="",
-        key=f"edit_notepad_{selected_id}",
-        height=100,
+    EXCEL_ONLINE_URL = (
+        "https://airportslines1-my.sharepoint.com/:x:/g/personal/"
+        "info_airports-lines_com/IQCoqB19JENLR6Us1-etRxtNAVQj3eKlijHGFtNwwj8FbjY"
+        "?e=CO5j8Y"
     )
 
-    role = st.session_state.role
-
-    colA, colB, colC, colD, colE = st.columns(5)
-
-    # ---------- Mettre à jour ----------
-    with colA:
-        if st.button("✅ Mettre à jour"):
-            if role_allows_go_gl_only() and not leon_allowed_for_row(row_data.get("GO")):
-                st.error("Utilisateur 'leon' : modification autorisée uniquement pour GO / GL.")
-            else:
-                update_planning_row(selected_id, new_values)
-                st.success("Navette mise à jour.")
-                st.rerun()
-
-    # ---------- Dupliquer même date ----------
-    with colB:
-        if st.button("📋 Dupliquer (même date)"):
-            if role_allows_go_gl_only() and not leon_allowed_for_row(new_values.get("GO")):
-                st.error("Utilisateur 'leon' : création autorisée uniquement pour GO / GL.")
-            else:
-                clone = new_values.copy()
-                insert_planning_row(clone)
-                st.success("Navette dupliquée.")
-                st.rerun()
-
-    # ---------- Dupliquer pour demain ----------
-    with colC:
-        if st.button("📆 Dupliquer pour demain"):
-            clone = new_values.copy()
-            d_txt = clone.get("DATE")
-            try:
-                d = datetime.strptime(d_txt, "%d/%m/%Y").date()
-                d2 = d + timedelta(days=1)
-                clone["DATE"] = d2.strftime("%d/%m/%Y")
-            except Exception:
-                pass
-
-            if role_allows_go_gl_only() and not leon_allowed_for_row(clone.get("GO")):
-                st.error("Utilisateur 'leon' : création autorisée uniquement pour GO / GL.")
-            else:
-                insert_planning_row(clone)
-                st.success("Navette dupliquée pour le lendemain.")
-                st.rerun()
-
-    # ---------- Dupliquer sur date choisie ----------
-    with colD:
-        dup_date = st.date_input(
-            "Date pour duplication personnalisée",
-            value=today,
-            key=f"dup_custom_{selected_id}",
-        )
-        if st.button("📆 Dupliquer sur cette date"):
-            clone = new_values.copy()
-            clone["DATE"] = dup_date.strftime("%d/%m/%Y")
-
-            if role_allows_go_gl_only() and not leon_allowed_for_row(clone.get("GO")):
-                st.error("Utilisateur 'leon' : création autorisée uniquement pour GO / GL.")
-            else:
-                insert_planning_row(clone)
-                st.success(f"Navette dupliquée sur le {clone['DATE']}.")
-                st.rerun()
-
-    # ---------- Supprimer ----------
-    with colE:
-        if st.button("🗑️ Supprimer"):
-            if role_allows_go_gl_only() and not leon_allowed_for_row(row_data.get("GO")):
-                st.error("Utilisateur 'leon' : suppression autorisée uniquement pour GO / GL.")
-            else:
-                delete_planning_row(selected_id)
-                st.success("Navette supprimée.")
-                st.rerun()
+    # ==============================
+    # 🌐 OUVERTURE EXCEL ONLINE
+    # ==============================
+    st.markdown(
+        f"""
+        <a href="{EXCEL_ONLINE_URL}" target="_blank">
+            <button style="
+                padding:10px 16px;
+                font-size:16px;
+                background-color:#0f6cbd;
+                color:white;
+                border:none;
+                border-radius:6px;
+                cursor:pointer;
+            ">
+                🌐 Ouvrir le planning Excel
+            </button>
+        </a>
+        """,
+        unsafe_allow_html=True,
+    )
 
     st.markdown("---")
-    st.markdown("### 👥 Groupage / Navette partagée (via les coches du tableau)")
 
-    st.caption("Coche les lignes dans la colonne `_SELECT`, puis utilise les boutons ci-dessous.")
+    # ==============================
+    # ♻️ MISE À JOUR DB DEPUIS EXCEL
+    # ==============================
+    if st.session_state.logged_in and st.session_state.role == "admin":
 
-    colG1, colG2, colG3 = st.columns(3)
+        st.markdown("### ♻️ Mise à jour de la base de données")
 
-    # ---------- Marquer Groupage ----------
-    with colG1:
-        if st.button("🔶 Marquer comme Groupage"):
-            if not selected_ids_for_group:
-                st.warning("Aucune navette cochée.")
-            else:
-                for rid in selected_ids_for_group:
-                    row_g = get_row_by_id(int(rid))
-                    if not row_g:
-                        continue
-                    if role_allows_go_gl_only() and not leon_allowed_for_row(row_g.get("GO")):
-                        continue
-                    update_planning_row(int(rid), {"GROUPAGE": "1", "PARTAGE": "0"})
-                st.success("Navettes marquées comme Groupage.")
-                st.rerun()
+        confirm_db = st.checkbox(
+            "⚠️ Je confirme que le fichier Excel est à jour et fermé",
+            key="confirm_sync_db",
+        )
 
-    # ---------- Marquer Navette partagée ----------
-    with colG2:
-        if st.button("🟨 Marquer comme Navette partagée"):
-            if not selected_ids_for_group:
-                st.warning("Aucune navette cochée.")
-            else:
-                for rid in selected_ids_for_group:
-                    row_g = get_row_by_id(int(rid))
-                    if not row_g:
-                        continue
-                    if role_allows_go_gl_only() and not leon_allowed_for_row(row_g.get("GO")):
-                        continue
-                    update_planning_row(int(rid), {"PARTAGE": "1", "GROUPAGE": "0"})
-                st.success("Navettes marquées comme Navette partagée.")
-                st.rerun()
+        if st.button(
+            "♻️ Mettre à jour la base depuis Excel",
+            type="secondary",
+            disabled=not confirm_db,
+        ):
+            with st.status("🗄️ Mise à jour de la base en cours…", expanded=True) as status:
+                try:
+                    import subprocess
+                    import sys
 
-    # ---------- Effacer les deux ----------
-    with colG3:
-        if st.button("⬜ Effacer Groupage / Partagée"):
-            if not selected_ids_for_group:
-                st.warning("Aucune navette cochée.")
-            else:
-                for rid in selected_ids_for_group:
-                    row_g = get_row_by_id(int(rid))
-                    if not row_g:
-                        continue
-                    if role_allows_go_gl_only() and not leon_allowed_for_row(row_g.get("GO")):
-                        continue
-                    update_planning_row(int(rid), {"GROUPAGE": "0", "PARTAGE": "0"})
-                st.success("Groupage / Partagée effacés pour ces navettes.")
-                st.rerun()
+                    status.write("📥 Lecture du fichier Excel…")
+                    subprocess.run(
+                        [sys.executable, "sync_from_excel.py"],
+                        check=True,
+                    )
+
+                    status.update(
+                        label="✅ Base de données mise à jour depuis Excel",
+                        state="complete",
+                    )
+
+                    st.success("✅ Base synchronisée avec Excel")
+                    st.rerun()
+
+                except Exception as e:
+                    status.update(
+                        label="❌ Erreur lors de la mise à jour de la base",
+                        state="error",
+                    )
+                    st.error(str(e))
+
+    st.markdown("---")
+
+    # ==============================
+    # 🔄 PUBLICATION DU PLANNING (FTP)
+    # ==============================
+    if st.session_state.logged_in and st.session_state.role == "admin":
+
+        st.markdown("### 🔄 Publication du planning")
+
+        confirm_pub = st.checkbox(
+            "⚠️ Je confirme vouloir publier le planning Excel Online",
+            key="confirm_publish",
+        )
+
+        if st.button(
+            "♻️ Publier le planning (OneDrive → FTP → DB)",
+            type="primary",
+            disabled=not confirm_pub,
+        ):
+            with st.status("🔄 Publication en cours…", expanded=True) as status:
+
+                status.write("📤 Copie du fichier OneDrive vers le FTP…")
+                ok = upload_planning_onedrive_to_ftp()
+                if not ok:
+                    status.update(
+                        label="❌ Échec OneDrive → FTP",
+                        state="error",
+                    )
+                    st.stop()
+
+                status.write("🗄️ Recréation de la base de données…")
+                onedrive_to_ftp_and_rebuild_db()
+
+                status.update(
+                    label="✅ Planning publié et base mise à jour",
+                    state="complete",
+                )
+
+            st.success("✅ Planning publié et base mise à jour")
+
+
+
+
+
+
+
+
+
 # ============================================================
 #   ONGLET 🔍 CLIENTS — HISTORIQUE & CRÉATION RAPIDE
 # ============================================================
@@ -2262,7 +2419,6 @@ def render_tab_clients():
             insert_planning_row(retour_data)
             st.success("Navette RETOUR créée.")
             st.rerun()
-
 
 # ============================================================
 #   OUTILS CHAUFFEURS — CONTACTS, STATS, TRI
@@ -2828,190 +2984,182 @@ def render_tab_vue_chauffeur(forced_ch=None):
     # =======================================================
     #   DÉTAIL DES NAVETTES (TEXTE COMPACT)
     # =======================================================
-    st.markdown("---")
-    st.markdown("### 📋 Détail des navettes (texte compact)")
+    if df_ch is None or df_ch.empty:
+        st.info("Aucune navette pour cette période.")
+    else:
+        st.markdown("---")
+        st.markdown("### 📋 Détail des navettes (texte compact)")
 
-    cols = df_ch.columns.tolist()
-    st.caption("Les lignes marquées 🆕 sont celles modifiées depuis ta dernière confirmation.")
+        cols = df_ch.columns.tolist()
+        st.caption("Les lignes marquées 🆕 sont celles modifiées depuis ta dernière confirmation.")
 
-    for _, row in df_ch.iterrows():
-        bloc_lines: List[str] = []
-        is_new = bool(row.get("IS_NEW", False))
+        for _, row in df_ch.iterrows():
 
-        heure_txt = normalize_time_string(row.get("HEURE", ""))
+            bloc_lines: List[str] = []
+            is_new = bool(row.get("IS_NEW", False))
+            heure_txt = normalize_time_string(row.get("HEURE", ""))
 
-        # Date
-        date_val = row.get("DATE", "")
-        if isinstance(date_val, (datetime, date)):
-            date_txt = date_val.strftime("%d/%m/%Y")
-        else:
-            date_txt = str(date_val or "").strip()
+            # ------------------
+            # Date
+            # ------------------
+            date_val = row.get("DATE", "")
+            if isinstance(date_val, (datetime, date)):
+                date_txt = date_val.strftime("%d/%m/%Y")
+            else:
+                date_txt = str(date_val or "").strip()
 
-        # Indispo
-        if is_indispo_row(row, cols):
-            end_indispo = normalize_time_string(row.get("²²²²", ""))
-            header = ""
-            if date_txt:
-                header += f"📆 {date_txt} | "
-            header += f"⏱ {heure_txt or '??:??'} → {end_indispo or '??:??'} | 🚫 Indisponible"
-            bloc_lines.append(header)
-            ch_txt = str(row.get("CH", "") or ch_selected)
-            bloc_lines.append(f"👨‍✈️ {ch_txt}")
-            st.markdown("\n".join(bloc_lines))
-            st.markdown("---")
-            continue
+            # ------------------
+            # Indisponibilité
+            # ------------------
+            if is_indispo_row(row, cols):
 
-        designation = str(row.get("DESIGNATION", "") or "").strip()
-        route_text = ""
-        for cand in ["Unnamed: 8", "DESIGNATION"]:
-            if cand in cols and row.get(cand):
-                route_text = str(row[cand]).strip()
-                break
+                end_indispo = normalize_time_string(row.get("²²²²", ""))
+                header = ""
 
-        if route_text and designation and designation not in route_text:
-            dest_full = f"{route_text} ({designation})"
-        else:
-            dest_full = route_text or designation or ""
+                if date_txt:
+                    header += f"📆 {date_txt} | "
 
-        dest_full = resolve_client_alias(dest_full)
+                header += f"⏱ {heure_txt or '??:??'} → {end_indispo or '??:??'} | 🚫 Indisponible"
+                bloc_lines.append(header)
 
-        groupage_flag = bool_from_flag(row.get("GROUPAGE", "0")) if "GROUPAGE" in cols else False
-        partage_flag = bool_from_flag(row.get("PARTAGE", "0")) if "PARTAGE" in cols else False
+                ch_txt = str(row.get("CH", "") or ch_selected)
+                bloc_lines.append(f"👨‍✈️ {ch_txt}")
 
-        prefix = ""
-        if groupage_flag:
-            prefix = "[GRP] "
-        elif partage_flag:
-            prefix = "[PARTAGE] "
+                st.markdown("\n".join(bloc_lines))
+                st.markdown("---")
+                continue
 
-        header = ""
-        if is_new:
-            header += "🆕 "
+            # ------------------
+            # Destination
+            # ------------------
+            designation = str(row.get("DESIGNATION", "") or "").strip()
+            route_text = ""
 
-        header += prefix
-        if date_txt:
-            header += f"📆 {date_txt} | "
-        header += f"⏱ {heure_txt or '??:??'}"
-
-        bloc_lines.append(header)
-
-        # si ligne "nouvelle", on met le header en gras
-        if is_new:
-            bloc_lines[0] = f"**{bloc_lines[0]}**"
-
-        ch_txt = str(row.get("CH", "") or ch_selected)
-        bloc_lines.append(f"👨‍✈️ {ch_txt}")
-
-        if dest_full:
-            bloc_lines.append(f"➡ {dest_full}")
-
-        nom = str(row.get("NOM", "") or "").strip()
-        if nom:
-            bloc_lines.append(f"🧑 {nom}")
-
-        adresse = str(row.get("ADRESSE", "") or "").strip()
-        cp = str(row.get("CP", "") or "").strip()
-        loc = str(row.get("Localité", "") or row.get("LOCALITE", "") or "").strip()
-        adr_full = " ".join(x for x in [adresse, cp, loc] if x)
-        if adr_full:
-            bloc_lines.append(f"📍 {adr_full}")
-        # ✈️ Numéro de vol (si présent)
-        # ✈️ Numéro de vol + statut (si présent)
-        vol_val = ""
-        for col in ["N° Vol", "N° Vol ", "Num Vol", "VOL", "Vol"]:
-            if col in df_ch.columns:
-                v = str(row.get(col, "") or "").strip()
-                if v:
-                    vol_val = v
+            for cand in ["Unnamed: 8", "DESIGNATION"]:
+                if cand in cols and row.get(cand):
+                    route_text = str(row[cand]).strip()
                     break
 
-        if vol_val:
-            # 1) Numéro de vol
-            bloc_lines.append(f"✈️ Vol {vol_val}")
+            if route_text and designation and designation not in route_text:
+                dest_full = f"{route_text} ({designation})"
+            else:
+                dest_full = route_text or designation or ""
 
-            # 2) Statut du vol via API (avec cache)
-            status, delay_min, sched_dt, est_dt = get_flight_status_cached(vol_val)
-            badge = flight_badge(status, delay_min)
+            dest_full = resolve_client_alias(dest_full)
 
-            if badge:
-               bloc_lines.append(f"📡 Statut : {badge}")
+            # ------------------
+            # Groupage / Partage
+            # ------------------
+            groupage_flag = bool_from_flag(row.get("GROUPAGE", "0")) if "GROUPAGE" in cols else False
+            partage_flag = bool_from_flag(row.get("PARTAGE", "0")) if "PARTAGE" in cols else False
 
-            msg = None
+            prefix = ""
+            if groupage_flag:
+                prefix = "[GRP] "
+            elif partage_flag:
+                prefix = "[PARTAGE] "
 
-            # 3) 🔔 Alerte chauffeur si RETARD (anti-spam DB)
-            if status == "DELAYED":
-                ch_txt = str(row.get("CH", "") or ch_selected).strip().upper()
+            header = ""
+            if is_new:
+                header += "🆕 "
 
-                if date_txt and ch_txt and not flight_alert_exists(date_txt, ch_txt, vol_val):
-                    msg = (
-                        f"⚠️ RETARD VOL {vol_val}\n"
-                        f"{date_txt} {heure_txt}\n"
-                        f"Destination : {dest_full}\n"
-                        f"Retard estimé : {delay_min} min"
-                    )
+            header += prefix
+            if date_txt:
+                header += f"📆 {date_txt} | "
+            header += f"⏱ {heure_txt or '??:??'}"
 
-                    if tel_ch:
-                        wa = build_whatsapp_link(tel_ch, msg)
-                        bloc_lines.append(
-                            f"🔔 [Prévenir le chauffeur (WhatsApp)]({wa})"
-                        )
-                    else:
-                        send_mail_admin("Retard vol", msg)
+            bloc_lines.append(header)
 
-                    upsert_flight_alert(date_txt, ch_txt, vol_val, status, delay_min)
+            if is_new:
+                bloc_lines[0] = f"**{bloc_lines[0]}**"
+
+            # ------------------
+            # Chauffeur
+            # ------------------
+            ch_txt = str(row.get("CH", "") or ch_selected)
+            bloc_lines.append(f"👨‍✈️ {ch_txt}")
+
+            # ------------------
+            # Destination / Client
+            # ------------------
+            if dest_full:
+                bloc_lines.append(f"➡ {dest_full}")
+
+            nom = str(row.get("NOM", "") or "").strip()
+            if nom:
+                bloc_lines.append(f"🧑 {nom}")
+
+            # ------------------
+            # Adresse
+            # ------------------
+            adresse = str(row.get("ADRESSE", "") or "").strip()
+            cp = str(row.get("CP", "") or "").strip()
+            loc = str(row.get("Localité", "") or row.get("LOCALITE", "") or "").strip()
+
+            adr_full = " ".join(x for x in [adresse, cp, loc] if x)
+            if adr_full:
+                bloc_lines.append(f"📍 {adr_full}")
+
+            # ------------------
+            # 📞 GSM CLIENT
+            # ------------------
+            client_phone = get_client_phone_from_row(row)
+            tel_clean = ""
+
+            if client_phone:
+                tel_clean = clean_phone(client_phone)
+                bloc_lines.append(f"📞 **Client** : [{client_phone}](tel:{tel_clean})")
+            else:
+                bloc_lines.append("📞 **Client** : ❌ numéro manquant")
+
+            # ================================
+            #   Actions GSM
+            # ================================
+            actions = []
+
+            if client_phone:
+                actions.append(f"[📞 Appeler client](tel:{tel_clean})")
+
+            if adr_full:
+                waze_url = build_waze_link(adr_full)
+                if waze_url and waze_url != "#":
+                    actions.append(f"[🧭 Ouvrir Waze]({waze_url})")
+
+            if client_phone and tel_ch:
+                msg_client = build_client_sms_from_driver(row, ch_selected, tel_ch)
+                wa_client_url = build_whatsapp_link(client_phone, msg_client)
+                actions.append(f"[💬 WhatsApp client]({wa_client_url})")
+
+            if actions:
+                bloc_lines.append(" | ".join(actions))
+            # ------------------
+            # ✈️ Vol + statut
+            # ------------------
+            vol_val = ""
+            for col in ["N° Vol", "N° Vol ", "Num Vol", "VOL", "Vol"]:
+                if col in cols:
+                    v = str(row.get(col, "") or "").strip()
+                    if v:
+                        vol_val = v
+                        break
+
+            if vol_val:
+                bloc_lines.append(f"✈️ Vol {vol_val}")
+
+                # Statut du vol via API (cache)
+                status, delay_min, sched_dt, est_dt = get_flight_status_cached(vol_val)
+                badge = flight_badge(status, delay_min)
+
+                if badge:
+                    bloc_lines.append(f"📡 Statut : {badge}")
+
+            # ------------------
+            # Affichage final
+            # ------------------
+            st.markdown("\n".join(bloc_lines))
+            st.markdown("---")
 
 
-
-
-
-        pax = str(row.get("PAX", "") or "").strip()
-        paiement = str(row.get("PAIEMENT", "") or "").strip()
-        caisse = str(row.get("Caisse", "") or row.get("CAISSE", "") or "").strip()
-        num_bdc = str(row.get("Num BDC", "") or "").strip()
-        go = str(row.get("GO", "") or "").strip()
-
-        pay_parts = []
-        if paiement:
-            pay_parts.append(f"Paiement : {paiement}")
-        if caisse:
-            pay_parts.append(f"Caisse : {caisse}")
-        if num_bdc:
-            pay_parts.append(f"BDC : {num_bdc}")
-        if go:
-            pay_parts.append(f"GO : {go}")
-        if pax:
-            pay_parts.append(f"{pax} pax")
-        if pay_parts:
-            bloc_lines.append("💶 " + " | ".join(pay_parts))
-
-        remarque = str(row.get("REMARQUE", "") or "").strip()
-        if remarque:
-            bloc_lines.append(f"💬 {remarque}")
-
-        # ================================
-        #   Actions GSM : Waze + WhatsApp
-        # ================================
-        actions = []
-
-        # 1) Lien Waze sur l'adresse
-        if adr_full:
-            waze_url = build_waze_link(adr_full)
-            if waze_url and waze_url != "#":
-                actions.append(f"[🧭 Ouvrir Waze]({waze_url})")
-
-        # 2) WhatsApp vers le client (si on a son numéro + GSM chauffeur)
-        client_phone = get_client_phone_from_row(row)
-        if client_phone and tel_ch:
-            msg_client = build_client_sms_from_driver(row, ch_selected, tel_ch)
-            wa_client_url = build_whatsapp_link(client_phone, msg_client)
-            actions.append(f"[💬 WhatsApp client]({wa_client_url})")
-
-        if actions:
-            bloc_lines.append(" | ".join(actions))
-
-        # Affichage final du bloc
-        st.markdown("\n".join(bloc_lines))
-        st.markdown("---")
 
 # ======================================================================
 #  ONGLET — Demandes d’indispo côté chauffeur
@@ -3063,12 +3211,15 @@ def render_tab_chauffeurs():
     try:
         with get_connection() as conn:
             df = pd.read_sql_query(
-                "SELECT rowid AS id, * FROM chauffeurs ORDER BY INITIALE",
+                'SELECT * FROM "chauffeurs" ORDER BY INITIALE',
                 conn,
             )
     except Exception as e:
         st.error(f"Erreur en lisant la table `chauffeurs` : {e}")
         return
+
+    # 🔒 Sécurité Streamlit : aucune colonne dupliquée
+    df = df.loc[:, ~df.columns.duplicated()]
 
     st.markdown("#### Table chauffeurs (éditable)")
     edited = st.data_editor(
@@ -3082,24 +3233,32 @@ def render_tab_chauffeurs():
         try:
             with get_connection() as conn:
                 cur = conn.cursor()
-                # On repart de zéro pour éviter les doublons / lignes fantômes
-                cur.execute("DELETE FROM chauffeurs")
+
+                # On repart de zéro pour éviter doublons / lignes fantômes
+                cur.execute('DELETE FROM "chauffeurs"')
 
                 cols = [c for c in edited.columns if c != "id"]
                 col_list_sql = ",".join(f'"{c}"' for c in cols)
                 placeholders = ",".join("?" for _ in cols)
 
                 for _, row in edited.iterrows():
-                    values = [row[c] if pd.notna(row[c]) else None for c in cols]
+                    values = [
+                        row[c] if pd.notna(row[c]) else None
+                        for c in cols
+                    ]
                     cur.execute(
-                        f"INSERT INTO chauffeurs ({col_list_sql}) VALUES ({placeholders})",
+                        f'INSERT INTO "chauffeurs" ({col_list_sql}) VALUES ({placeholders})',
                         values,
                     )
+
                 conn.commit()
+
             st.success("Table chauffeurs mise à jour ✅")
             st.rerun()
+
         except Exception as e:
             st.error(f"Erreur lors de la sauvegarde des chauffeurs : {e}")
+
 
 
 # ============================================================
@@ -3219,117 +3378,291 @@ def render_tab_excel_sync():
 def render_tab_admin_transferts():
     st.subheader("📦 Tous les transferts — vue admin")
 
-    today = date.today()
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input(
-            "Date de début",
-            value=today.replace(day=1),
-            key="admin_start_date",
-        )
-    with col2:
-        end_date = st.date_input(
-            "Date de fin",
-            value=today,
-            key="admin_end_date",
+    # Sous-onglets Admin transferts
+    tab_transferts, tab_excel, tab_heures = st.tabs([
+        "📋 Transferts / SMS",
+        "🟡 À reporter dans Excel",
+        "⏱️ Calcul d’heures",
+    ])
+
+    with tab_excel:
+        st.subheader("🟡 Modifications à reporter dans Excel (Feuil1)")
+
+        from database import list_pending_actions
+        import pandas as pd
+
+        actions = list_pending_actions(limit=300)
+
+        if not actions:
+            st.success("✅ Aucune modification en attente. Excel et l’application sont alignés.")
+        else:
+            rows = []
+
+            for (
+                action_id,
+                row_key,
+                action_type,
+                old_value,
+                new_value,
+                user,
+                created_at,
+            ) in actions:
+                rows.append({
+                    "Type": action_type,
+                    "Avant": old_value,
+                    "Après": new_value,
+                    "Modifié par": user,
+                    "Date / heure": created_at,
+                })
+
+            df_actions = pd.DataFrame(rows)
+
+            st.info(
+                "Ces modifications ont été faites dans l’application "
+                "mais ne sont pas encore reportées dans Excel (Feuil1)."
+            )
+
+            st.dataframe(
+                df_actions,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    # ======================================================
+    # 📋 ONGLET TRANSFERTS / SMS  (TON CODE ACTUEL)
+    # ======================================================
+    with tab_transferts:
+
+        today = date.today()
+        col1, col2 = st.columns(2)
+        with col1:
+            start_date = st.date_input(
+                "Date de début",
+                value=today.replace(day=1),
+                key="admin_start_date",
+            )
+        with col2:
+            end_date = st.date_input(
+                "Date de fin",
+                value=today,
+                key="admin_end_date",
+            )
+
+        df = get_planning(
+            start_date=start_date,
+            end_date=end_date,
+            chauffeur=None,
+            type_filter=None,
+            search="",
+            max_rows=5000,
         )
 
-    df = get_planning(
-        start_date=start_date,
-        end_date=end_date,
-        chauffeur=None,
-        type_filter=None,
-        search="",
-        max_rows=5000,
+        if df.empty:
+            st.warning("Aucun transfert pour cette période.")
+            return
+
+        # 🔽 Filtres avancés
+        col3, col4, col5 = st.columns(3)
+        with col3:
+            bdc_prefix = st.text_input(
+                "Filtrer par Num BDC (préfixe, ex : JC → JCS, JCH…)",
+                "",
+                key="admin_bdc_prefix",
+            )
+        with col4:
+            paiement_filter = st.text_input(
+                "Filtrer par mode de paiement (contient, ex : CASH, VISA…)",
+                "",
+                key="admin_paiement_filter",
+            )
+        with col5:
+            ch_filter = st.text_input(
+                "Filtrer par chauffeur (CH, ex : GG, FA, NP…)",
+                "",
+                key="admin_ch_filter",
+            )
+
+        if bdc_prefix.strip() and "Num BDC" in df.columns:
+            p = bdc_prefix.strip().upper()
+            df = df[df["Num BDC"].astype(str).str.upper().str.startswith(p)]
+
+        if paiement_filter.strip() and "PAIEMENT" in df.columns:
+            p = paiement_filter.strip().upper()
+            df = df[df["PAIEMENT"].astype(str).str.upper().str.contains(p)]
+
+        if ch_filter.strip() and "CH" in df.columns:
+            p = ch_filter.strip().upper()
+            df = df[df["CH"].astype(str).str.upper() == p]
+
+        if df.empty:
+            st.warning("Aucun transfert après application des filtres.")
+            return
+
+        # Tri
+        sort_mode = st.radio(
+            "Tri",
+            ["DATE + HEURE", "CH + DATE + HEURE"],
+            horizontal=True,
+            key="admin_sort_mode",
+        )
+
+        sort_cols = []
+        if sort_mode == "CH + DATE + HEURE" and "CH" in df.columns:
+            sort_cols.append("CH")
+        if "DATE" in df.columns:
+            sort_cols.append("DATE")
+        if "HEURE" in df.columns:
+            sort_cols.append("HEURE")
+
+        if sort_cols:
+            df = df.sort_values(sort_cols)
+
+        df_display = df.copy()
+        if "id" in df_display.columns:
+            df_display = df_display.drop(columns=["id"])
+
+        st.markdown(f"#### {len(df_display)} transfert(s) sur la période sélectionnée")
+        st.dataframe(df_display, use_container_width=True, height=500)
+
+        # ======================================================
+        #   SMS / WHATSAPP CLIENTS
+        # ======================================================
+        st.markdown("---")
+        st.markdown("### 📱 Messages clients (WhatsApp / SMS)")
+
+        col_sms1, col_sms2 = st.columns(2)
+
+        with col_sms1:
+            if st.button("📅 Préparer SMS/WhatsApp pour demain", key="sms_clients_demain"):
+                target = today + timedelta(days=1)
+                show_client_messages_for_period(df, target, nb_days=1)
+
+        with col_sms2:
+            if st.button("📅 Préparer SMS/WhatsApp pour les 3 prochains jours", key="sms_clients_3j"):
+                target = today + timedelta(days=1)
+                show_client_messages_for_period(df, target, nb_days=3)
+
+    # ======================================================
+    # ⏱️ ONGLET CALCUL D’HEURES
+    # ======================================================
+    with tab_heures:
+        render_tab_calcul_heures()
+
+def render_tab_calcul_heures():
+    st.subheader("⏱️ Calcul d’heures")
+
+    from database import (
+        get_time_rules_df,
+        save_time_rules_df,
+        get_rule_minutes,
+        _detect_sens_dest_from_row,
+        _minutes_to_hhmm,
     )
 
-    if df.empty:
-        st.warning("Aucun transfert pour cette période.")
-        return
+    tab_calc, tab_rules = st.tabs(["📊 Calcul", "⚙️ Règles"])
 
-    # 🔽 Filtres avancés
-    col3, col4, col5 = st.columns(3)
-    with col3:
-        bdc_prefix = st.text_input(
-            "Filtrer par Num BDC (préfixe, ex : JC → JCS, JCH…)",
-            "",
-            key="admin_bdc_prefix",
-        )
-    with col4:
-        paiement_filter = st.text_input(
-            "Filtrer par mode de paiement (contient, ex : CASH, VISA…)",
-            "",
-            key="admin_paiement_filter",
-        )
-    with col5:
-        ch_filter = st.text_input(
-            "Filtrer par chauffeur (CH, ex : GG, FA, NP…)",
-            "",
-            key="admin_ch_filter",
+    # =========================
+    # ⚙️ ONGLET RÈGLES
+    # =========================
+    with tab_rules:
+        st.markdown("### ⚙️ Règles de calcul")
+        st.caption("Chauffeur (NP, NP*, *), Sens (VERS/DE), Destination (BRU/AMS/…/AUTRE), Heures (ex: 2h30)")
+
+        df_rules = get_time_rules_df()
+        if df_rules.empty:
+            df_rules = pd.DataFrame(columns=["id", "ch", "sens", "dest", "heures"])
+
+        df_rules = df_rules.loc[:, ~df_rules.columns.duplicated()]
+
+        edited = st.data_editor(
+            df_rules,
+            use_container_width=True,
+            num_rows="dynamic",
+            key="time_rules_editor",
         )
 
-    if bdc_prefix.strip() and "Num BDC" in df.columns:
-        p = bdc_prefix.strip().upper()
-        df = df[df["Num BDC"].astype(str).str.upper().str.startswith(p)]
+        if st.button("💾 Enregistrer les règles"):
+            try:
+                if "id" in edited.columns:
+                    edited = edited.drop(columns=["id"], errors="ignore")
+                save_time_rules_df(edited)
+                st.success("Règles enregistrées ✅")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Erreur sauvegarde règles : {e}")
 
-    if paiement_filter.strip() and "PAIEMENT" in df.columns:
-        p = paiement_filter.strip().upper()
-        df = df[df["PAIEMENT"].astype(str).str.upper().str.contains(p)]
+    # =========================
+    # 📊 ONGLET CALCUL
+    # =========================
+    with tab_calc:
+        col1, col2, col3 = st.columns(3)
 
-    if ch_filter.strip() and "CH" in df.columns:
-        p = ch_filter.strip().upper()
-        df = df[df["CH"].astype(str).str.upper() == p]
+        today = date.today()
+        with col1:
+            d1 = st.date_input("Date début", value=today, key="hrs_d1")
+        with col2:
+            d2 = st.date_input("Date fin", value=today, key="hrs_d2")
+        with col3:
+            ch_filter = st.selectbox("Chauffeur", ["Tous", "NP", "NP*"], key="hrs_ch")
 
-    if df.empty:
-        st.warning("Aucun transfert après application des filtres.")
-        return
+        df = get_planning(
+            start_date=d1,
+            end_date=d2,
+            chauffeur=None if ch_filter == "Tous" else ch_filter,
+            type_filter=None,
+            search="",
+            max_rows=5000,
+        )
 
-    # Tri : par défaut Date + Heure, sinon Chauffeur + Date + Heure
-    sort_mode = st.radio(
-        "Tri",
-        ["DATE + HEURE", "CH + DATE + HEURE"],
-        horizontal=True,
-        key="admin_sort_mode",
-    )
+        if df.empty:
+            st.info("Aucune navette sur cette période.")
+            return
 
-    sort_cols = []
-    if sort_mode == "CH + DATE + HEURE" and "CH" in df.columns:
-        sort_cols.append("CH")
-    if "DATE" in df.columns:
-        sort_cols.append("DATE")
-    if "HEURE" in df.columns:
-        sort_cols.append("HEURE")
+        rows = []
+        total_minutes = 0
+        to_check = 0
 
-    if sort_cols:
-        df = df.sort_values(sort_cols)
+        for _, r in df.iterrows():
+            if is_indispo_row(r, df.columns.tolist()):
+                continue
 
-    df_display = df.copy()
-    if "id" in df_display.columns:
-        df_display = df_display.drop(columns=["id"])
+            ch = str(r.get("CH", "") or "").strip()
+            if ch_filter != "Tous" and ch != ch_filter:
+                continue
 
-    st.markdown(f"#### {len(df_display)} transfert(s) sur la période sélectionnée")
-    st.dataframe(df_display, use_container_width=True, height=500)
-    # ======================================================
-    #   SMS / WHATSAPP CLIENTS
-    # ======================================================
-    st.markdown("---")
-    st.markdown("### 📱 Messages clients (WhatsApp / SMS)")
+            dv = r.get("DATE")
+            if isinstance(dv, (datetime, date)):
+                date_txt = dv.strftime("%d/%m/%Y")
+            else:
+                dtmp = pd.to_datetime(dv, dayfirst=True, errors="coerce")
+                date_txt = dtmp.strftime("%d/%m/%Y") if not pd.isna(dtmp) else ""
 
-    today = date.today()
-    col_sms1, col_sms2 = st.columns(2)
+            sens, dest = _detect_sens_dest_from_row(r.to_dict())
+            minutes = get_rule_minutes(ch, sens, dest)
 
-    # Bouton : demain
-    with col_sms1:
-        if st.button("📅 Préparer SMS/WhatsApp pour demain", key="sms_clients_demain"):
-            target = today + timedelta(days=1)
-            # ⚠️ IMPORTANT : df = planning filtré COMPLET (pas df_display)
-            show_client_messages_for_period(df, target, nb_days=1)
+            note = ""
+            if minutes <= 0:
+                note = "⚠️ Heure estimée à vérifier / modifier"
+                to_check += 1
+            else:
+                total_minutes += minutes
 
-    # Bouton : 3 prochains jours
-    with col_sms2:
-        if st.button("📅 Préparer SMS/WhatsApp pour les 3 prochains jours", key="sms_clients_3j"):
-            target = today + timedelta(days=1)
-            show_client_messages_for_period(df, target, nb_days=3)
+            rows.append({
+                "Date": date_txt,
+                "CH": ch,
+                "Sens": sens,
+                "Dest": dest,
+                "Heures": _minutes_to_hhmm(minutes) if minutes else "",
+                "Note": note,
+            })
+
+        out = pd.DataFrame(rows)
+        st.dataframe(out, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        st.metric("Total heures", _minutes_to_hhmm(total_minutes))
+        st.metric("Lignes à vérifier", to_check)
+
 
 # ==========================================================================
 #  ONGLET Admin — Validation des indispos
@@ -3418,27 +3751,46 @@ def render_tab_indispo_admin():
 # ============================================================
 
 def main():
-    # s'assurer que la colonne updated_at existe et que la table d'ack est prête
-    ensure_planning_updated_at_column()
-    init_indispo_table()
-    ensure_km_time_columns()
-    init_chauffeur_ack_table()
-    init_flight_alerts_table()  # ✅ OK maintenant
-    ensure_flight_alerts_time_columns()
-
-    # init session
+    # ======================================
+    # 1️⃣ INITIALISATION SESSION (OBLIGATOIRE)
+    # ======================================
     init_session_state()
 
-    # Si pas connecté → écran de login
+    # ======================================
+    # 2️⃣ INITIALISATIONS DB SAFE
+    #    (ne plantent pas si DB vide)
+    # ======================================
+    init_indispo_table()
+    init_chauffeur_ack_table()
+    init_flight_alerts_table()
+    init_time_rules_table()
+    init_actions_table() 
+
+    # Ces fonctions DOIVENT être safe
+    ensure_planning_updated_at_column()
+    ensure_km_time_columns()
+    ensure_flight_alerts_time_columns()
+
+    # ======================================
+    # 3️⃣ LOGIN
+    # ======================================
     if not st.session_state.logged_in:
         login_screen()
         return
 
-    # Barre du haut
+    # ======================================
+    # 4️⃣ UI PRINCIPALE
+    # ======================================
     render_top_bar()
 
     role = st.session_state.role
-    ...
+
+    # 👉 ensuite ton routing normal :
+    # if role == "admin":
+    #     ...
+    # elif role == "driver":
+    #     ...
+
 
     # ====================== ADMIN ===========================
     # ====================== ADMIN ===========================
