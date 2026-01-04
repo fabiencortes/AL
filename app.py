@@ -50,6 +50,9 @@ from database import (
     sqlite_safe,
     get_last_sync_time,
     set_last_sync_time,
+    ensure_meta_table,
+    get_meta,
+    set_meta,
 
 )
 
@@ -72,13 +75,78 @@ def init_session_state():
         if k not in st.session_state:
             st.session_state[k] = v
 
+# ============================================================
+# 🔁 SYNCHRONISATION AUTOMATIQUE INVISIBLE (PLANNING FUTUR)
+# ============================================================
+
+import time
+
+if "last_auto_sync" not in st.session_state:
+    # Empêche toute synchro auto au premier chargement
+    st.session_state.last_auto_sync = time.time()
+
+
+def auto_sync_planning_if_needed():
+    """
+    Synchronise automatiquement le planning FUTUR
+    toutes les X minutes, sans affichage UI.
+    """
+    SYNC_INTERVAL = 15 * 60  # 15 minutes (SAFE pour SharePoint)
+    now = time.time()
+
+    # Trop tôt → on ne fait rien
+    if now - st.session_state.last_auto_sync < SYNC_INTERVAL:
+        return
+
+    try:
+        sync_planning_from_today()
+        st.session_state.last_auto_sync = now
+        st.cache_data.clear()  # force rafraîchissement des vues
+    except Exception:
+        # ⚠️ aucune erreur visible pour l'utilisateur
+        pass
+
 # =========================
-# CONFIG FTP – PLANNING
+# CONFIG SHAREPOINT – PLANNING
 # =========================
-FTP_HOST = "ftp.airports-linescom.webhosting.be"
-FTP_USER = "site@airports-linescom"
-FTP_PASS = "siteALGL2025"
-FTP_PLANNING_PATH = "/www/wp-content/uploads/2025/11/Planning%202025.xlsx"
+
+SHAREPOINT_EXCEL_URL = (
+    "https://airportslines1-my.sharepoint.com/:x:/g/personal/"
+    "info_airports-lines_com/IQAmuZHAjt79SZQwL5wT6N4AAZ_Kml1cqlMab4p9iK36SkE"
+    "?download=1"
+)
+
+def load_planning_from_sharepoint() -> pd.DataFrame:
+    """
+    Télécharge Planning 2025.xlsx depuis SharePoint
+    et retourne un DataFrame pandas
+    """
+    try:
+        r = requests.get(SHAREPOINT_EXCEL_URL, timeout=30)
+        r.raise_for_status()
+
+        bio = BytesIO(r.content)
+        df = pd.read_excel(bio, engine="openpyxl")
+
+        return df.fillna("")
+
+    except Exception as e:
+        st.error(f"❌ Erreur lecture SharePoint : {e}")
+        return pd.DataFrame()
+
+def load_sheet_from_sharepoint(sheet_name: str) -> pd.DataFrame:
+    """
+    Télécharge le fichier Excel SharePoint et lit une feuille précise.
+    """
+    try:
+        r = requests.get(SHAREPOINT_EXCEL_URL, timeout=30)
+        r.raise_for_status()
+        bio = BytesIO(r.content)
+        df = pd.read_excel(bio, sheet_name=sheet_name, engine="openpyxl")
+        return df.fillna("")
+    except Exception as e:
+        st.error(f"❌ Erreur lecture SharePoint ({sheet_name}) : {e}")
+        return pd.DataFrame()
 
 def onedrive_to_ftp_and_rebuild_db():
     from datetime import date
@@ -196,56 +264,15 @@ def onedrive_to_ftp_and_rebuild_db():
     st.cache_data.clear()
     st.rerun()
 
+from datetime import datetime
+def render_last_sync_info():
+    ts = st.session_state.get("last_auto_sync", 0)
+    if not ts:
+        return
 
+    txt = datetime.fromtimestamp(ts).strftime("%H:%M")
+    st.caption(f"🕒 Dernière synchro : {txt}")
 
-def load_planning_from_ftp() -> pd.DataFrame:
-    """
-    Télécharge Planning 2025.xlsx depuis le FTP
-    et retourne un DataFrame pandas
-    """
-    try:
-        ftp = FTP(FTP_HOST)
-        ftp.login(FTP_USER, FTP_PASS)
-
-        bio = BytesIO()
-        ftp.retrbinary(f"RETR {FTP_PLANNING_PATH}", bio.write)
-        ftp.quit()
-
-        bio.seek(0)
-
-        df = pd.read_excel(bio, engine="openpyxl")
-        return df.fillna("")
-
-    except Exception as e:
-        st.error(f"❌ Erreur lecture FTP : {e}")
-        return pd.DataFrame()
-
-
-ONEDRIVE_PLANNING_PATH = (
-    r"C:\Users\admin\OneDrive - AIRPORTS-LINES\Planning 2025.xlsx"
-)
-
-def upload_planning_onedrive_to_ftp():
-    if not os.path.exists(ONEDRIVE_PLANNING_PATH):
-        st.error(
-            "❌ Fichier OneDrive introuvable :\n"
-            f"{ONEDRIVE_PLANNING_PATH}"
-        )
-        return False
-
-    try:
-        ftp = FTP(FTP_HOST)
-        ftp.login(FTP_USER, FTP_PASS)
-
-        with open(ONEDRIVE_PLANNING_PATH, "rb") as f:
-            ftp.storbinary(f"STOR {FTP_PLANNING_PATH}", f)
-
-        ftp.quit()
-        return True
-
-    except Exception as e:
-        st.error(f"❌ Erreur FTP : {e}")
-        return False
 def rebuild_db_fast(status):
     import os
     import shutil
@@ -272,6 +299,34 @@ def rebuild_db_fast(status):
     ensure_indexes()
 
     status.update(label="🎉 Base active remplacée", state="complete")
+
+def send_planning_confirmation_email(
+    chauffeur: str,
+    trajet: str,
+    date_confirm: date,
+    commentaire: str,
+):
+    subject = f"[CONFIRMATION PLANNING] {chauffeur} — {date_confirm.strftime('%d/%m/%Y')}"
+
+    body = f"""
+Bonjour,
+
+Le chauffeur {chauffeur} confirme avoir pris connaissance de son planning.
+
+Trajet compris :
+{trajet}
+
+Date concernée :
+{date_confirm.strftime('%d/%m/%Y')}
+
+Commentaire :
+{commentaire or "—"}
+
+Message envoyé depuis l’application Airports Lines.
+"""
+
+    send_mail_admin(subject, body)
+
 
 def rebuild_db_from_ftp(status):
     """
@@ -319,7 +374,7 @@ def rebuild_db_from_ftp(status):
 
     status.update(label="🎉 Reconstruction terminée", state="complete")
 
-def sync_planning_from_ftp():
+def sync_planning_from_sharepoint():
 
     # ==========================================================
     # 1) VERROU ANTI-BOUCLE STREAMLIT
@@ -332,122 +387,280 @@ def sync_planning_from_ftp():
 
     try:
         # ======================================================
-        # 2) Charger le fichier Excel depuis le FTP
+        # 2) Charger Feuil1 (planning) depuis SharePoint
         # ======================================================
-        df_excel = load_planning_from_ftp()
-
+        df_excel = load_sheet_from_sharepoint("Feuil1")
         if df_excel.empty:
-            st.warning("Le planning FTP est vide.")
+            st.warning("Le planning SharePoint (Feuil1) est vide.")
             return
 
         # ======================================================
-        # 3) Filtre SIMPLE et RAPIDE par date
-        #    (aujourd’hui - 2 jours → futur)
+        # 3) Normalisation DATE → DATE_ISO (YYYY-MM-DD)
         # ======================================================
-        today = date.today()
-
-        df_excel["DATE_TMP"] = pd.to_datetime(
+        df_excel["DATE_ISO"] = pd.to_datetime(
             df_excel["DATE"],
             dayfirst=True,
             errors="coerce"
-        ).dt.date
+        ).dt.strftime("%Y-%m-%d")
 
-        df_excel = df_excel[
-            df_excel["DATE_TMP"].notna() &
-            (df_excel["DATE_TMP"] >= today - timedelta(days=2))
-        ].copy()
-
-        df_excel.drop(columns=["DATE_TMP"], inplace=True)
-
+        df_excel = df_excel[df_excel["DATE_ISO"].notna()].copy()
         if df_excel.empty:
-            st.info("Aucune ligne à synchroniser pour la période sélectionnée.")
+            st.warning("Aucune date valide trouvée dans Feuil1.")
             return
 
         # ======================================================
-        # 4) Vérifier colonnes obligatoires
+        # 4) Colonnes obligatoires
         # ======================================================
-        REQUIRED_COLS = ["DATE", "HEURE", "CH"]
-        for col in REQUIRED_COLS:
+        for col in ("DATE", "HEURE", "CH"):
             if col not in df_excel.columns:
-                st.error(f"Colonne manquante dans le fichier FTP : {col}")
+                st.error(f"Colonne manquante dans Feuil1 : {col}")
                 return
 
         # ======================================================
-        # 5) Charger UNIQUEMENT ce qui est utile depuis la DB
+        # 5) Créer table planning si absente
         # ======================================================
         with get_connection() as conn:
-            df_db = pd.read_sql_query(
-                "SELECT id, DATE, HEURE, CH FROM planning",
-                conn
-            )
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS planning (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT
+                )
+            """)
+            conn.commit()
 
         # ======================================================
-        # 6) Index DB par clé DATE|HEURE|CH
+        # 6) S’assurer que toutes les colonnes existent
         # ======================================================
-        def make_key(row):
-            return (
-                f"{str(row.get('DATE','')).strip()}|"
-                f"{str(row.get('HEURE','')).strip()}|"
-                f"{str(row.get('CH','')).strip()}"
-            )
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(planning)")
+            existing_cols = {row[1] for row in cur.fetchall()}
 
-        db_map = {
-            make_key(r): int(r["id"])
-            for _, r in df_db.iterrows()
-        }
+        for col in df_excel.columns:
+            if col != "id" and col not in existing_cols:
+                with get_connection() as conn:
+                    conn.execute(f'ALTER TABLE planning ADD COLUMN "{col}" TEXT')
+                    conn.commit()
+                existing_cols.add(col)
+
+        if "DATE_ISO" not in existing_cols:
+            with get_connection() as conn:
+                conn.execute('ALTER TABLE planning ADD COLUMN "DATE_ISO" TEXT')
+                conn.commit()
+
+        # ======================================================
+        # 7) IMPORT INTELLIGENT
+        #    - 1ʳᵉ fois : import complet
+        #    - ensuite : mise à jour par clé (DATE + HEURE + CH)
+        # ======================================================
+        ensure_meta_table()
+        first_import_done = get_meta("full_import_done") == "1"
 
         inserts = 0
         updates = 0
 
-        # ======================================================
-        # 7) Synchronisation Excel → DB
-        # ======================================================
         for _, row in df_excel.iterrows():
-            key = make_key(row)
 
+            # Normalisation HEURE → "HH:MM:SS" ou None
+            heure_norm = normalize_time_string(row.get("HEURE"))
+
+            # 🔑 clé métier
+            key_date = sqlite_safe(row["DATE"])
+            key_ch = row["CH"]
+
+            # Supprimer uniquement la ligne concernée (clé métier)
+            with get_connection() as conn:
+                if heure_norm is None:
+                    conn.execute(
+                        """
+                        DELETE FROM planning
+                        WHERE DATE = ? AND HEURE IS NULL AND CH = ?
+                        """,
+                        (key_date, key_ch),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        DELETE FROM planning
+                        WHERE DATE = ? AND HEURE = ? AND CH = ?
+                        """,
+                        (key_date, heure_norm, key_ch),
+                    )
+                conn.commit()
+
+            # Préparer les données à insérer
             data = {
                 col: sqlite_safe(row[col])
                 for col in df_excel.columns
                 if col != "id"
             }
 
-            if key in db_map:
-                update_planning_row(db_map[key], data)
-                updates += 1
-            else:
-                insert_planning_row(data)
-                inserts += 1
+            data["HEURE"] = heure_norm
+            data["DATE_ISO"] = row["DATE_ISO"]
 
-        # ======================================================
-        # 8️⃣ Excel = maintenant à jour → on enlève les badges 🟡
-        # ======================================================
-        from database import get_actions_connection
+            insert_planning_row(data)
+            inserts += 1
 
-        with get_actions_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("UPDATE actions SET needs_excel_update = 0")
+        if not first_import_done:
+            set_meta("full_import_done", "1")
+        # ======================================================
+        # PATCH HEURE — correction incrémentale (sans reset DB)
+        # ======================================================
+        with get_connection() as conn:
+            conn.execute("""
+                UPDATE planning
+                SET HEURE = NULL
+                WHERE HEURE IN ('', '0', '00:00:0', '0:00:00')
+            """)
             conn.commit()
 
         # ======================================================
-        # 9) Succès + sauvegarde date de synchro
+        # 8) VUES dérivées (rapides, sans duplication DB)
         # ======================================================
+        with get_connection() as conn:
+            cur = conn.cursor()
+
+            cur.execute("DROP VIEW IF EXISTS planning_day")
+            cur.execute("DROP VIEW IF EXISTS planning_7j")
+            cur.execute("DROP VIEW IF EXISTS planning_full")
+
+            cur.execute("""
+                CREATE VIEW planning_full AS
+                SELECT * FROM planning
+            """)
+
+            cur.execute("""
+                CREATE VIEW planning_7j AS
+                SELECT *
+                FROM planning
+                WHERE DATE_ISO BETWEEN date('now') AND date('now','+6 day')
+            """)
+
+            cur.execute("""
+                CREATE VIEW planning_day AS
+                SELECT *
+                FROM planning
+                WHERE DATE_ISO = date('now')
+            """)
+
+            conn.commit()
+
+        # ======================================================
+        # 9) Import Feuil2 → table chauffeurs
+        # ======================================================
+        df_ch = load_sheet_from_sharepoint("Feuil2")
+        if not df_ch.empty:
+            with get_connection() as conn:
+                conn.execute('DROP TABLE IF EXISTS chauffeurs')
+                conn.commit()
+
+            cols = [c for c in df_ch.columns if c]
+            cols_sql = ",".join(f'"{c}"' for c in cols)
+            col_defs = ", ".join(f'"{c}" TEXT' for c in cols)
+
+            with get_connection() as conn:
+                conn.execute(f'CREATE TABLE chauffeurs ({col_defs})')
+                conn.commit()
+
+            placeholders = ",".join("?" for _ in cols)
+
+            for _, r in df_ch.iterrows():
+                values = [sqlite_safe(r.get(c)) for c in cols]
+                with get_connection() as conn:
+                    conn.execute(
+                        f'INSERT INTO chauffeurs ({cols_sql}) VALUES ({placeholders})',
+                        values,
+                    )
+                    conn.commit()
+
+        # ======================================================
+        # 10) Import Feuil3 → table feuil3
+        # ======================================================
+        df_f3 = load_sheet_from_sharepoint("Feuil3")
+        if not df_f3.empty:
+            with get_connection() as conn:
+                conn.execute("DROP TABLE IF EXISTS feuil3")
+                conn.commit()
+
+            cols3 = [c for c in df_f3.columns if c]
+            cols_sql3 = ",".join(f'"{c}"' for c in cols3)
+            col_defs3 = ", ".join(f'"{c}" TEXT' for c in cols3)
+
+            with get_connection() as conn:
+                conn.execute(f'CREATE TABLE feuil3 ({col_defs3})')
+                conn.commit()
+
+            placeholders3 = ",".join("?" for _ in cols3)
+
+            for _, r in df_f3.iterrows():
+                values = [sqlite_safe(r.get(c)) for c in cols3]
+                with get_connection() as conn:
+                    conn.execute(
+                        f'INSERT INTO feuil3 ({cols_sql3}) VALUES ({placeholders3})',
+                        values,
+                    )
+                    conn.commit()
+
         st.success(
-            f"FTP → DB terminé ✅ "
-            f"{inserts} ajout(s) • {updates} mise(s) à jour"
+            f"SharePoint → DB terminé ✅ "
+            f"{inserts} ligne(s) synchronisée(s) | "
+            f"Historique conservé"
         )
 
-        set_last_sync_time(datetime.now())
-
     except Exception as e:
-        st.error(f"❌ Erreur synchro FTP → DB : {e}")
-        raise
+        st.exception(e)
+        st.stop()
 
     finally:
-        # ======================================================
-        # 10) Déverrouillage anti-boucle (TOUJOURS)
-        # ======================================================
         st.session_state["sync_running"] = False
 
+def sync_planning_from_today():
+    today_iso = date.today().strftime("%Y-%m-%d")
+
+    df_excel = load_sheet_from_sharepoint("Feuil1")
+    if df_excel.empty:
+        st.warning("Planning Excel vide.")
+        return
+
+    # Normalisation DATE
+    df_excel["DATE_ISO"] = pd.to_datetime(
+        df_excel["DATE"],
+        dayfirst=True,
+        errors="coerce"
+    ).dt.strftime("%Y-%m-%d")
+
+    # 🔥 garder uniquement aujourd’hui et le futur
+    df_excel = df_excel[df_excel["DATE_ISO"] >= today_iso].copy()
+
+    if df_excel.empty:
+        st.info("Aucune donnée à synchroniser.")
+        return
+
+    # 🔥 suppression ciblée (rapide, sans doublon)
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM planning WHERE DATE_ISO >= ?",
+            (today_iso,),
+        )
+        conn.commit()
+
+    inserts = 0
+
+    for _, row in df_excel.iterrows():
+        heure_norm = normalize_time_string(row.get("HEURE"))
+
+        data = {
+            col: sqlite_safe(row[col])
+            for col in df_excel.columns
+            if col not in ("id", "HEURE")
+        }
+
+        data["HEURE"] = heure_norm
+        data["DATE_ISO"] = row["DATE_ISO"]
+
+        insert_planning_row(data)
+        inserts += 1
+
+    st.success(f"✅ {inserts} lignes synchronisées (à partir d’aujourd’hui)")
 
 
 from database import make_row_key_from_row, get_latest_ch_overrides_map
@@ -479,7 +692,6 @@ def apply_actions_overrides(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-from import_excel_to_db import EXCEL_FILE, import_planning_from_feuil1
 import requests
 def flight_badge(status: str, delay_min: int = 0) -> str:
     status = (status or "").upper()
@@ -797,49 +1009,50 @@ FROM_EMAIL = SMTP_USER
 #   HELPERS — NORMALISATION DES HEURES
 # ============================================================
 
-def normalize_time_string(val) -> str:
+def normalize_time_string(val):
     """
-    Nettoie et convertit : 8, 815, 8h15, 08H15, " 8:5 "...
-    Retourne toujours HH:MM ou "".
+    Nettoie et convertit une heure vers HH:MM:SS pour la DB.
+    Retourne None si invalide / vide.
     """
     if val is None:
-        return ""
+        return None
 
     s = str(val).strip()
-    if not s:
-        return ""
+    if not s or s == "0":
+        return None
 
     # Remplacer H / h par :
     s = s.replace("H", ":").replace("h", ":").strip()
 
     # Format HHMM → HH:MM
     if s.isdigit():
-        if len(s) <= 2:
-            try:
+        try:
+            if len(s) <= 2:
                 h = int(s)
-                return f"{h:02d}:00"
-            except:
-                return s
-        else:
-            try:
+                m = 0
+            else:
                 h = int(s[:-2])
                 m = int(s[-2:])
-                return f"{h:02d}:{m:02d}"
-            except:
-                return s
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                return f"{h:02d}:{m:02d}:00"
+            return None
+        except Exception:
+            return None
 
-    # Format H:M, HH:M, H:MM, etc.
+    # Format H:M, HH:M, H:MM, HH:MM
     if ":" in s:
         try:
-            h, m = s.split(":")
+            h, m = s.split(":")[:2]
             h = int(h)
             m = int(m)
             if 0 <= h <= 23 and 0 <= m <= 59:
-                return f"{h:02d}:{m:02d}"
-        except:
-            return ""
+                return f"{h:02d}:{m:02d}:00"
+            return None
+        except Exception:
+            return None
 
-    return s
+    return None
+
 
 def resolve_client_alias(text: str) -> str:
     """
@@ -1804,7 +2017,7 @@ def render_tab_quick_day_mobile():
         chauffeur=None,
         type_filter=None,
         search="",
-        max_rows=3000,
+        max_rows=300,
         source="day",
     )
 
@@ -2023,25 +2236,23 @@ def render_tab_quick_day_mobile():
 
 
 # ============================================================
-#   ONGLET 📊 TABLEAU / ÉDITION — SÉLECTION + FICHE DÉTAILLÉE
+#   ONGLET 📊 TABLEAU / ÉDITION — EXCEL ONLINE → DB
 # ============================================================
 def render_tab_table():
     st.subheader("📊 Planning — Édition Excel Online")
 
     st.markdown(
-        "Le planning s’édite directement dans **Excel Online** "
-        "(ouverture dans un nouvel onglet)."
+        "Le planning s’édite dans **Excel Online**. "
+        "La base locale est synchronisée **uniquement à partir d’aujourd’hui**."
     )
 
     EXCEL_ONLINE_URL = (
         "https://airportslines1-my.sharepoint.com/:x:/g/personal/"
-        "info_airports-lines_com/IQCoqB19JENLR6Us1-etRxtNAVQj3eKlijHGFtNwwj8FbjY"
-        "?e=CO5j8Y"
+        "info_airports-lines_com/IQAmuZHAjt79SZQwL5wT6N4AAZ_Kml1cqlMab4p9iK36SkE"
+        "?e=1aVt2n"
     )
 
-    # ==============================
-    # 🌐 OUVERTURE EXCEL ONLINE
-    # ==============================
+    # 🌐 Ouvrir Excel
     st.markdown(
         f"""
         <a href="{EXCEL_ONLINE_URL}" target="_blank">
@@ -2054,7 +2265,7 @@ def render_tab_table():
                 border-radius:6px;
                 cursor:pointer;
             ">
-                🌐 Ouvrir le planning Excel
+                🌐 Ouvrir le planning Excel Online
             </button>
         </a>
         """,
@@ -2063,91 +2274,38 @@ def render_tab_table():
 
     st.markdown("---")
 
-    # ==============================
-    # ♻️ MISE À JOUR DB DEPUIS EXCEL
-    # ==============================
+    # ======================================================
+    # 🔁 SYNCHRO MANUELLE (FORCE MAJEURE)
+    # ======================================================
     if st.session_state.logged_in and st.session_state.role == "admin":
 
-        st.markdown("### ♻️ Mise à jour de la base de données")
+        st.markdown("### 🔁 Synchronisation manuelle (force majeure)")
 
-        confirm_db = st.checkbox(
-            "⚠️ Je confirme que le fichier Excel est à jour et fermé",
-            key="confirm_sync_db",
+        st.caption(
+            "À utiliser uniquement en cas de modification immédiate dans Excel "
+            "ou de problème constaté par un chauffeur."
+        )
+
+        confirm_sync = st.checkbox(
+            "⚠️ Forcer la synchronisation du planning futur",
+            key="confirm_force_sync_tableau",
         )
 
         if st.button(
-            "♻️ Mettre à jour la base depuis Excel",
+            "🔁 Forcer la synchronisation maintenant",
             type="secondary",
-            disabled=not confirm_db,
+            disabled=not confirm_sync,
+            key="btn_force_sync_tableau",
         ):
-            with st.status("🗄️ Mise à jour de la base en cours…", expanded=True) as status:
-                try:
-                    import subprocess
-                    import sys
+            with st.status("⏳ Synchronisation en cours…", expanded=True):
+                sync_planning_from_today()
+                st.cache_data.clear()
+                st.session_state.last_auto_sync = time.time()
+                st.success("✅ Planning mis à jour")
+                st.rerun()
 
-                    status.write("📥 Lecture du fichier Excel…")
-                    subprocess.run(
-                        [sys.executable, "sync_from_excel.py"],
-                        check=True,
-                    )
-
-                    status.update(
-                        label="✅ Base de données mise à jour depuis Excel",
-                        state="complete",
-                    )
-
-                    st.success("✅ Base synchronisée avec Excel")
-                    st.rerun()
-
-                except Exception as e:
-                    status.update(
-                        label="❌ Erreur lors de la mise à jour de la base",
-                        state="error",
-                    )
-                    st.error(str(e))
-
-    st.markdown("---")
-
-    # ==============================
-    # 🔄 PUBLICATION DU PLANNING (FTP)
-    # ==============================
-    if st.session_state.logged_in and st.session_state.role == "admin":
-
-        st.markdown("### 🔄 Publication du planning")
-
-        confirm_pub = st.checkbox(
-            "⚠️ Je confirme vouloir publier le planning Excel Online",
-            key="confirm_publish",
-        )
-
-        if st.button(
-            "♻️ Publier le planning (OneDrive → FTP → DB)",
-            type="primary",
-            disabled=not confirm_pub,
-        ):
-            with st.status("🔄 Publication en cours…", expanded=True) as status:
-
-                status.write("📤 Copie du fichier OneDrive vers le FTP…")
-                ok = upload_planning_onedrive_to_ftp()
-                if not ok:
-                    status.update(
-                        label="❌ Échec OneDrive → FTP",
-                        state="error",
-                    )
-                    st.stop()
-
-                status.write("🗄️ Recréation de la base de données…")
-                onedrive_to_ftp_and_rebuild_db()
-
-                status.update(
-                    label="✅ Planning publié et base mise à jour",
-                    state="complete",
-                )
-
-            st.success("✅ Planning publié et base mise à jour")
-
-
-
+        # 🕒 Affichage dernière synchro
+        render_last_sync_info()
 
 
 
@@ -2778,16 +2936,13 @@ def render_tab_vue_chauffeur(forced_ch=None):
 
     chs = get_chauffeurs_for_ui()
 
-
     # ============================
     #   CHOIX DU CHAUFFEUR
     # ============================
     if forced_ch:
-        # Chauffeur connecté via GSM
         ch_selected = forced_ch
         st.markdown(f"Chauffeur connecté : **{ch_selected}**")
     else:
-        # Admin / bureau : possibilité de laisser vide = tous les chauffeurs
         ch_selected = st.selectbox(
             "Choisir un chauffeur (CH) (laisser vide pour tous les chauffeurs)",
             [""] + chs,
@@ -2797,189 +2952,132 @@ def render_tab_vue_chauffeur(forced_ch=None):
     today = date.today()
 
     # ============================
-    #   MODE "TOUS LES CHAUFFEURS"
-    #   (aucun chauffeur sélectionné)
+    #   MODE TOUS LES CHAUFFEURS
     # ============================
     if not ch_selected and not forced_ch:
-        # Ici on est côté admin/bureau
         if st.session_state.get("role") == "admin":
-            st.info(
-                "Aucun chauffeur sélectionné : tu es en mode "
-                "'tous les chauffeurs' (envoi groupé)."
-            )
-            st.markdown("---")
-            st.markdown("### 📧 Envoi groupé à tous les chauffeurs")
-
-            from_date_all = st.date_input(
-                "Envoyer le planning à partir de cette date pour TOUS les chauffeurs :",
-                value=today + timedelta(days=1),
-                key="vue_chauffeur_all_from",
-            )
-
-            if st.button(
-                "📤 Envoyer mails + préparer WhatsApp pour tous les chauffeurs",
-                key="vue_chauffeur_send_all",
-            ):
-                send_planning_to_all_chauffeurs(from_date_all)
+            st.info("Mode tous les chauffeurs")
         else:
-            # Cas très théorique (un chauffeur qui arriverait ici sans forced_ch)
-            st.info("Sélectionne un chauffeur pour voir tes navettes.")
-        return  # on s'arrête ici en mode "tous"
+            st.info("Sélectionne un chauffeur")
+        return
 
     # ============================
-    #   MODE CHAUFFEUR INDIVIDUEL
+    #   MODE CHAUFFEUR
     # ============================
     tel_ch, mail_ch = get_chauffeur_contact(ch_selected)
     last_ack = get_chauffeur_last_ack(ch_selected)
 
+    df_ch = get_chauffeur_planning(
+        ch_selected,
+        from_date=today,
+        to_date=today + timedelta(days=6),
+    )
+
+    if df_ch.empty:
+        st.warning("Aucune navette.")
+        return
+
+    # Marquer les lignes nouvelles
+    if "updated_at" in df_ch.columns:
+        df_ch["IS_NEW"] = df_ch["updated_at"].apply(
+            lambda x: True if last_ack is None else pd.to_datetime(x, errors="coerce") > last_ack
+        )
+    else:
+        df_ch["IS_NEW"] = False
+    # =======================================================
+    #   CHOIX DE LA PÉRIODE (CLAIR POUR LE CHAUFFEUR)
+    # =======================================================
     scope = st.radio(
-        "Période",
-        ["Uniquement une date", "À partir de demain"],
+        "📅 Quelles navettes veux-tu voir ?",
+        ["Navettes du jour", "Navettes à partir de demain"],
         index=0,
         horizontal=True,
         key="vue_chauffeur_scope",
     )
 
-    if scope == "Uniquement une date":
-        day_selected = st.date_input(
-            "Date",
-            value=today,
-            key="vue_chauffeur_date",
-        )
+    if scope == "Navettes du jour":
+        sel_date = today
+        scope_label = sel_date.strftime("%d/%m/%Y")
+
         df_ch = get_chauffeur_planning(
             ch_selected,
-            from_date=day_selected,
-            to_date=day_selected,
+            from_date=sel_date,
+            to_date=sel_date,
         )
-
-        if df_ch.empty:
-            st.warning(f"Aucune navette pour {ch_selected} le {day_selected.strftime('%d/%m/%Y')}.")
-            return
-
-        df_ch = _sort_df_by_date_heure(df_ch)
-        render_chauffeur_stats(df_ch)
-        day_label = day_selected.strftime("%d/%m/%Y")
-
-        pdf_bytes = create_chauffeur_pdf(df_ch, ch_selected, day_label)
-        message_txt = build_chauffeur_day_message(df_ch, ch_selected, day_label)
-        mail_subject = f"Planning {day_label} — {ch_selected}"
-        mail_body = message_txt
-        notif_from_date = day_selected
 
     else:
-        from_date = today + timedelta(days=1)
-        df_ch = get_chauffeur_planning(ch_selected, from_date=from_date, to_date=None)
+        sel_date = today + timedelta(days=1)
+        scope_label = f"à partir du {sel_date.strftime('%d/%m/%Y')}"
 
-        if df_ch.empty:
-            st.warning(f"Aucune navette pour {ch_selected} à partir du {from_date.strftime('%d/%m/%Y')}.")
-            return
-
-        df_ch = _sort_df_by_date_heure(df_ch)
-        render_chauffeur_stats(df_ch)
-
-        from_label = from_date.strftime("%d/%m/%Y")
-        pdf_bytes = create_chauffeur_pdf(df_ch, ch_selected, from_label)
-
-        df_all = get_planning(start_date=from_date, end_date=None, max_rows=5000)
-        message_txt = build_chauffeur_future_message(df_all, ch_selected, from_date)
-        mail_subject = f"Planning à partir du {from_label} — {ch_selected}"
-        mail_body = message_txt
-        notif_from_date = from_date
-
-    # Marquer les lignes nouvelles / modifiées pour ce chauffeur
-    if "updated_at" in df_ch.columns:
-        def _is_new_row(val):
-            if last_ack is None:
-                # s'il n'a jamais confirmé, on considère tout comme "nouveau"
-                return True
-            if val is None or val == "":
-                return False
-            try:
-                dt = pd.to_datetime(val, errors="coerce")
-            except Exception:
-                return False
-            if pd.isna(dt):
-                return False
-            try:
-                dt_py = dt.to_pydatetime()
-            except AttributeError:
-                dt_py = dt
-            return dt_py > last_ack
-
-        df_ch["IS_NEW"] = df_ch["updated_at"].apply(_is_new_row)
-    else:
-        df_ch["IS_NEW"] = False
-
-    # Boutons PDF / WhatsApp / Mail
-    col_pdf, col_whats, col_mail = st.columns(3)
-
-    with col_pdf:
-        st.download_button(
-            "📄 Télécharger la feuille chauffeur (PDF)",
-            data=pdf_bytes,
-            file_name=f"AirportsLines_{ch_selected}.pdf",
-            mime="application/pdf",
+        df_ch = get_chauffeur_planning(
+            ch_selected,
+            from_date=sel_date,
+            to_date=None,
         )
 
-    with col_whats:
-        if tel_ch:
-            # petit message "nouveau planning" + demande de confirmation
-            wa_msg = build_chauffeur_new_planning_message(ch_selected, notif_from_date)
-            wa_link = build_whatsapp_link(tel_ch, wa_msg)
-            st.markdown(f"[💬 Prévenir le chauffeur par WhatsApp]({wa_link})")
-        else:
-            st.caption("Pas de numéro trouvé pour ce chauffeur (table `chauffeurs`).")
+    if df_ch.empty:
+        st.warning(f"Aucune navette {scope_label}.")
+        return
 
-    with col_mail:
-        email_key = f"vue_chauffeur_email_{ch_selected}"
-        email_default = mail_ch or ""
-        email = st.text_input(
-            "Adresse e-mail du chauffeur",
-            value=email_default,
-            key=email_key,
-        )
-
-        if email:
-            mailto_link = build_mailto_link(email, mail_subject, mail_body)
-            st.markdown(f"[📧 Ouvrir un mail avec ce planning]({mailto_link})")
-
-            if email != mail_ch and st.button("💾 Enregistrer cet e-mail pour ce chauffeur"):
-                try:
-                    with get_connection() as conn:
-                        cur = conn.cursor()
-                        cur.execute(
-                            "UPDATE chauffeurs SET MAIL = ? WHERE TRIM(INITIALE) = ?",
-                            (email, ch_selected),
-                        )
-                        conn.commit()
-                    st.success("E-mail mis à jour pour ce chauffeur.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Erreur lors de la mise à jour de l’e-mail : {e}")
-        else:
-            st.caption("Renseigne un e-mail pour activer le lien mail.")
-
-
+    df_ch = _sort_df_by_date_heure(df_ch)
+    render_chauffeur_stats(df_ch)
 
     # =======================================================
-    #   CONFIRMATION DU CHAUFFEUR : PLANNING REÇU
+    #   CONFIRMATION GLOBALE DU CHAUFFEUR
+    #   (envoi de TOUT ce qui a été encodé)
     # =======================================================
     st.markdown("---")
-    st.markdown("### ✅ Confirmation de réception du planning")
+    st.markdown("### ✅ Envoyer ma confirmation au bureau")
 
-    if last_ack is None:
-        st.info("Tu n'as pas encore confirmé la réception de ton planning.")
-    else:
+    missing = []
+    recap_lines = []
+
+    for _, row in df_ch.iterrows():
+        nav_id = row.get("id")
+
+        trajet = st.session_state.get(f"trajet_nav_{nav_id}", "").strip()
+        probleme = st.session_state.get(f"prob_nav_{nav_id}", "").strip()
+
+        if not trajet:
+            missing.append(nav_id)
+
+        recap_lines.append(
+            f"Navette ID {nav_id}\n"
+            f"Chauffeur : {ch_selected}\n"
+            f"Trajet : {trajet or '❌ NON RENSEIGNÉ'}\n"
+            f"Problème : {probleme or '—'}\n"
+            "-----------------------------"
+        )
+
+    if missing:
+        st.error(
+            f"❌ {len(missing)} navette(s) sans trajet renseigné. "
+            "Merci de compléter toutes les lignes avant l’envoi."
+        )
+
+    if st.button(
+        "📤 Envoyer ma confirmation et mes remarques",
+        disabled=bool(missing),
+        key=f"confirm_all_{ch_selected}",
+    ):
         try:
-            ack_txt = last_ack.strftime("%d/%m/%Y %H:%M:%S")
-        except Exception:
-            ack_txt = str(last_ack)
-        st.caption(f"Dernière confirmation : {ack_txt}")
+            send_mail_admin(
+                subject=f"[CONFIRMATION CHAUFFEUR] {ch_selected}",
+                body=(
+                    f"Confirmation du chauffeur {ch_selected}\n\n"
+                    + "\n".join(recap_lines)
+                ),
+            )
 
-    if st.button("👍 J'ai bien reçu mon planning et les modifications", key=f"ack_{ch_selected}"):
-        set_chauffeur_last_ack(ch_selected)
-        st.success("Merci, ta confirmation a bien été enregistrée.")
-        st.rerun()
+            # Marquer comme confirmé
+            set_chauffeur_last_ack(ch_selected)
+
+            st.success("✅ Confirmation envoyée au bureau. Merci 👍")
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"Erreur lors de l’envoi : {e}")
+
 
     # =======================================================
     #   DÉTAIL DES NAVETTES (TEXTE COMPACT)
@@ -2989,13 +3087,13 @@ def render_tab_vue_chauffeur(forced_ch=None):
     else:
         st.markdown("---")
         st.markdown("### 📋 Détail des navettes (texte compact)")
+        st.caption("Les lignes marquées 🆕 sont celles modifiées depuis ta dernière confirmation.")
 
         cols = df_ch.columns.tolist()
-        st.caption("Les lignes marquées 🆕 sont celles modifiées depuis ta dernière confirmation.")
 
         for _, row in df_ch.iterrows():
 
-            bloc_lines: List[str] = []
+            bloc_lines = []
             is_new = bool(row.get("IS_NEW", False))
             heure_txt = normalize_time_string(row.get("HEURE", ""))
 
@@ -3070,7 +3168,7 @@ def render_tab_vue_chauffeur(forced_ch=None):
 
             bloc_lines.append(header)
 
-            if is_new:
+            if is_new and bloc_lines:
                 bloc_lines[0] = f"**{bloc_lines[0]}**"
 
             # ------------------
@@ -3104,7 +3202,6 @@ def render_tab_vue_chauffeur(forced_ch=None):
             # 📞 GSM CLIENT
             # ------------------
             client_phone = get_client_phone_from_row(row)
-            tel_clean = ""
 
             if client_phone:
                 tel_clean = clean_phone(client_phone)
@@ -3132,6 +3229,7 @@ def render_tab_vue_chauffeur(forced_ch=None):
 
             if actions:
                 bloc_lines.append(" | ".join(actions))
+
             # ------------------
             # ✈️ Vol + statut
             # ------------------
@@ -3146,18 +3244,116 @@ def render_tab_vue_chauffeur(forced_ch=None):
             if vol_val:
                 bloc_lines.append(f"✈️ Vol {vol_val}")
 
-                # Statut du vol via API (cache)
                 status, delay_min, sched_dt, est_dt = get_flight_status_cached(vol_val)
                 badge = flight_badge(status, delay_min)
 
                 if badge:
                     bloc_lines.append(f"📡 Statut : {badge}")
 
+            # ==========================
+            # ÉTAT "ENVOYÉ" (TOUJOURS EN PREMIER)
+            # ==========================
+            nav_id = row.get("id")
+            sent_key = f"sent_nav_{nav_id}"
+            is_sent = st.session_state.get(sent_key, False)
+
+            # ==========================
+            # BADGE
+            # ==========================
+            if is_sent:
+                st.markdown("🟢 **Information envoyée au bureau**")
+
             # ------------------
-            # Affichage final
+            # Affichage navette
             # ------------------
             st.markdown("\n".join(bloc_lines))
+
+            # ==========================
+            # SAISIE CHAUFFEUR (PAR TRANSFERT)
+            # ==========================
+            trajet_key = f"trajet_nav_{nav_id}"
+            prob_key = f"prob_nav_{nav_id}"
+
+            if trajet_key not in st.session_state:
+                st.session_state[trajet_key] = ""
+            if prob_key not in st.session_state:
+                st.session_state[prob_key] = ""
+
+            st.text_input(
+                "Trajet compris (ex : Liège → Zaventem)",
+                key=trajet_key,
+            )
+
+            with st.expander("🚨 Signaler un problème (optionnel)"):
+                st.text_area(
+                    "Décris le problème pour cette navette",
+                    key=prob_key,
+                    placeholder="Ex : heure impossible, adresse incorrecte, client injoignable…",
+                )
+
             st.markdown("---")
+
+
+    # =======================================================
+    #   ENVOI DE CONFIRMATION (NAVETTES REMPLIES UNIQUEMENT)
+    # =======================================================
+    st.markdown("### ✅ Envoyer mes informations au bureau")
+
+    recap_lines = []
+    nb_remplies = 0
+
+    for _, row in df_ch.iterrows():
+        nav_id = row.get("id")
+
+        trajet = st.session_state.get(f"trajet_nav_{nav_id}", "").strip()
+        probleme = st.session_state.get(f"prob_nav_{nav_id}", "").strip()
+
+        # on ignore totalement les navettes vides
+        if not trajet and not probleme:
+            continue
+
+        nb_remplies += 1
+
+        recap_lines.append(
+            f"Navette ID {nav_id}\n"
+            f"Chauffeur : {ch_selected}\n"
+            f"Trajet : {trajet or '—'}\n"
+            f"Problème : {probleme or '—'}\n"
+            "-----------------------------"
+        )
+
+    if nb_remplies == 0:
+        st.warning(
+            "ℹ️ Aucune information encodée. "
+            "Merci de compléter au moins une navette avant l’envoi."
+        )
+
+    if st.button(
+        "📤 Envoyer mes informations",
+        disabled=(nb_remplies == 0),
+        key=f"confirm_all_{ch_selected}_{scope}_{sel_date}",
+    ):
+        send_mail_admin(
+            subject=f"[INFOS CHAUFFEUR] {ch_selected}",
+            body="\n".join(recap_lines),
+        )
+
+        # marquer comme envoyées UNIQUEMENT les navettes remplies
+        for _, row in df_ch.iterrows():
+            nav_id = row.get("id")
+
+            trajet = st.session_state.get(f"trajet_nav_{nav_id}", "").strip()
+            probleme = st.session_state.get(f"prob_nav_{nav_id}", "").strip()
+
+            if trajet or probleme:
+                st.session_state[f"sent_nav_{nav_id}"] = True
+
+        set_chauffeur_last_ack(ch_selected)
+
+        st.success(f"✅ {nb_remplies} navette(s) envoyée(s) au bureau.")
+        st.rerun()
+
+
 
 
 
@@ -3311,64 +3507,48 @@ def render_tab_feuil3():
 
 
 # ============================================================
-#   ONGLET 📂 EXCEL ↔ DB (FEUIL1)
+#   ONGLET 📂 EXCEL ↔ DB (SharePoint – Feuil1)
 # ============================================================
 
 def render_tab_excel_sync():
-    st.subheader("📂 Synchronisation Excel → Base de données (Feuil1)")
-
-    if import_planning_from_feuil1 is None:
-        st.error(
-            "La fonction `import_planning_from_feuil1()` n'est pas disponible.\n\n"
-            "Vérifie que dans `import_excel_to_db.py` tu as bien une fonction "
-            "`import_planning_from_feuil1()` et que tu fais :\n"
-            "`from import_excel_to_db import EXCEL_FILE, import_planning_from_feuil1`."
-        )
-        return
+    st.subheader("📂 Synchronisation SharePoint → Base de données (Feuil1)")
 
     st.markdown(
-        f"""
-        **Fichier Excel utilisé :**  
-        `{EXCEL_FILE}`
+        """
+        **Source du planning : SharePoint (fichier Excel en ligne)**
 
         ---
         🔧 **Workflow conseillé :**
 
-        1. Clique sur **📂 Ouvrir dans Excel**  
-           → Tu modifies *Feuil1* comme d'habitude (groupage, couleurs, etc.).  
-        2. Tu **enregistres** le fichier Excel.  
-        3. Tu reviens ici et cliques sur **🔁 Mettre à jour la base**  
-           → La table `planning` est recréée à partir de Feuil1.
+        1. Ouvre le fichier Excel directement sur **SharePoint / OneDrive Web**  
+           → Tu modifies *Feuil1* comme d'habitude  
+           (groupage, indispos, partagée, chauffeurs, etc.).
+        2. Le fichier est **enregistré automatiquement** par SharePoint.
+        3. Tu reviens ici et cliques sur **🔄 Mettre à jour la base**  
+           → La table `planning` est synchronisée depuis SharePoint.
 
-        ⚠️ Les couleurs Excel (groupage / partagée / indispo) sont traduites en colonnes
-        `GROUPAGE`, `PARTAGE`, `²²²²`… puis réutilisées dans l’app pour les styles.
+        ⚠️ Les couleurs Excel sont traduites en colonnes  
+        (`GROUPAGE`, `PARTAGE`, `²²²²`, etc.)  
+        et réutilisées dans l’app pour l’affichage.
         """
     )
 
-    col1, col2 = st.columns(2)
+    st.markdown("---")
 
-    with col1:
-        if st.button("📂 Ouvrir dans Excel"):
-            try:
-                abs_path = os.path.abspath(EXCEL_FILE)
-                os.startfile(abs_path)
-                st.success(f"Fichier ouvert dans Excel : {abs_path}")
-            except Exception as e:
-                st.error(f"Impossible d'ouvrir Excel automatiquement : {e}")
-                st.info("Ouvre le fichier manuellement dans l'Explorateur si besoin.")
+    if st.button("🔄 Mettre à jour la base depuis SharePoint"):
+        sync_planning_from_sharepoint()
+        st.success("Base de données mise à jour depuis SharePoint ✅")
+        st.toast("Planning synchronisé avec SharePoint.", icon="🚐")
 
-    with col2:
-        if st.button("🔁 Mettre à jour la base depuis Feuil1"):
-            try:
-                import_planning_from_feuil1()
-                st.success("Base de données mise à jour depuis Feuil1 ✅")
-                st.toast("Planning synchronisé avec l'Excel.", icon="🚐")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Erreur pendant l'import : {e}")
+
 
     st.markdown("---")
-    st.info("💡 Tu peux faire toutes tes modifs dans Excel, sauvegarder, puis revenir ici pour recharger la base.")
+    st.info(
+        "💡 Le fichier Excel n’est plus ouvert localement.\n\n"
+        "Tu peux modifier le planning depuis **n’importe quel PC**, "
+        "la base sera toujours reconstruite depuis SharePoint."
+    )
+
 
 
 # ============================================================
@@ -3751,6 +3931,7 @@ def render_tab_indispo_admin():
 # ============================================================
 
 def main():
+    auto_sync_planning_if_needed()
     # ======================================
     # 1️⃣ INITIALISATION SESSION (OBLIGATOIRE)
     # ======================================

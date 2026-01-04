@@ -5,26 +5,26 @@ import streamlit as st
 import pandas as pd
 import hashlib
 
-def sqlite_safe(val):
-    if val is None:
+def sqlite_safe(value):
+    """
+    Convertit une valeur en type compatible SQLite
+    SANS JAMAIS MODIFIER LES DATES
+    """
+    if value is None:
         return None
 
-    # datetime.time
-    if hasattr(val, "hour") and hasattr(val, "minute"):
-        return f"{val.hour:02d}:{val.minute:02d}"
-
-    # datetime / date / pandas
+    # pandas NaN
     try:
-        import pandas as pd
-        from datetime import datetime, date
-        if isinstance(val, (pd.Timestamp, datetime, date)):
-            return val.strftime("%d/%m/%Y")
+        if pd.isna(value):
+            return None
     except Exception:
         pass
 
-    return str(val)
+    # datetime / date → string ISO ou string Excel
+    if isinstance(value, (datetime, date)):
+        return value.strftime("%Y-%m-%d")
 
-
+    return str(value)
 # =========================
 #   CONFIG BASE DE DONNÉES
 # =========================
@@ -47,20 +47,32 @@ def get_connection() -> sqlite3.Connection:
 
 def _normalize_date_str(d: Any) -> str:
     """
-    Utilitaire : convertit une date (datetime.date ou str) au format dd/mm/YYYY.
+    Utilitaire : convertit une date (datetime.date ou str)
+    vers le format dd/mm/YYYY, sans warning pandas.
     """
     if d is None or (isinstance(d, float) and pd.isna(d)):
         return ""
+
     if isinstance(d, date):
         return d.strftime("%d/%m/%Y")
+
     s = str(d).strip()
     if not s:
         return ""
+
     try:
-        v = pd.to_datetime(s, dayfirst=True, errors="coerce")
+        # Cas ISO déjà normalisé : YYYY-MM-DD
+        if len(s) == 10 and s[4] == "-" and s[7] == "-":
+            v = pd.to_datetime(s, format="%Y-%m-%d", errors="coerce")
+        else:
+            # Cas Excel / européen : DD/MM/YYYY
+            v = pd.to_datetime(s, dayfirst=True, errors="coerce")
+
         if pd.isna(v):
             return s
+
         return v.strftime("%d/%m/%Y")
+
     except Exception:
         return s
 
@@ -125,15 +137,6 @@ def _load_planning_df() -> pd.DataFrame:
     if df.empty:
         return df
 
-    # Normalisation DATE -> datetime.date (tout en gardant la valeur texte initiale dans la base)
-    if "DATE" in df.columns:
-        try:
-            df["DATE"] = pd.to_datetime(
-                df["DATE"], dayfirst=True, errors="coerce"
-            ).dt.date
-        except Exception:
-            # on laisse tel quel si ça échoue
-            pass
 
     # S'assurer que GROUPAGE / PARTAGE existent toujours (sinon colonnes 0)
     if "GROUPAGE" not in df.columns:
@@ -144,11 +147,6 @@ def _load_planning_df() -> pd.DataFrame:
     return df
 
 
-# =========================
-#   LECTURE PLANNING
-# =========================
-
-@st.cache_data(ttl=300)
 # =========================
 #   LECTURE PLANNING
 # =========================
@@ -171,6 +169,8 @@ def get_planning(
         - "7j"   -> planning_7j    (planning / édition / chauffeur)
         - "full" -> planning_full  (admin / clients / historique)
     """
+    ...
+
 
     # =========================
     # Choix de la table
@@ -191,7 +191,7 @@ def get_planning(
                 f"""
                 SELECT *
                 FROM {table}
-                ORDER BY DATE, HEURE
+                ORDER BY DATE_ISO, HEURE
                 LIMIT ?
                 """,
                 conn,
@@ -383,7 +383,7 @@ def get_chauffeurs() -> List[str]:
     all_codes = sorted(all_codes, key=lambda x: x.upper())
     return all_codes
 
-
+@st.cache_data(ttl=300)
 def get_chauffeur_planning(
     chauffeur: str,
     from_date: Optional[date] = None,
@@ -1453,4 +1453,35 @@ def mark_row_needs_excel_update(row_key: str):
             VALUES (?, 'EXCEL_UPDATE_NEEDED', datetime('now'))
         """, (row_key,))
         conn.commit()
+# ============================================================
+#   TABLE META (état de la synchro SharePoint)
+# ============================================================
+
+def ensure_meta_table():
+    with get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        conn.commit()
+
+
+def get_meta(key: str):
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM meta WHERE key = ?", (key,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def set_meta(key: str, value: str):
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+        conn.commit()
+
 
