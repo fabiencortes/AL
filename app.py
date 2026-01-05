@@ -298,6 +298,51 @@ def rebuild_db_fast(status):
     ensure_indexes()
 
     status.update(label="🎉 Base active remplacée", state="complete")
+def format_navette_ack(row, ch_selected, trajet, probleme):
+    from datetime import datetime, date
+    import pandas as pd
+
+    # 📆 Date
+    dv = row.get("DATE")
+    if isinstance(dv, (datetime, date)):
+        date_txt = dv.strftime("%d/%m/%Y")
+    else:
+        dtmp = pd.to_datetime(dv, dayfirst=True, errors="coerce")
+        date_txt = dtmp.strftime("%d/%m/%Y") if not pd.isna(dtmp) else "??/??/????"
+
+    # ⏱ Heure
+    heure_txt = normalize_time_string(row.get("HEURE")) or "??:??"
+
+    # Sens / destination
+    designation = str(row.get("DESIGNATION", "") or "").upper()
+    sens = "VERS" if "VERS" in designation else "DE"
+    dest = "BRU" if "BRU" in designation else "AUTRE"
+
+    # Client
+    nom = str(row.get("NOM", "") or "").strip()
+
+    # Adresse
+    adresse = str(row.get("ADRESSE", "") or "").strip()
+    cp = str(row.get("CP", "") or "").replace(".0", "")
+    loc = str(row.get("Localité", "") or row.get("LOCALITE", "") or "").strip()
+    adr_full = " ".join(x for x in [adresse, cp, loc] if x)
+
+    # Téléphone
+    tel = str(row.get("TEL", "") or row.get("TELEPHONE", "") or "").strip()
+
+    return f"""📆 {date_txt} | ⏱ {heure_txt}
+👨‍✈️ {ch_selected} ➡ {sens} ({dest})
+
+🧑 {nom}
+📍 {adr_full}
+📞 {tel}
+
+📝 Infos chauffeur :
+Trajet : {trajet or "—"}
+Problème : {probleme or "—"}
+"""
+
+
 
 def send_planning_confirmation_email(
     chauffeur: str,
@@ -3319,11 +3364,12 @@ def render_tab_vue_chauffeur(forced_ch=None):
         nb_remplies += 1
 
         recap_lines.append(
-            f"Navette ID {nav_id}\n"
-            f"Chauffeur : {ch_selected}\n"
-            f"Trajet : {trajet or '—'}\n"
-            f"Problème : {probleme or '—'}\n"
-            "-----------------------------"
+            format_navette_ack(
+                row=row,
+                ch_selected=ch_selected,
+                trajet=trajet,
+                probleme=probleme,
+            )
         )
 
     if nb_remplies == 0:
