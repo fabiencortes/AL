@@ -2678,44 +2678,67 @@ def render_chauffeur_stats(df_ch: pd.DataFrame):
         st.metric("💶 Caisse totale", float(caisse_total))
 
 # ============================================================
-#   ENVOI PLANNING À TOUS LES CHAUFFEURS
+#   ENVOI PLANNING AUX CHAUFFEURS (MAIL + WHATSAPP)
 # ============================================================
 
-def send_planning_to_all_chauffeurs(from_date: date):
+def send_planning_to_chauffeurs(
+    chauffeurs: list[str],
+    from_date: date,
+    to_date: date | None = None,
+    message_type: str = "planning",
+):
     """
     Envoie à chaque chauffeur un mail avec SON planning individuel
-    à partir de from_date, et prépare les liens WhatsApp pour
-    prévenir qu'un nouveau planning est disponible.
+    et prépare les liens WhatsApp.
     """
-    chs = get_chauffeurs()
-    if not chs:
-        st.warning("Aucun chauffeur configuré dans Feuil2.")
+
+    if not chauffeurs:
+        st.warning("Aucun chauffeur sélectionné.")
         return
 
     # Charger une seule fois tout le planning
-    df_all = get_planning(start_date=from_date, end_date=None, max_rows=5000)
+    df_all = get_planning(
+        start_date=from_date,
+        end_date=to_date,
+        max_rows=5000,
+        source="7j",
+    )
+
     if df_all.empty:
-        st.warning(f"Aucune navette à partir du {from_date.strftime('%d/%m/%Y')}.")
+        st.warning("Aucune navette sur la période sélectionnée.")
         return
 
     sent = 0
-    no_email = []
-    wa_links: List[Dict[str, str]] = []
+    no_email: list[str] = []
+    wa_links: list[dict] = []
 
-    # --------------- BOUCLE POUR CHAQUE CHAUFFEUR ---------------
-    for ch in chs:
+    # ===================================================
+    # BOUCLE CHAUFFEURS
+    # ===================================================
+    for ch in chauffeurs:
 
-        # Téléphone + mail du chauffeur
         tel, mail = get_chauffeur_contact(ch)
 
-        # Filtrer SON planning (on ne fait rien si aucune navette)
-        df_ch = df_all[df_all["CH"].astype(str).str.strip().str.upper() == ch.upper()]
+        df_ch = df_all[
+            df_all["CH"].astype(str).str.strip().str.upper() == ch.upper()
+        ]
+
         if df_ch.empty:
             continue
 
-        # ------------ MAIL ------------
-        msg_txt = build_chauffeur_future_message(df_all, ch, from_date)
-        subject = f"Planning à partir du {from_date.strftime('%d/%m/%Y')} — {ch}"
+        # ---------------- MAIL ----------------
+        if message_type == "planning":
+            subject = f"Planning à partir du {from_date.strftime('%d/%m/%Y')} — {ch}"
+            msg_txt = build_chauffeur_future_message(df_all, ch, from_date)
+        else:
+            subject = f"📢 Modification planning — {ch}"
+            msg_txt = (
+                "Bonjour,\n\n"
+                "📢 Une modification de planning a été effectuée aujourd’hui.\n"
+                "Merci de consulter l’application Airports Lines "
+                "et de confirmer la réception.\n\n"
+                "— Airports Lines"
+            )
 
         if mail:
             if send_email_smtp(mail, subject, msg_txt):
@@ -2723,31 +2746,39 @@ def send_planning_to_all_chauffeurs(from_date: date):
         else:
             no_email.append(ch)
 
-        # ------------ WHATSAPP ------------
+        # ---------------- WHATSAPP ----------------
         if tel:
             wa_msg = build_chauffeur_new_planning_message(ch, from_date)
             wa_url = build_whatsapp_link(tel, wa_msg)
-            wa_links.append({"ch": ch, "tel": tel, "url": wa_url})
+            wa_links.append({
+                "ch": ch,
+                "tel": tel,
+                "url": wa_url,
+            })
 
-    # Résultats MAIL
-    st.success(f"Emails envoyés pour {sent} chauffeur(s).")
+    # ===================================================
+    # RETOUR UI
+    # ===================================================
+    st.success(f"📧 Emails envoyés pour {sent} chauffeur(s).")
 
     if no_email:
-        st.info("Pas d'adresse email configurée pour : " + ", ".join(no_email))
+        st.info(
+            "📭 Pas d'adresse email configurée pour : "
+            + ", ".join(sorted(no_email))
+        )
 
-    # Résultats WHATSAPP
     if wa_links:
         st.markdown("### 💬 Prévenir les chauffeurs par WhatsApp")
         st.caption(
-            "Clique sur chaque lien pour ouvrir WhatsApp avec le message "
-            "pré-rempli. Seuls les chauffeurs qui ont des navettes à partir "
-            "de cette date et un numéro de GSM apparaissent ici."
+            "Clique sur un lien pour ouvrir WhatsApp avec le message pré-rempli."
         )
+
         for item in wa_links:
-            ch = item["ch"]
-            tel = item["tel"]
-            url = item["url"]
-            st.markdown(f"- {ch} ({tel}) → [Envoyer WhatsApp]({url})")
+            st.markdown(
+                f"- {item['ch']} ({item['tel']}) → "
+                f"[Envoyer WhatsApp]({item['url']})"
+            )
+
 
 
 
@@ -3003,36 +3034,183 @@ def render_tab_vue_chauffeur(forced_ch=None):
     # ============================
     #   MODE TOUS LES CHAUFFEURS
     # ============================
+    mode_all = False
+
     if not ch_selected and not forced_ch:
         if st.session_state.get("role") == "admin":
+            mode_all = True
             st.info("Mode tous les chauffeurs")
         else:
             st.info("Sélectionne un chauffeur")
-        return
+            return
 
     # ============================
-    #   MODE CHAUFFEUR
+    #   CHARGEMENT DU PLANNING
     # ============================
-    tel_ch, mail_ch = get_chauffeur_contact(ch_selected)
-    last_ack = get_chauffeur_last_ack(ch_selected)
+    if mode_all:
+        # ----------------------------
+        # ADMIN : TOUS LES CHAUFFEURS
+        # ----------------------------
+        df_ch = get_planning(
+            start_date=today,
+            end_date=today + timedelta(days=6),
+            chauffeur=None,
+            type_filter=None,
+            search="",
+            max_rows=5000,
+            source="7j",
+        )
 
-    df_ch = get_chauffeur_planning(
-        ch_selected,
-        from_date=today,
-        to_date=today + timedelta(days=6),
-    )
+        tel_ch = None
+        mail_ch = None
+        last_ack = None
 
-    if df_ch.empty:
+    else:
+        # ----------------------------
+        # MODE CHAUFFEUR UNIQUE
+        # ----------------------------
+        tel_ch, mail_ch = get_chauffeur_contact(ch_selected)
+        last_ack = get_chauffeur_last_ack(ch_selected)
+
+        df_ch = get_chauffeur_planning(
+            ch_selected,
+            from_date=today,
+            to_date=today + timedelta(days=6),
+        )
+
+    if df_ch is None or df_ch.empty:
         st.warning("Aucune navette.")
         return
+    # =======================================================
+    #   📢 ENVOI DU PLANNING (ADMIN)
+    # =======================================================
+    if st.session_state.get("role") == "admin":
+        st.markdown("---")
+        st.markdown("### 📢 Envoi du planning")
 
-    # Marquer les lignes nouvelles
-    if "updated_at" in df_ch.columns:
-        df_ch["IS_NEW"] = df_ch["updated_at"].apply(
-            lambda x: True if last_ack is None else pd.to_datetime(x, errors="coerce") > last_ack
+        # ---------------------------
+        # Choix période
+        # ---------------------------
+        periode = st.radio(
+            "📅 Quelle période envoyer ?",
+            ["Aujourd’hui", "Demain + 2 jours"],
+            horizontal=True,
+            key="send_planning_periode",
         )
-    else:
-        df_ch["IS_NEW"] = False
+
+        if periode == "Aujourd’hui":
+            d_start = today
+            d_end = today
+            periode_label = "du jour"
+        else:
+            d_start = today + timedelta(days=1)
+            d_end = today + timedelta(days=3)
+            periode_label = "de demain à J+3"
+
+
+        # ---------------------------
+        # Choix destinataire
+        # ---------------------------
+        ch_choice = st.radio(
+            "🚖 Destinataire",
+            ["Tous les chauffeurs", "Un chauffeur"],
+            horizontal=True,
+            key="send_planning_target",
+        )
+
+        if ch_choice == "Un chauffeur":
+            ch_target = st.selectbox(
+                "Sélectionner le chauffeur",
+                sorted(df_ch["CH"].dropna().unique().tolist()),
+                key="send_planning_one_ch",
+            )
+            chauffeurs = [ch_target]
+        else:
+            chauffeurs = sorted(
+                df_ch["CH"].dropna().unique().tolist()
+            )
+
+        # ---------------------------
+        # Bouton d’envoi
+        # ---------------------------
+        if st.button("📧 Envoyer le planning"):
+
+            if not chauffeurs:
+                st.warning("Aucun chauffeur à notifier.")
+            else:
+                send_planning_to_chauffeurs(
+                    chauffeurs=chauffeurs,
+                    from_date=d_start,
+                    to_date=d_end,
+                    message_type="planning",
+                )
+
+                st.success(
+                    f"✅ Planning {periode_label} envoyé aux chauffeurs sélectionnés."
+                )
+                st.rerun()
+
+
+    # =======================================================
+    #   📊 STATUT CONFIRMATION PAR CHAUFFEUR (ADMIN)
+    # =======================================================
+    if mode_all and st.session_state.get("role") == "admin":
+        st.markdown("---")
+        st.markdown("### 📊 Statut des chauffeurs")
+
+        chauffeurs = sorted(df_ch["CH"].dropna().unique().tolist())
+
+        status_rows = []
+
+        for ch in chauffeurs:
+            last_ack = get_chauffeur_last_ack(ch)
+
+            status_rows.append({
+                "Chauffeur": ch,
+                "Statut": "🟢 Confirmé" if last_ack else "🔴 Non confirmé",
+                "Dernière confirmation": (
+                    last_ack.strftime("%d/%m/%Y %H:%M")
+                    if last_ack else "—"
+                ),
+            })
+
+        st.dataframe(
+            pd.DataFrame(status_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # ===================================================
+        #   ⏰ RAPPEL AUX CHAUFFEURS NON CONFIRMÉS
+        # ===================================================
+        if st.button("⏰ Rappel aux chauffeurs non confirmés"):
+
+            chauffeurs = sorted(
+                df_ch["CH"].dropna().unique().tolist()
+            )
+
+            non_confirmes = [
+                ch for ch in chauffeurs
+                if not get_chauffeur_last_ack(ch)
+            ]
+
+            if not non_confirmes:
+                st.success("✅ Tous les chauffeurs ont confirmé leur planning.")
+            else:
+                send_planning_to_chauffeurs(
+                    chauffeurs=non_confirmes,
+                    from_date=today,
+                    to_date=None,
+                    message_type="modification",
+                )
+
+                st.success(
+                    f"⏰ Rappel envoyé à {len(non_confirmes)} chauffeur(s) non confirmé(s)."
+                )
+                st.rerun()
+
+
+
     # =======================================================
     #   CHOIX DE LA PÉRIODE (CLAIR POUR LE CHAUFFEUR)
     # =======================================================
