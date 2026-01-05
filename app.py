@@ -2296,9 +2296,9 @@ def render_tab_table():
     )
 
     EXCEL_ONLINE_URL = (
-        "https://airportslines1-my.sharepoint.com/:x:/g/personal/"
-        "info_airports-lines_com/IQAmuZHAjt79SZQwL5wT6N4AAZ_Kml1cqlMab4p9iK36SkE"
-        "?e=1aVt2n"
+        "https://www.dropbox.com/scl/fi/lymuumy8en46l7p0uwjj3/"
+        "Planning-2026.xlsx"
+        "?rlkey=sgvr0a58ekpr471p5aguqk3k8&dl=0"
     )
 
     # 🌐 Ouvrir Excel
@@ -4304,4 +4304,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
