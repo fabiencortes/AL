@@ -15,7 +15,6 @@ import smtplib
 from email.mime.text import MIMEText
 import pandas as pd
 import requests
-import dropbox
 from io import BytesIO
 import streamlit as st
 from reportlab.lib.pagesizes import A4
