@@ -3435,6 +3435,30 @@ def render_tab_vue_chauffeur(forced_ch=None):
                 bloc_lines.append(f"📞 **Client** : [{client_phone}](tel:{tel_clean})")
             else:
                 bloc_lines.append("📞 **Client** : ❌ numéro manquant")
+            # =========================
+            # 💰 Paiement / PAX (AFFICHAGE SEUL)
+            # =========================
+            pay_lines = []
+
+            # 👥 Passagers
+            pax = row.get("PAX")
+            if pax:
+                pay_lines.append(f"👥 {pax} pax")
+
+            # 💳 Paiement
+            paiement = str(row.get("PAIEMENT", "") or "").lower()
+            caisse = row.get("Caisse")
+
+            if paiement == "facture":
+                pay_lines.append("🧾 Facture")
+            elif paiement in ("caisse", "bancontact"):
+                if caisse not in ("", None):
+                    pay_lines.append(f"💶 {caisse} € ({paiement})")
+                else:
+                    pay_lines.append(f"💶 {paiement}")
+
+            if pay_lines:
+                bloc_lines.append(" | ".join(pay_lines))                
 
             # ================================
             #   Actions GSM
@@ -4306,3 +4330,4 @@ def main():
 if __name__ == "__main__":
 
     main()
+
