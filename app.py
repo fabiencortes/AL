@@ -2034,13 +2034,18 @@ def render_tab_quick_day_mobile():
     if not chs_ui:
         chs_ui = get_chauffeurs() or CH_CODES
 
-    # 3) Tri par heure
+    # 3) Tri par heure 
     def _key_time(v):
-        txt = normalize_time_string(v)
+        txt = normalize_time_string(v)  # renvoie HH:MM:SS
+        if not txt:
+            return datetime.max.time()
         try:
-            return datetime.strptime(txt, "%H:%M").time()
+            return datetime.strptime(txt, "%H:%M:%S").time()
         except Exception:
-            return datetime.min.time()
+            try:
+                return datetime.strptime(txt, "%H:%M").time()
+            except Exception:
+                return datetime.max.time()
 
     if "HEURE" in df.columns:
         df["_sort_time"] = df["HEURE"].apply(_key_time)
@@ -3841,6 +3846,8 @@ def render_tab_calcul_heures():
         st.markdown("---")
         st.metric("Total heures", _minutes_to_hhmm(total_minutes))
         st.metric("Lignes à vérifier", to_check)
+
+
 
 
 # ==========================================================================
