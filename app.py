@@ -9,6 +9,8 @@ from datetime import datetime, date, timedelta
 from typing import Dict, Any, List
 from database import init_time_rules_table
 from database import init_actions_table
+from database import mark_navette_confirmed
+from database import ensure_ack_columns
 from utils_paths import force_copy_planning_to_onedrive
 from pathlib import Path
 
@@ -785,17 +787,12 @@ Commentaire / problème : {commentaire or "—"}
     send_mail_admin(subject, body)
 
 
-def is_navette_confirmed(row, nav_id) -> bool:
+def is_navette_confirmed(row):
     """
-    Détermine si une navette est déjà confirmée par le chauffeur
+    Une navette est confirmée si ACK_AT est renseigné en DB
     """
-    # 1️⃣ Priorité DB si colonne existe
-    for col in ("CONFIRMED", "ACK", "IS_CONFIRMED"):
-        if col in row and str(row.get(col)).strip() in ("1", "True", "true", "YES", "OK"):
-            return True
+    return bool(row.get("ACK_AT"))
 
-    # 2️⃣ Fallback session (déjà utilisé chez toi)
-    return bool(st.session_state.get(f"sent_nav_{nav_id}", False))
 
 def rebuild_db_from_ftp(status):
     """
@@ -1773,7 +1770,8 @@ def build_planning_mail_body(
             date_txt = dv.strftime("%d/%m/%Y")
         else:
             try:
-                date_txt = pd.to_datetime(dv, dayfirst=True, errors="coerce").strftime("%d/%m/%Y")
+                dtmp = pd.to_datetime(dv, dayfirst=True, errors="coerce")
+                date_txt = dtmp.strftime("%d/%m/%Y") if not pd.isna(dtmp) else "??/??/????"
             except Exception:
                 date_txt = "??/??/????"
 
@@ -1791,7 +1789,9 @@ def build_planning_mail_body(
         # -------------------------
         # DESTINATION
         # -------------------------
-        lieu = resolve_client_alias(str(row.get("DESIGNATION", "") or "").strip())
+        lieu = resolve_client_alias(
+            str(row.get("DESIGNATION", "") or "").strip()
+        )
 
         # -------------------------
         # CLIENT
@@ -1801,7 +1801,7 @@ def build_planning_mail_body(
         adr_full = build_full_address_from_row(row)
 
         # -------------------------
-        # VÉHICULE (STRICT)
+        # VÉHICULE
         # -------------------------
         immat = str(row.get("IMMAT", "") or "").strip()
         reh_n = extract_positive_int(row.get("REH"))
@@ -1815,6 +1815,11 @@ def build_planning_mail_body(
         paiement = str(row.get("PAIEMENT", "") or "").lower()
         caisse = row.get("Caisse")
 
+        # -------------------------
+        # GO (IMPORTANT)
+        # -------------------------
+        go_val = str(row.get("GO", "") or "").strip()
+
         # =============================
         # LIGNE PRINCIPALE
         # =============================
@@ -1822,10 +1827,15 @@ def build_planning_mail_body(
             f"📆 {date_txt} | ⏱ {heure} — {sens_txt} ({lieu})"
         )
 
+        if go_val:
+            lines.append(f"🟢 GO : {go_val}")
+
         if nom:
             lines.append(f"👤 Client : {nom}")
+
         if tel_client:
             lines.append(f"📞 Client : {tel_client}")
+
         if adr_full:
             lines.append(f"📍 Adresse : {adr_full}")
 
@@ -1846,13 +1856,14 @@ def build_planning_mail_body(
         # -------------------------
         if vol:
             lines.append(f"✈️ Vol : {vol}")
-        if pax:
+
+        if pax not in ("", None, 0, "0"):
             lines.append(f"👥 PAX : {pax}")
 
         if paiement == "facture":
             lines.append("💳 Paiement : Facture")
         elif paiement in ("caisse", "bancontact"):
-            if caisse:
+            if caisse not in ("", None):
                 lines.append(f"💳 Paiement : {paiement} — {caisse} €")
             else:
                 lines.append(f"💳 Paiement : {paiement}")
@@ -1860,6 +1871,7 @@ def build_planning_mail_body(
         lines.append("")
 
     return "\n".join(lines).strip()
+
 
 
 def get_client_phone_from_row(row: pd.Series) -> str:
@@ -4497,6 +4509,250 @@ def export_chauffeur_planning_pdf(df_ch: pd.DataFrame, ch: str):
         st.rerun()
 
 
+# ============================================================
+#   🚖 ONGLET CHAUFFEUR — MON PLANNING COMPLET
+# ============================================================
+
+def render_tab_chauffeur_driver():
+    ch_selected = st.session_state.get("chauffeur_code")
+    if not ch_selected:
+        st.error("Chauffeur non identifié.")
+        return
+
+    st.subheader(f"🚖 Mon planning — {ch_selected}")
+
+    today = date.today()
+
+    df_ch = get_chauffeur_planning(
+        ch_selected,
+        from_date=today,
+        to_date=today + timedelta(days=6),
+    )
+
+    if df_ch is None or df_ch.empty:
+        st.info("Aucune navette.")
+        return
+
+    df_ch = _sort_df_by_date_heure(df_ch)
+    cols = df_ch.columns.tolist()
+
+    # ===================================================
+    # 📄 PDF
+    # ===================================================
+    st.markdown("### 📄 Mon planning")
+    if st.button("📄 Télécharger mon planning en PDF"):
+        pdf = export_chauffeur_planning_pdf(df_ch, ch_selected)
+        st.download_button(
+            label="⬇️ Télécharger le PDF",
+            data=pdf,
+            file_name=f"planning_{ch_selected}.pdf",
+            mime="application/pdf",
+        )
+
+    st.markdown("---")
+
+    # ===================================================
+    # 🚖 NAVETTES
+    # ===================================================
+    for _, row in df_ch.iterrows():
+        nav_id = row.get("id")
+        bloc = []
+
+        # ------------------
+        # Confirmation
+        # ------------------
+        if is_navette_confirmed(row):
+            bloc.append("✅ **Navette confirmée**")
+        else:
+            bloc.append("🕒 **À confirmer**")
+
+        # ------------------
+        # Date / Heure
+        # ------------------
+        dv = row.get("DATE")
+        if isinstance(dv, date):
+            date_txt = dv.strftime("%d/%m/%Y")
+        else:
+            try:
+                dtmp = pd.to_datetime(dv, dayfirst=True, errors="coerce")
+                date_txt = dtmp.strftime("%d/%m/%Y") if not pd.isna(dtmp) else ""
+            except Exception:
+                date_txt = ""
+
+        heure_txt = normalize_time_string(row.get("HEURE")) or "??:??"
+        bloc.append(f"📆 {date_txt} | ⏱ {heure_txt}")
+
+        # ------------------
+        # Sens / Destination
+        # ------------------
+        sens_txt = format_sens_ar(row.get("Unnamed: 8"))
+        dest = resolve_client_alias(str(row.get("DESIGNATION", "") or "").strip())
+        bloc.append(f"➡ {sens_txt} ({dest})")
+
+        # ------------------
+        # Client
+        # ------------------
+        nom = str(row.get("NOM", "") or "").strip()
+        if nom:
+            bloc.append(f"🧑 {nom}")
+
+        # ------------------
+        # 👥 PAX (VISIBLE)
+        # ------------------
+        pax = row.get("PAX")
+        if pax not in ("", None, 0, "0"):
+            try:
+                pax_int = int(pax)
+                if pax_int > 0:
+                    bloc.append(f"👥 **{pax_int} pax**")
+            except Exception:
+                bloc.append(f"👥 **{pax} pax**")
+
+        # ------------------
+        # Véhicule
+        # ------------------
+        if row.get("IMMAT"):
+            bloc.append(f"🚘 Plaque : {row.get('IMMAT')}")
+
+        siege_n = extract_positive_int(row.get("SIEGE", "SIÈGE"))
+        if siege_n:
+            bloc.append(f"🪑 Siège enfant : {siege_n}")
+
+        reh_n = extract_positive_int(row.get("REH"))
+        if reh_n:
+            bloc.append(f"♿ REH : {reh_n}")
+
+        # ------------------
+        # Adresse
+        # ------------------
+        adr = build_full_address_from_row(row)
+        if adr:
+            bloc.append(f"📍 {adr}")
+
+        # ------------------
+        # Téléphone
+        # ------------------
+        tel = get_client_phone_from_row(row)
+        if tel:
+            bloc.append(f"📞 {tel}")
+
+        # ------------------
+        # Paiement
+        # ------------------
+        pay_lines = []
+        paiement = str(row.get("PAIEMENT", "") or "").lower()
+        caisse = row.get("Caisse")
+
+        if paiement == "facture":
+            pay_lines.append("🧾 Facture")
+        elif paiement in ("caisse", "bancontact"):
+            pay_lines.append(
+                f"💶 {caisse} € ({paiement})" if caisse not in ("", None) else f"💶 {paiement}"
+            )
+
+        if pay_lines:
+            bloc.append(" | ".join(pay_lines))
+
+        # ------------------
+        # Vol + statut
+        # ------------------
+        vol = extract_vol_val(row, cols)
+        if vol:
+            bloc.append(f"✈️ Vol {vol}")
+            status, delay_min, *_ = get_flight_status_cached(vol)
+            badge = flight_badge(status, delay_min)
+            if badge:
+                bloc.append(f"📡 Statut : {badge}")
+
+        # ------------------
+        # GO
+        # ------------------
+        go_val = str(row.get("GO", "") or "").strip()
+        if go_val:
+            bloc.append(f"🟢 GO : {go_val}")
+
+        # ------------------
+        # 🔗 Actions (Appels / Waze / Maps / WhatsApp)
+        # ------------------
+        actions = []
+
+        if tel:
+            tel_clean = clean_phone(tel)
+            actions.append(f"[📞 Appeler](tel:{tel_clean})")
+
+        if adr:
+            waze_url = build_waze_link(adr)
+            if waze_url and waze_url != "#":
+                actions.append(f"[🧭 Waze]({waze_url})")
+
+            gmaps_url = build_google_maps_link(adr)
+            if gmaps_url and gmaps_url != "#":
+                actions.append(f"[🗺 Google Maps]({gmaps_url})")
+
+        if tel:
+            msg = build_client_sms_from_driver(row, ch_selected, tel)
+            wa_url = build_whatsapp_link(tel, msg)
+            actions.append(f"[💬 WhatsApp]({wa_url})")
+
+        if actions:
+            bloc.append(" | ".join(actions))
+
+        # ------------------
+        # Affichage
+        # ------------------
+        st.markdown("\n".join(bloc))
+
+        # ------------------
+        # Saisie chauffeur
+        # ------------------
+        trajet_key = f"trajet_nav_{nav_id}"
+        prob_key = f"prob_nav_{nav_id}"
+
+        st.session_state.setdefault(trajet_key, "")
+        st.session_state.setdefault(prob_key, "")
+
+        st.text_input("Trajet compris", key=trajet_key)
+
+        with st.expander("🚨 Signaler un problème"):
+            st.text_area("Décrire le problème", key=prob_key)
+
+        st.markdown("---")
+
+    # ===================================================
+    # 📤 ENVOI CONFIRMATION
+    # ===================================================
+    if st.button("📤 Envoyer mes informations"):
+        recap = []
+
+        for _, row in df_ch.iterrows():
+            nav_id = row.get("id")
+            trajet = st.session_state.get(f"trajet_nav_{nav_id}", "").strip()
+            prob = st.session_state.get(f"prob_nav_{nav_id}", "").strip()
+
+            if trajet or prob:
+                recap.append(
+                    format_navette_ack(
+                        row=row,
+                        ch_selected=ch_selected,
+                        trajet=trajet,
+                        probleme=prob,
+                    )
+                )
+                mark_navette_confirmed(nav_id, ch_selected)
+
+        if not recap:
+            st.warning("Aucune information encodée.")
+            return
+
+        send_mail_admin(
+            subject=f"[INFOS CHAUFFEUR] {ch_selected}",
+            body="\n\n".join(recap),
+        )
+
+        set_chauffeur_last_ack(ch_selected)
+        st.success("✅ Confirmation enregistrée.")
+        st.rerun()
+
 
 
 
@@ -5096,6 +5352,7 @@ def main():
     ensure_planning_updated_at_column()
     ensure_km_time_columns()
     ensure_flight_alerts_time_columns()
+    ensure_ack_columns()
 
     # ======================================
     # 3️⃣ LOGIN
@@ -5201,17 +5458,21 @@ def main():
 
     # ==================== DRIVER (CHAUFFEUR) = GG, FA,... ===
     elif role == "driver":
-        # Chauffeur : uniquement la vue chauffeur, filtrée sur son code
         ch_code = st.session_state.get("chauffeur_code")
         if not ch_code:
             st.error("Aucun code chauffeur configuré pour cet utilisateur.")
             return
 
-        tab1, tab2 = st.tabs(["🚖 Mes navettes", "🚫 Mes indispos"])
+        tab1, tab2 = st.tabs(
+            ["🚖 Mon planning", "🚫 Mes indispos"]
+        )
+
         with tab1:
-            render_tab_vue_chauffeur(forced_ch=ch_code)
+            render_tab_chauffeur_driver()
+
         with tab2:
             render_tab_indispo_driver(ch_code)
+
 
     # ==================== AUTRE RÔLE INCONNU = ERREUR ======
     else:

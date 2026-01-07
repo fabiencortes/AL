@@ -806,6 +806,33 @@ def get_chauffeur_last_ack(chauffeur: str) -> Optional[datetime]:
         return datetime.fromisoformat(txt)
     except Exception:
         return None
+def mark_navette_confirmed(nav_id: int, ch: str):
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE planning
+            SET ACK_BY = ?, ACK_AT = datetime('now')
+            WHERE id = ?
+            """,
+            (ch, nav_id),
+        )
+        conn.commit()
+
+
+def ensure_ack_columns():
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(planning)")
+        cols = [r[1] for r in cur.fetchall()]
+
+        if "ACK_BY" not in cols:
+            cur.execute("ALTER TABLE planning ADD COLUMN ACK_BY TEXT")
+
+        if "ACK_AT" not in cols:
+            cur.execute("ALTER TABLE planning ADD COLUMN ACK_AT TEXT")
+
+        conn.commit()
+
 
 
 def set_chauffeur_last_ack(chauffeur: str, dt: Optional[datetime] = None) -> None:
