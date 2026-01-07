@@ -3,6 +3,7 @@
 #   BLOC 1/7 : IMPORTS, CONFIG, HELPERS, SESSION
 # ============================================================
 DEBUG_SAFE_MODE = True
+AUTO_REFRESH_MINUTES = 5  # 🔁 auto-refresh toutes les X minutes
 import os
 import io
 from datetime import datetime, date, timedelta
@@ -11,8 +12,8 @@ from database import init_time_rules_table
 from database import init_actions_table
 from database import mark_navette_confirmed
 from database import ensure_ack_columns
-from utils_paths import force_copy_planning_to_onedrive
 from pathlib import Path
+from streamlit_autorefresh import st_autorefresh
 
 import math
 import smtplib
@@ -25,7 +26,6 @@ import streamlit as st
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import cm
-from ftplib import FTP
 
 from database import (
     get_planning,
@@ -59,7 +59,6 @@ from database import (
     set_meta,
 
 )
-
 # ============================================================
 #   SESSION STATE
 # ============================================================
@@ -209,75 +208,71 @@ def _cell_is_yellow(cell) -> bool:
 
 
 
-def add_excel_color_flags_from_sharepoint(df: pd.DataFrame, sheet_name: str = "Feuil1") -> pd.DataFrame:
-    """
-    Télécharge le XLSX SharePoint et ajoute au DF 3 colonnes:
-      - IS_GROUPAGE (DATE+HEURE jaunes)
-      - IS_PARTAGE  (HEURE seule jaune)
-      - IS_ATTENTE  (CH contient '*')
-    Important: on ajoute ces colonnes AVANT filtrage/suppression de lignes,
-    pour garder l'alignement.
-    """
-    df = df.copy()
-
-    # sécurité index
-    df = df.reset_index(drop=True)
+def add_excel_color_flags_from_dropbox(
+    df: pd.DataFrame,
+    sheet_name: str = "Feuil1"
+) -> pd.DataFrame:
+    df = df.copy().reset_index(drop=True)
 
     try:
-        r = requests.get(SHAREPOINT_EXCEL_URL, timeout=30)
-        r.raise_for_status()
+        # 🔐 Télécharger le fichier Excel via l’API Dropbox (UNE seule source)
+        content = download_dropbox_excel_bytes()
+        if not content:
+            raise RuntimeError("Fichier Dropbox inaccessible")
 
-        wb = load_workbook(BytesIO(r.content), data_only=True)
+        wb = load_workbook(BytesIO(content), data_only=True)
         ws = wb[sheet_name]
 
-        # repère les colonnes par l'en-tête (ligne 1)
-        headers = [str(c.value).strip() if c.value is not None else "" for c in ws[1]]
-        def _idx(name: str):
+        headers = [str(c.value).strip() if c.value else "" for c in ws[1]]
+
+        def col_idx(name: str):
             name = name.strip().upper()
             for i, h in enumerate(headers):
-                if str(h).strip().upper() == name:
-                    return i + 1  # openpyxl = 1-based
+                if h.upper() == name:
+                    return i + 1
             return None
 
-        col_date = _idx("DATE")
-        col_heure = _idx("HEURE")
-        col_ch = _idx("CH")
+        col_date = col_idx("DATE")
+        col_heure = col_idx("HEURE")
 
-        # fallback si pas trouvé (à adapter si ton XLSX change)
-        if col_date is None or col_heure is None or col_ch is None:
-            # on n'ajoute que l'attente (étoile) via df
-            df["IS_GROUPAGE"] = 0
-            df["IS_PARTAGE"] = 0
-            df["IS_ATTENTE"] = df["CH"].astype(str).str.contains(r"\*", na=False).astype(int)
-            return df
+        is_groupage: list[int] = []
+        is_partage: list[int] = []
 
-        is_groupage = []
-        is_partage = []
-
-        # on parcourt les lignes Excel 2.. (car ligne 1 = header)
-        # et on s'aligne sur df reset_index (0..len-1)
         for excel_row in range(2, 2 + len(df)):
-            c_date = ws.cell(row=excel_row, column=col_date)
-            c_heure = ws.cell(row=excel_row, column=col_heure)
+            c_date = ws.cell(excel_row, col_date) if col_date else None
+            c_heure = ws.cell(excel_row, col_heure) if col_heure else None
 
-            date_y = _cell_is_yellow(c_date)
-            heure_y = _cell_is_yellow(c_heure)
+            date_y = _cell_is_yellow(c_date) if c_date else False
+            heure_y = _cell_is_yellow(c_heure) if c_heure else False
 
-            is_groupage.append(1 if (date_y and heure_y) else 0)
-            is_partage.append(1 if ((not date_y) and heure_y) else 0)
+            is_groupage.append(1 if date_y and heure_y else 0)
+            is_partage.append(1 if (not date_y) and heure_y else 0)
 
         df["IS_GROUPAGE"] = is_groupage
         df["IS_PARTAGE"] = is_partage
-        df["IS_ATTENTE"] = df["CH"].astype(str).str.contains(r"\*", na=False).astype(int)
+        df["IS_ATTENTE"] = (
+            df["CH"]
+            .astype(str)
+            .str.contains(r"\*", na=False)
+            .astype(int)
+        )
 
         return df
 
-    except Exception:
-        # si problème lecture couleurs, on ne casse pas la sync
+    except Exception as e:
+        # 🛡️ Fallback sûr (pas de crash)
         df["IS_GROUPAGE"] = 0
         df["IS_PARTAGE"] = 0
-        df["IS_ATTENTE"] = df.get("CH", "").astype(str).str.contains(r"\*", na=False).astype(int)
+        df["IS_ATTENTE"] = (
+            df["CH"]
+            .astype(str)
+            .str.contains(r"\*", na=False)
+            .astype(int)
+        )
+        st.error(f"❌ Couleurs Excel non lues : {e}")
         return df
+
+
 # ============================================================
 #   BADGES VISUELS NAVETTES
 # ============================================================
@@ -328,165 +323,89 @@ def auto_sync_planning_if_needed():
     finally:
         st.session_state.sync_running = False
 
+import os, json
+from io import BytesIO
+import pandas as pd
+import requests
+import streamlit as st
 
-# =========================
-# CONFIG SHAREPOINT – PLANNING
-# =========================
+DROPBOX_FILE_PATH = "/Goldenlines/Planning 2026.xlsx"
 
-SHAREPOINT_EXCEL_URL = (
-    "https://airportslines1-my.sharepoint.com/:x:/g/personal/"
-    "info_airports-lines_com/IQAmuZHAjt79SZQwL5wT6N4AAZ_Kml1cqlMab4p9iK36SkE"
-    "?download=1"
-)
-
-def load_planning_from_sharepoint() -> pd.DataFrame:
+def download_dropbox_excel_bytes() -> bytes | None:
     """
-    Télécharge Planning 2025.xlsx depuis SharePoint
-    et retourne un DataFrame pandas
+    Télécharge le fichier Excel depuis Dropbox via l’API officielle
+    et retourne le contenu brut (bytes).
     """
     try:
-        r = requests.get(SHAREPOINT_EXCEL_URL, timeout=30)
-        r.raise_for_status()
+        token = "sl.u.AGMlO2zjFYxx3t0yh1XhEi1tIwGt5K-xT7bxLCg1ilSLgkZ26zOUkZCWp6DqcRoomG6wQ553DCS3x8coAg3MYTv-IC3zhcPIKPZjzu7u39ClAAb2skUb5CjrHPYbciaQ-_Yjxd9o5wfhH0MDr7RQJckIwRvBXYtLf4E_yrkRsB2FBZaTL1Etv0Ruxq1GJPSFHafa4tY-S7pCVvCSMsO-FBNsYCwaZLoVfYDgzMuoAbGpL4iSb_1KbNt_-7gAra1vON_MySpNOeiVEMiz8NkSk3nQBixus7tjGBIV0LwEJDvGLKA-MTiYIb9QfPTqlRndO4TR5uA0aJ2jKTt9dNzJP2Pz7A-K4PC48JE4xKLT0KehKA6LzVtnNPNaWSuMl0fImaLJlnrg2FOei8FBGel_u6mwz2g-W9JZp14yOeq7d6MOcqwQao1YbdLypEQnjsR6S5IE9KW6OiJqkNQxwOHTxGJuENbtePHNDfsdZXIIzTDqI_y3Uj7aFR_rnKN77YhYP-669OOibgQOlXTEjYd1__tWhEh2Rt4sKnJfnnUM6g7n2fgHYfPZUujiEDB7pKebIE5eLOrYJ45oZxwpxKiIDkEdgEDZ7kVfsB_clZMqzAIUbK1FH3cxbKQO62WWi8MXRV3cinmJ1YLSgCat-5RaHBULYZI7545SzYig3C_ToG2oGfL0g-FCP84yfYpMWMF_HHv8LDYO8ncnd_0LNz2F1CasfmjilnN3z_O3zmA9ECJ73xIwJYJhnLTyrEoHTOL8Ldw3nlBqPmyd7VdSQQ6REnKoSp7xkOr2fWZY_a7SzYDY84_rvdk5RUcD_sZTTpEhFV9ENtVrTq2xVO96Pks64iGhSUsYCVjeQTHmH4B9Cj8aDaQ3AmInDBaypKSomtthDOQFtFgHEeDFHXBQMtjNZ9469xY51MEgWAOlxNsBYeryblIpIvolEZIFunOi4VQweaiKtFnDh-YiSNCjdLO9IlFgyBN4E7WIZS9uRu3ZEPIQmj7zuX8jZR1Nh29D6MyEBfR65-deshTGPzvj6awRjSLOUf1AyTo3TJm9A-BfDTSsCEHu25beCIk-lzHfKpPo-C8sNuIsFv_oUKCOas3GyX-6RzxykQiDtXB7DS7eY0q5PWbK6RB8KgJfa_sVjCPAZDNDAbq0V9pnjSyo6tzvsGmzQYUgbFVd1bvhpm_pDbgybiXMwSbLpiXuUqafaitTyPbd5wpZfrFke8fArqX0Wdc79gzlvzTh5w4eWJw2J4haDvwSRtFOJ2D91ialF8v_FgksAcU7a8HhoP_4RyHZHlyM"
 
-        bio = BytesIO(r.content)
-        df = pd.read_excel(bio, engine="openpyxl")
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Dropbox-API-Arg": '{"path": "/Goldenlines/Planning 2026.xlsx"}',
+            "Content-Type": "application/octet-stream",
+        }
 
-        return df.fillna("")
+        r = requests.post(
+            "https://content.dropboxapi.com/2/files/download",
+            headers=headers,
+            data=b"",   # ⚠️ OBLIGATOIRE
+            timeout=30,
+        )
+
+        if r.status_code != 200:
+            st.error(f"Dropbox HTTP {r.status_code} : {r.text}")
+            return None
+
+        return r.content
 
     except Exception as e:
-        st.error(f"❌ Erreur lecture SharePoint : {e}")
+        st.error(f"❌ Erreur téléchargement Dropbox : {e}")
+        return None
+def load_planning_from_dropbox(sheet_name: str | None = None) -> pd.DataFrame:
+    content = download_dropbox_excel_bytes()
+    if not content:
         return pd.DataFrame()
 
-def load_sheet_from_sharepoint(sheet_name: str) -> pd.DataFrame:
-    """
-    Télécharge le fichier Excel SharePoint et lit une feuille précise.
-    """
     try:
-        r = requests.get(SHAREPOINT_EXCEL_URL, timeout=30)
-        r.raise_for_status()
-        bio = BytesIO(r.content)
+        bio = BytesIO(content)
         df = pd.read_excel(bio, sheet_name=sheet_name, engine="openpyxl")
         return df.fillna("")
     except Exception as e:
-        st.error(f"❌ Erreur lecture SharePoint ({sheet_name}) : {e}")
+        st.error(f"❌ Erreur lecture Excel : {e}")
         return pd.DataFrame()
 
-def onedrive_to_ftp_and_rebuild_db():
-    from datetime import date
-    import subprocess
-    import sys
-    import pandas as pd
-    from database import get_connection
 
-    # ==========================
-    # 1️⃣ OneDrive → FTP
-    # ==========================
-    ok = upload_planning_onedrive_to_ftp()
-    if not ok:
-        st.error("❌ Échec copie OneDrive → FTP")
-        return
-
-    st.info("✅ Fichier OneDrive copié sur le FTP")
-
-    # ==========================
-    # 2️⃣ Recréer la DB depuis le FTP
-    # ==========================
+def get_dropbox_file_last_modified() -> datetime | None:
     try:
-        subprocess.run(
-            [sys.executable, "create_database_from_excel.py"],
-            check=True
+        token = os.environ.get("DROPBOX_TOKEN")
+        if not token:
+            return None
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+
+        data = {
+            "path": "/Goldenlines/Planning 2026.xlsx"
+        }
+
+        r = requests.post(
+            "https://api.dropboxapi.com/2/files/get_metadata",
+            headers=headers,
+            json=data,
+            timeout=20,
         )
-    except Exception as e:
-        st.error(f"❌ Erreur recréation DB : {e}")
-        return
+        r.raise_for_status()
 
-    st.info("✅ Base de données recréée")
+        info = r.json()
+        return datetime.fromisoformat(
+            info["server_modified"].replace("Z", "+00:00")
+        )
 
-    # ==========================
-    # 3️⃣ Vérifier que planning existe
-    # ==========================
-    with get_connection() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT name
-            FROM sqlite_master
-            WHERE type='table' AND name='planning'
-        """)
-        if cur.fetchone() is None:
-            st.error("❌ Table planning introuvable après recréation")
-            return
+    except Exception:
+        return None
 
-    # ==========================
-    # 4️⃣ Charger le planning
-    # ==========================
-    with get_connection() as conn:
-        df = pd.read_sql_query("SELECT * FROM planning", conn)
-
-    if df.empty:
-        st.warning("⚠️ Planning vide après import")
-        return
-
-    # ==========================
-    # 5️⃣ Filtrer à partir d’aujourd’hui
-    # ==========================
-    today = date.today()
-
-    if "DATE" not in df.columns:
-        st.error("❌ Colonne DATE absente dans planning")
-        return
-
-    df["DATE_TMP"] = pd.to_datetime(
-        df["DATE"], dayfirst=True, errors="coerce"
-    ).dt.date
-
-    df = df[
-        df["DATE_TMP"].notna() &
-        (df["DATE_TMP"] >= today)
-    ].copy()
-
-    df.drop(columns=["DATE_TMP"], inplace=True)
-
-    # ==========================
-    # 6️⃣ Réécriture propre de la table planning
-    # ==========================
-    with get_connection() as conn:
-        cur = conn.cursor()
-
-        cur.execute('DROP TABLE IF EXISTS "planning"')
-
-        cols = [c for c in df.columns if c != "id"]
-
-        # ✅ Colonnes protégées (espaces, :, /, unicode, etc.)
-        cols_sql = ", ".join(f'"{c}" TEXT' for c in cols)
-        cols_sql_names = ", ".join(f'"{c}"' for c in cols)
-
-        cur.execute(f"""
-            CREATE TABLE "planning" (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                {cols_sql}
-            )
-        """)
-
-        placeholders = ", ".join("?" for _ in cols)
-
-        # ✅ IMPORTANT : noms de colonnes entre guillemets
-        insert_sql = f"""
-            INSERT INTO "planning" ({cols_sql_names})
-            VALUES ({placeholders})
-        """
-
-        for _, row in df.iterrows():
-            cur.execute(
-                insert_sql,
-                [str(row[c]) if row[c] is not None else "" for c in cols]
-            )
-
-        conn.commit()
-
-    st.success("🎉 DB mise à jour (à partir d’aujourd’hui)")
-    st.cache_data.clear()
-    st.toast("🔄 Données rechargées", icon="✅")
-    return
 # ============================================================
 #   DB — COLONNES FLAGS COULEURS (AUTO)
 # ============================================================
@@ -793,296 +712,6 @@ def is_navette_confirmed(row):
     """
     return bool(row.get("ACK_AT"))
 
-
-def rebuild_db_from_ftp(status):
-    """
-    Sauvegarde la DB actuelle, la supprime,
-    puis recrée une DB neuve depuis le FTP
-    """
-    import os
-    import subprocess
-    import sys
-    from datetime import datetime
-    import shutil
-
-    DB_PATH = "airportslines.db"
-    BACKUP_DIR = "db_backups"
-
-    # 1) Dossier backup
-    status.update(label="💾 Préparation des sauvegardes…")
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-
-    # 2) Sauvegarde DB existante
-    if os.path.exists(DB_PATH):
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = os.path.join(BACKUP_DIR, f"airportslines_{ts}.db")
-        shutil.copy2(DB_PATH, backup_path)
-        status.write(f"✅ Base sauvegardée : {backup_path}")
-
-        os.remove(DB_PATH)
-        status.write("🧹 Ancienne base supprimée")
-    else:
-        status.write("ℹ️ Aucune base existante à sauvegarder")
-
-    # 3) Recréation DB
-    status.update(label="📦 Création de la nouvelle base de données…")
-    subprocess.run(
-        [sys.executable, "create_database_from_excel.py"],
-        check=True
-    )
-    status.write("✅ Nouvelle base créée depuis le FTP")
-
-    # 4) Index SQL
-    status.update(label="⚡ Optimisation de la base (index SQL)…")
-    from database import ensure_indexes
-    ensure_indexes()
-    status.write("✅ Index SQL créés")
-
-    status.update(label="🎉 Reconstruction terminée", state="complete")
-
-def sync_planning_from_sharepoint():
-
-    # ==========================================================
-    # 1) VERROU ANTI-BOUCLE STREAMLIT
-    # ==========================================================
-    if st.session_state.get("sync_running"):
-        st.warning("⏳ Synchronisation déjà en cours")
-        return
-
-    st.session_state["sync_running"] = True
-
-    try:
-        # ======================================================
-        # 2) Charger Feuil1 (planning) depuis SharePoint
-        # ======================================================
-        df_excel = load_sheet_from_sharepoint("Feuil1")
-        if df_excel.empty:
-            st.warning("Le planning SharePoint (Feuil1) est vide.")
-            return
-        # ✅ Ajout flags couleurs (groupage/partage) + étoile (attente)
-        df_excel = add_excel_color_flags_from_sharepoint(df_excel, sheet_name="Feuil1")
-
-        # ======================================================
-        # 3) Normalisation DATE → DATE_ISO (YYYY-MM-DD)
-        # ======================================================
-        df_excel["DATE_ISO"] = pd.to_datetime(
-            df_excel["DATE"],
-            dayfirst=True,
-            errors="coerce"
-        ).dt.strftime("%Y-%m-%d")
-
-        df_excel = df_excel[df_excel["DATE_ISO"].notna()].copy()
-        if df_excel.empty:
-            st.warning("Aucune date valide trouvée dans Feuil1.")
-            return
-
-        # ======================================================
-        # 4) Colonnes obligatoires
-        # ======================================================
-        for col in ("DATE", "HEURE", "CH"):
-            if col not in df_excel.columns:
-                st.error(f"Colonne manquante dans Feuil1 : {col}")
-                return
-
-        # ======================================================
-        # 5) Créer table planning si absente
-        # ======================================================
-        with get_connection() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS planning (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT
-                )
-            """)
-            conn.commit()
-        ensure_planning_color_columns()
-        # ======================================================
-        # 6) S’assurer que toutes les colonnes existent
-        # ======================================================
-        with get_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("PRAGMA table_info(planning)")
-            existing_cols = {row[1] for row in cur.fetchall()}
-
-        for col in df_excel.columns:
-            if col != "id" and col not in existing_cols:
-                with get_connection() as conn:
-                    conn.execute(f'ALTER TABLE planning ADD COLUMN "{col}" TEXT')
-                    conn.commit()
-                existing_cols.add(col)
-
-        if "DATE_ISO" not in existing_cols:
-            with get_connection() as conn:
-                conn.execute('ALTER TABLE planning ADD COLUMN "DATE_ISO" TEXT')
-                conn.commit()
-
-        # ======================================================
-        # 7) IMPORT INTELLIGENT
-        #    - 1ʳᵉ fois : import complet
-        #    - ensuite : mise à jour par clé (DATE + HEURE + CH)
-        # ======================================================
-        ensure_meta_table()
-        first_import_done = get_meta("full_import_done") == "1"
-
-        inserts = 0
-        updates = 0
-
-        for _, row in df_excel.iterrows():
-
-            # Normalisation HEURE → "HH:MM:SS" ou None
-            heure_norm = normalize_time_string(row.get("HEURE"))
-
-            # 🔑 clé métier
-            key_date = sqlite_safe(row["DATE"])
-            key_ch = row["CH"]
-
-            # Supprimer uniquement la ligne concernée (clé métier)
-            with get_connection() as conn:
-                if heure_norm is None:
-                    conn.execute(
-                        """
-                        DELETE FROM planning
-                        WHERE DATE = ? AND HEURE IS NULL AND CH = ?
-                        """,
-                        (key_date, key_ch),
-                    )
-                else:
-                    conn.execute(
-                        """
-                        DELETE FROM planning
-                        WHERE DATE = ? AND HEURE = ? AND CH = ?
-                        """,
-                        (key_date, heure_norm, key_ch),
-                    )
-                conn.commit()
-
-            # Préparer les données à insérer
-            data = {
-                col: sqlite_safe(row[col])
-                for col in df_excel.columns
-                if col != "id"
-            }
-
-            data["HEURE"] = heure_norm
-            data["DATE_ISO"] = row["DATE_ISO"]
-
-            insert_planning_row(data)
-            inserts += 1
-
-        if not first_import_done:
-            set_meta("full_import_done", "1")
-        # ======================================================
-        # PATCH HEURE — correction incrémentale (sans reset DB)
-        # ======================================================
-        with get_connection() as conn:
-            conn.execute("""
-                UPDATE planning
-                SET HEURE = NULL
-                WHERE HEURE IN ('', '0', '00:00:0', '0:00:00')
-            """)
-            conn.commit()
-
-        # ======================================================
-        # 8) VUES dérivées (rapides, sans duplication DB)
-        # ======================================================
-        with get_connection() as conn:
-            cur = conn.cursor()
-
-            cur.execute("DROP VIEW IF EXISTS planning_day")
-            cur.execute("DROP VIEW IF EXISTS planning_7j")
-            cur.execute("DROP VIEW IF EXISTS planning_full")
-
-            cur.execute("""
-                CREATE VIEW planning_full AS
-                SELECT * FROM planning
-            """)
-
-            cur.execute("""
-                CREATE VIEW planning_7j AS
-                SELECT *
-                FROM planning
-                WHERE DATE_ISO BETWEEN date('now') AND date('now','+6 day')
-            """)
-
-            cur.execute("""
-                CREATE VIEW planning_day AS
-                SELECT *
-                FROM planning
-                WHERE DATE_ISO = date('now')
-            """)
-
-            conn.commit()
-
-        # ======================================================
-        # 9) Import Feuil2 → table chauffeurs
-        # ======================================================
-        df_ch = load_sheet_from_sharepoint("Feuil2")
-        if not df_ch.empty:
-            with get_connection() as conn:
-                conn.execute('DROP TABLE IF EXISTS chauffeurs')
-                conn.commit()
-
-            cols = [c for c in df_ch.columns if c]
-            cols_sql = ",".join(f'"{c}"' for c in cols)
-            col_defs = ", ".join(f'"{c}" TEXT' for c in cols)
-
-            with get_connection() as conn:
-                conn.execute(f'CREATE TABLE chauffeurs ({col_defs})')
-                conn.commit()
-
-            placeholders = ",".join("?" for _ in cols)
-
-            for _, r in df_ch.iterrows():
-                values = [sqlite_safe(r.get(c)) for c in cols]
-                with get_connection() as conn:
-                    conn.execute(
-                        f'INSERT INTO chauffeurs ({cols_sql}) VALUES ({placeholders})',
-                        values,
-                    )
-                    conn.commit()
-
-        # ======================================================
-        # 10) Import Feuil3 → table feuil3
-        # ======================================================
-        df_f3 = load_sheet_from_sharepoint("Feuil3")
-        if not df_f3.empty:
-            with get_connection() as conn:
-                conn.execute("DROP TABLE IF EXISTS feuil3")
-                conn.commit()
-
-            cols3 = [c for c in df_f3.columns if c]
-            cols_sql3 = ",".join(f'"{c}"' for c in cols3)
-            col_defs3 = ", ".join(f'"{c}" TEXT' for c in cols3)
-
-            with get_connection() as conn:
-                conn.execute(f'CREATE TABLE feuil3 ({col_defs3})')
-                conn.commit()
-
-            placeholders3 = ",".join("?" for _ in cols3)
-
-            for _, r in df_f3.iterrows():
-                values = [sqlite_safe(r.get(c)) for c in cols3]
-                with get_connection() as conn:
-                    conn.execute(
-                        f'INSERT INTO feuil3 ({cols_sql3}) VALUES ({placeholders3})',
-                        values,
-                    )
-                    conn.commit()
-        
-        rebuild_planning_views()
-
-        st.success(
-            f"SharePoint → DB terminé ✅ "
-            f"{inserts} ligne(s) synchronisée(s) | "
-            f"Historique conservé"
-        )
-
-    except Exception as e:
-        st.exception(e)
-        st.stop()
-
-    finally:
-        st.session_state["sync_running"] = False
-
 def rebuild_planning_views():
     """
     🔁 Recrée toutes les vues SQL planning
@@ -1118,31 +747,35 @@ def rebuild_planning_views():
 
 
 def sync_planning_from_today():
+    from datetime import datetime
+
     today_iso = date.today().strftime("%Y-%m-%d")
 
-    df_excel = load_sheet_from_sharepoint("Feuil1")
+    # 1️⃣ Charger Excel Dropbox (Feuil1)
+    df_excel = load_planning_from_dropbox("Feuil1")
     if df_excel.empty:
-        st.warning("Planning Excel vide.")
-        return
+        st.warning("Planning Dropbox vide.")
+        return 0
+
+    # 2️⃣ Flags couleurs Excel
+    df_excel = add_excel_color_flags_from_dropbox(df_excel, "Feuil1")
     ensure_planning_color_columns()
-    df_excel = add_excel_color_flags_from_sharepoint(df_excel, sheet_name="Feuil1")
 
-
-    # Normalisation DATE
+    # 3️⃣ Normalisation DATE
     df_excel["DATE_ISO"] = pd.to_datetime(
         df_excel["DATE"],
         dayfirst=True,
-        errors="coerce"
+        errors="coerce",
     ).dt.strftime("%Y-%m-%d")
 
-    # 🔥 garder uniquement aujourd’hui et le futur
+    # 🔥 garder uniquement aujourd’hui + futur
     df_excel = df_excel[df_excel["DATE_ISO"] >= today_iso].copy()
 
     if df_excel.empty:
         st.info("Aucune donnée à synchroniser.")
-        return
+        return 0
 
-    # 🔥 suppression ciblée (rapide, sans doublon)
+    # 4️⃣ Suppression DB ciblée
     with get_connection() as conn:
         conn.execute(
             "DELETE FROM planning WHERE DATE_ISO >= ?",
@@ -1150,6 +783,7 @@ def sync_planning_from_today():
         )
         conn.commit()
 
+    # 5️⃣ Réinsertion propre (Feuil1)
     inserts = 0
 
     for _, row in df_excel.iterrows():
@@ -1167,7 +801,77 @@ def sync_planning_from_today():
         insert_planning_row(data)
         inserts += 1
 
-    st.success(f"✅ {inserts} lignes synchronisées (à partir d’aujourd’hui)")
+    # 6️⃣ Recréer les vues SQL
+    rebuild_planning_views()
+
+    # ======================================================
+    # 7️⃣ Import Feuil2 → table chauffeurs
+    # ======================================================
+    df_ch = load_planning_from_dropbox("Feuil2")
+    if not df_ch.empty:
+        with get_connection() as conn:
+            conn.execute("DROP TABLE IF EXISTS chauffeurs")
+            conn.commit()
+
+        cols = [c for c in df_ch.columns if c]
+        col_defs = ", ".join(f'"{c}" TEXT' for c in cols)
+        cols_sql = ",".join(f'"{c}"' for c in cols)
+        placeholders = ",".join("?" for _ in cols)
+
+        with get_connection() as conn:
+            conn.execute(f'CREATE TABLE chauffeurs ({col_defs})')
+            conn.commit()
+
+        for _, r in df_ch.iterrows():
+            values = [sqlite_safe(r.get(c)) for c in cols]
+            with get_connection() as conn:
+                conn.execute(
+                    f'INSERT INTO chauffeurs ({cols_sql}) VALUES ({placeholders})',
+                    values,
+                )
+                conn.commit()
+
+    # ======================================================
+    # 8️⃣ Import Feuil3 → table feuil3
+    # ======================================================
+    df_f3 = load_planning_from_dropbox("Feuil3")
+    if not df_f3.empty:
+        with get_connection() as conn:
+            conn.execute("DROP TABLE IF EXISTS feuil3")
+            conn.commit()
+
+        cols3 = [c for c in df_f3.columns if c]
+        col_defs3 = ", ".join(f'"{c}" TEXT' for c in cols3)
+        cols_sql3 = ",".join(f'"{c}"' for c in cols3)
+        placeholders3 = ",".join("?" for _ in cols3)
+
+        with get_connection() as conn:
+            conn.execute(f'CREATE TABLE feuil3 ({col_defs3})')
+            conn.commit()
+
+        for _, r in df_f3.iterrows():
+            values = [sqlite_safe(r.get(c)) for c in cols3]
+            with get_connection() as conn:
+                conn.execute(
+                    f'INSERT INTO feuil3 ({cols_sql3}) VALUES ({placeholders3})',
+                    values,
+                )
+                conn.commit()
+
+    # ======================================================
+    # 9️⃣ Mémoriser heure de dernière synchro (UI)
+    # ======================================================
+    st.session_state["last_sync_time"] = datetime.now().strftime("%H:%M")
+
+    # ======================================================
+    # 🔥 Rafraîchir toutes les vues Streamlit
+    # ======================================================
+    st.cache_data.clear()
+    st.rerun()
+
+    return inserts
+
+
 
 
 from database import make_row_key_from_row, get_latest_ch_overrides_map
@@ -3642,6 +3346,24 @@ def build_chauffeur_day_message(df_ch: pd.DataFrame, ch_selected: str, day_label
 # ============================================================
 
 def render_tab_vue_chauffeur(forced_ch=None):
+    from streamlit_autorefresh import st_autorefresh
+
+    # 🔁 Rafraîchissement automatique (relance la vue)
+    AUTO_REFRESH_MINUTES = 5
+    st_autorefresh(
+        interval=AUTO_REFRESH_MINUTES * 60 * 1000,
+        key="auto_refresh_vue_chauffeur",
+    )
+
+    # 🔍 Auto-sync si le fichier Dropbox a changé
+    last_dbx_mtime = get_dropbox_file_last_modified()
+    last_known = st.session_state.get("last_dropbox_mtime")
+
+    if last_dbx_mtime and last_dbx_mtime != last_known:
+        with st.spinner("🔁 Planning mis à jour — actualisation automatique…"):
+            sync_planning_from_today()
+        st.session_state["last_dropbox_mtime"] = last_dbx_mtime
+
     st.subheader("🚖 Vue Chauffeur (texte compact)")
 
     chs = get_chauffeurs_for_ui()
@@ -4118,10 +3840,13 @@ def render_tab_vue_chauffeur(forced_ch=None):
     # =======================================================
     if df_ch is None or df_ch.empty:
         st.info("Aucune navette pour cette période.")
+
     else:
         st.markdown("---")
         st.markdown("### 📋 Détail des navettes (texte compact)")
-        st.caption("Les lignes marquées 🆕 sont celles modifiées depuis ta dernière confirmation.")
+        st.caption(
+            "Les lignes marquées 🆕 sont celles modifiées depuis ta dernière confirmation."
+        )
 
         cols = df_ch.columns.tolist()
 
@@ -4133,9 +3858,9 @@ def render_tab_vue_chauffeur(forced_ch=None):
             is_new = bool(row.get("IS_NEW", False))
             heure_txt = normalize_time_string(row.get("HEURE", "")) or "??:??"
 
-            # ------------------
+            # ===================================================
             # Groupage / Partage / Attente
-            # ------------------
+            # ===================================================
             is_groupage = int(row.get("IS_GROUPAGE", 0)) == 1
             is_partage = int(row.get("IS_PARTAGE", 0)) == 1
             is_attente = int(row.get("IS_ATTENTE", 0)) == 1
@@ -4145,35 +3870,45 @@ def render_tab_vue_chauffeur(forced_ch=None):
                 prefix = "🟡 [GROUPÉE] "
             elif is_partage:
                 prefix = "🟡 [PARTAGÉE] "
+
             if is_attente:
                 prefix += "⭐ "
 
-            # ------------------
+            # ===================================================
             # Date
-            # ------------------
+            # ===================================================
             date_val = row.get("DATE", "")
             if isinstance(date_val, (datetime, date)):
                 date_txt = date_val.strftime("%d/%m/%Y")
             else:
                 dtmp = pd.to_datetime(date_val, dayfirst=True, errors="coerce")
-                date_txt = dtmp.strftime("%d/%m/%Y") if not pd.isna(dtmp) else ""
+                date_txt = (
+                    dtmp.strftime("%d/%m/%Y")
+                    if not pd.isna(dtmp)
+                    else ""
+                )
 
-            # ------------------
+            # ===================================================
             # Indisponibilité
-            # ------------------
+            # ===================================================
             if is_indispo_row(row, cols):
-                end_indispo = normalize_time_string(row.get("²²²²", "")) or "??:??"
+                end_indispo = (
+                    normalize_time_string(row.get("²²²²", ""))
+                    or "??:??"
+                )
                 bloc_lines.append(
                     f"📆 {date_txt} | ⏱ {heure_txt} → {end_indispo} | 🚫 Indisponible"
                 )
-                bloc_lines.append(f"👨‍✈️ {row.get('CH', ch_selected)}")
+                bloc_lines.append(
+                    f"👨‍✈️ {row.get('CH', ch_selected)}"
+                )
                 st.markdown("\n".join(bloc_lines))
                 st.markdown("---")
                 continue
 
-            # ------------------
+            # ===================================================
             # HEADER
-            # ------------------
+            # ===================================================
             header = ""
             if is_new:
                 header += "🆕 "
@@ -4182,7 +3917,9 @@ def render_tab_vue_chauffeur(forced_ch=None):
             bloc_lines.append(header)
 
             # Chauffeur
-            bloc_lines.append(f"👨‍✈️ {row.get('CH', ch_selected)}")
+            bloc_lines.append(
+                f"👨‍✈️ {row.get('CH', ch_selected)}"
+            )
 
             # Destination
             route_text = ""
@@ -4190,6 +3927,7 @@ def render_tab_vue_chauffeur(forced_ch=None):
                 if cand in cols and row.get(cand):
                     route_text = str(row.get(cand)).strip()
                     break
+
             route_text = resolve_client_alias(route_text)
             if route_text:
                 bloc_lines.append(f"➡ {route_text}")
@@ -4199,15 +3937,23 @@ def render_tab_vue_chauffeur(forced_ch=None):
             if nom:
                 bloc_lines.append(f"🧑 {nom}")
 
-            # ------------------
+            # ===================================================
             # Véhicule
-            # ------------------
+            # ===================================================
             if row.get("IMMAT"):
-                bloc_lines.append(f"🚘 Plaque : {row.get('IMMAT')}")
+                bloc_lines.append(
+                    f"🚘 Plaque : {row.get('IMMAT')}"
+                )
+
             if extract_positive_int(row.get("SIEGE", "SIÈGE")):
-                bloc_lines.append(f"🪑 Siège enfant : {row.get('SIEGE')}")
+                bloc_lines.append(
+                    f"🪑 Siège enfant : {row.get('SIEGE')}"
+                )
+
             if extract_positive_int(row.get("REH")):
-                bloc_lines.append(f"♿ REH : {row.get('REH')}")
+                bloc_lines.append(
+                    f"♿ REH : {row.get('REH')}"
+                )
 
             # Adresse
             adr_full = build_full_address_from_row(row)
@@ -4218,43 +3964,66 @@ def render_tab_vue_chauffeur(forced_ch=None):
             client_phone = get_client_phone_from_row(row)
             if client_phone:
                 tel_clean = clean_phone(client_phone)
-                bloc_lines.append(f"📞 Client : [{client_phone}](tel:{tel_clean})")
+                bloc_lines.append(
+                    f"📞 Client : [{client_phone}](tel:{tel_clean})"
+                )
 
-            # Paiement / PAX
+            # ===================================================
+            # Paiement / PAX (ULTRA LISIBLE)
+            # ===================================================
             pay_lines = []
+
             if row.get("PAX"):
                 pay_lines.append(f"👥 {row.get('PAX')} pax")
 
             paiement = str(row.get("PAIEMENT", "") or "").lower()
             caisse = row.get("Caisse")
+
             if paiement == "facture":
-                pay_lines.append("🧾 Facture")
-            elif paiement in ("caisse", "bancontact"):
-                pay_lines.append(f"💶 {caisse} € ({paiement})" if caisse else f"💶 {paiement}")
+                pay_lines.append("🧾 **FACTURE**")
+
+            elif paiement == "caisse" and caisse:
+                pay_lines.append(
+                    "<span style='color:#d32f2f;font-weight:800;'>"
+                    f"💶 {caisse} € (CASH)"
+                    "</span>"
+                )
+
+            elif paiement == "bancontact" and caisse:
+                pay_lines.append(
+                    "<span style='color:#1976d2;font-weight:800;'>"
+                    f"💳 {caisse} € (BANCONTACT)"
+                    "</span>"
+                )
 
             if pay_lines:
                 bloc_lines.append(" | ".join(pay_lines))
 
-            # ------------------
-            # GO + CONFIRMATION
-            # ------------------
+            # ===================================================
+            # GO (sans libellé)
+            # ===================================================
             go_val = str(row.get("GO", "") or "").strip()
             if go_val:
-                bloc_lines.append(f"🟢 GO : {go_val}")
+                bloc_lines.append(f"🟢 {go_val}")
 
-            if is_navette_confirmed(row, nav_id):
+            # Confirmation
+            if is_navette_confirmed(row):
                 bloc_lines.append("✅ **Navette confirmée**")
 
-            # ------------------
-            # ACTIONS
-            # ------------------
+            # ===================================================
+            # Actions
+            # ===================================================
             actions = []
+
             if client_phone:
-                actions.append(f"[📞 Appeler client](tel:{tel_clean})")
+                actions.append(
+                    f"[📞 Appeler client](tel:{tel_clean})"
+                )
 
             if adr_full:
                 waze = build_waze_link(adr_full)
                 gmaps = build_google_maps_link(adr_full)
+
                 if waze != "#":
                     actions.append(f"[🧭 Waze]({waze})")
                 if gmaps != "#":
@@ -4263,7 +4032,9 @@ def render_tab_vue_chauffeur(forced_ch=None):
             if client_phone and tel_ch:
                 wa = build_whatsapp_link(
                     client_phone,
-                    build_client_sms_from_driver(row, ch_selected, tel_ch),
+                    build_client_sms_from_driver(
+                        row, ch_selected, tel_ch
+                    ),
                 )
                 actions.append(f"[💬 WhatsApp client]({wa})")
 
@@ -4275,14 +4046,17 @@ def render_tab_vue_chauffeur(forced_ch=None):
             if vol:
                 bloc_lines.append(f"✈️ Vol {vol}")
 
-            # ------------------
+            # ===================================================
             # AFFICHAGE FINAL
-            # ------------------
-            st.markdown("\n".join(bloc_lines))
+            # ===================================================
+            st.markdown(
+                "<br>".join(bloc_lines),
+                unsafe_allow_html=True,
+            )
 
-            # ------------------
-            # SAISIE CHAUFFEUR
-            # ------------------
+            # ===================================================
+            # Saisie chauffeur
+            # ===================================================
             trajet_key = f"trajet_nav_{nav_id}"
             prob_key = f"prob_nav_{nav_id}"
 
@@ -4298,19 +4072,26 @@ def render_tab_vue_chauffeur(forced_ch=None):
                 st.text_area(
                     "Décris le problème pour cette navette",
                     key=prob_key,
-                    placeholder="Ex : heure impossible, adresse incorrecte, client injoignable…",
+                    placeholder=(
+                        "Ex : heure impossible, adresse incorrecte, "
+                        "client injoignable…"
+                    ),
                 )
+
         st.markdown("---")
         st.markdown("### 📄 Mon planning")
 
         if st.button("📄 Télécharger mon planning en PDF"):
-            pdf_buffer = export_chauffeur_planning_pdf(df_ch, ch_selected)
+            pdf_buffer = export_chauffeur_planning_pdf(
+                df_ch, ch_selected
+            )
             st.download_button(
                 label="⬇️ Télécharger le PDF",
                 data=pdf_buffer,
                 file_name=f"planning_{ch_selected}.pdf",
                 mime="application/pdf",
             )
+
 
 
 def export_chauffeur_planning_pdf(df_ch: pd.DataFrame, ch: str):
@@ -4523,14 +4304,50 @@ def render_tab_chauffeur_driver():
 
     today = date.today()
 
+    # ===================================================
+    # 📅 CHOIX DE LA PÉRIODE (CHAUFFEUR)
+    # ===================================================
+    scope = st.radio(
+        "📅 Quelles navettes veux-tu voir ?",
+        [
+            "📍 Aujourd’hui",
+            "➡️ À partir de demain",
+            "📆 Tout mon planning",
+        ],
+        index=0,
+        horizontal=True,
+        key="vue_chauffeur_scope",
+    )
+
+    if scope == "📍 Aujourd’hui":
+        from_date = today
+        to_date = today
+        mode_all = False
+        scope_label = "du jour"
+
+    elif scope == "➡️ À partir de demain":
+        from_date = today + timedelta(days=1)
+        to_date = None
+        mode_all = False
+        scope_label = "à partir de demain"
+
+    else:  # 📆 Tout
+        from_date = None
+        to_date = None
+        mode_all = False   # ⚠️ chauffeur = uniquement SES navettes
+        scope_label = "complet"
+
+    # ===================================================
+    # 🔄 CHARGEMENT DU PLANNING
+    # ===================================================
     df_ch = get_chauffeur_planning(
         ch_selected,
-        from_date=today,
-        to_date=today + timedelta(days=6),
+        from_date=from_date,
+        to_date=to_date,
     )
 
     if df_ch is None or df_ch.empty:
-        st.info("Aucune navette.")
+        st.info(f"Aucune navette {scope_label}.")
         return
 
     df_ch = _sort_df_by_date_heure(df_ch)
@@ -4555,8 +4372,30 @@ def render_tab_chauffeur_driver():
     # 🚖 NAVETTES
     # ===================================================
     for _, row in df_ch.iterrows():
+
         nav_id = row.get("id")
         bloc = []
+
+        # ------------------
+        # Flags groupage / partage / attente
+        # ------------------
+        is_groupage = int(row.get("IS_GROUPAGE", 0) or 0) == 1
+        is_partage = int(row.get("IS_PARTAGE", 0) or 0) == 1
+        is_attente = int(row.get("IS_ATTENTE", 0) or 0) == 1
+
+        prefix = ""
+        if is_groupage:
+            prefix += "🟡 [GROUPÉE] "
+        elif is_partage:
+            prefix += "🟡 [PARTAGÉE] "
+        if is_attente:
+            prefix += "⭐ "
+
+        # ------------------
+        # Chauffeur
+        # ------------------
+        ch_code = str(row.get("CH", "") or ch_selected).strip()
+        bloc.append(f"👨‍✈️ **{ch_code}**")
 
         # ------------------
         # Confirmation
@@ -4573,21 +4412,19 @@ def render_tab_chauffeur_driver():
         if isinstance(dv, date):
             date_txt = dv.strftime("%d/%m/%Y")
         else:
-            try:
-                dtmp = pd.to_datetime(dv, dayfirst=True, errors="coerce")
-                date_txt = dtmp.strftime("%d/%m/%Y") if not pd.isna(dtmp) else ""
-            except Exception:
-                date_txt = ""
+            dtmp = pd.to_datetime(dv, dayfirst=True, errors="coerce")
+            date_txt = dtmp.strftime("%d/%m/%Y") if not pd.isna(dtmp) else ""
 
         heure_txt = normalize_time_string(row.get("HEURE")) or "??:??"
-        bloc.append(f"📆 {date_txt} | ⏱ {heure_txt}")
+        bloc.append(f"{prefix}📆 {date_txt} | ⏱ {heure_txt}")
 
         # ------------------
         # Sens / Destination
         # ------------------
         sens_txt = format_sens_ar(row.get("Unnamed: 8"))
         dest = resolve_client_alias(str(row.get("DESIGNATION", "") or "").strip())
-        bloc.append(f"➡ {sens_txt} ({dest})")
+        if sens_txt or dest:
+            bloc.append(f"➡ {sens_txt} ({dest})".strip())
 
         # ------------------
         # Client
@@ -4597,14 +4434,14 @@ def render_tab_chauffeur_driver():
             bloc.append(f"🧑 {nom}")
 
         # ------------------
-        # 👥 PAX (VISIBLE)
+        # 👥 PAX
         # ------------------
         pax = row.get("PAX")
         if pax not in ("", None, 0, "0"):
             try:
-                pax_int = int(pax)
-                if pax_int > 0:
-                    bloc.append(f"👥 **{pax_int} pax**")
+                pax_i = int(pax)
+                if pax_i > 0:
+                    bloc.append(f"👥 **{pax_i} pax**")
             except Exception:
                 bloc.append(f"👥 **{pax} pax**")
 
@@ -4614,7 +4451,7 @@ def render_tab_chauffeur_driver():
         if row.get("IMMAT"):
             bloc.append(f"🚘 Plaque : {row.get('IMMAT')}")
 
-        siege_n = extract_positive_int(row.get("SIEGE", "SIÈGE"))
+        siege_n = extract_positive_int(row.get("SIEGE", row.get("SIÈGE")))
         if siege_n:
             bloc.append(f"🪑 Siège enfant : {siege_n}")
 
@@ -4623,15 +4460,12 @@ def render_tab_chauffeur_driver():
             bloc.append(f"♿ REH : {reh_n}")
 
         # ------------------
-        # Adresse
+        # Adresse / Tel
         # ------------------
         adr = build_full_address_from_row(row)
         if adr:
             bloc.append(f"📍 {adr}")
 
-        # ------------------
-        # Téléphone
-        # ------------------
         tel = get_client_phone_from_row(row)
         if tel:
             bloc.append(f"📞 {tel}")
@@ -4639,19 +4473,21 @@ def render_tab_chauffeur_driver():
         # ------------------
         # Paiement
         # ------------------
-        pay_lines = []
-        paiement = str(row.get("PAIEMENT", "") or "").lower()
+        paiement = str(row.get("PAIEMENT", "") or "").lower().strip()
         caisse = row.get("Caisse")
 
         if paiement == "facture":
-            pay_lines.append("🧾 Facture")
-        elif paiement in ("caisse", "bancontact"):
-            pay_lines.append(
-                f"💶 {caisse} € ({paiement})" if caisse not in ("", None) else f"💶 {paiement}"
+            bloc.append("🧾 **FACTURE**")
+        elif paiement == "caisse" and caisse:
+            bloc.append(
+                "<span style='color:#d32f2f;font-weight:800;'>"
+                f"💶 {caisse} € (CASH)</span>"
             )
-
-        if pay_lines:
-            bloc.append(" | ".join(pay_lines))
+        elif paiement == "bancontact" and caisse:
+            bloc.append(
+                "<span style='color:#1976d2;font-weight:800;'>"
+                f"💳 {caisse} € (BANCONTACT)</span>"
+            )
 
         # ------------------
         # Vol + statut
@@ -4662,37 +4498,30 @@ def render_tab_chauffeur_driver():
             status, delay_min, *_ = get_flight_status_cached(vol)
             badge = flight_badge(status, delay_min)
             if badge:
-                bloc.append(f"📡 Statut : {badge}")
+                bloc.append(f"📡 {badge}")
 
         # ------------------
         # GO
         # ------------------
         go_val = str(row.get("GO", "") or "").strip()
         if go_val:
-            bloc.append(f"🟢 GO : {go_val}")
+            bloc.append(f"🟢 {go_val}")
 
         # ------------------
-        # 🔗 Actions (Appels / Waze / Maps / WhatsApp)
+        # Actions
         # ------------------
         actions = []
 
         if tel:
-            tel_clean = clean_phone(tel)
-            actions.append(f"[📞 Appeler](tel:{tel_clean})")
+            actions.append(f"[📞 Appeler](tel:{clean_phone(tel)})")
 
         if adr:
-            waze_url = build_waze_link(adr)
-            if waze_url and waze_url != "#":
-                actions.append(f"[🧭 Waze]({waze_url})")
-
-            gmaps_url = build_google_maps_link(adr)
-            if gmaps_url and gmaps_url != "#":
-                actions.append(f"[🗺 Google Maps]({gmaps_url})")
+            actions.append(f"[🧭 Waze]({build_waze_link(adr)})")
+            actions.append(f"[🗺 Google Maps]({build_google_maps_link(adr)})")
 
         if tel:
             msg = build_client_sms_from_driver(row, ch_selected, tel)
-            wa_url = build_whatsapp_link(tel, msg)
-            actions.append(f"[💬 WhatsApp]({wa_url})")
+            actions.append(f"[💬 WhatsApp]({build_whatsapp_link(tel, msg)})")
 
         if actions:
             bloc.append(" | ".join(actions))
@@ -4700,16 +4529,13 @@ def render_tab_chauffeur_driver():
         # ------------------
         # Affichage
         # ------------------
-        st.markdown("\n".join(bloc))
+        st.markdown("<br>".join(bloc), unsafe_allow_html=True)
 
         # ------------------
         # Saisie chauffeur
         # ------------------
         trajet_key = f"trajet_nav_{nav_id}"
         prob_key = f"prob_nav_{nav_id}"
-
-        st.session_state.setdefault(trajet_key, "")
-        st.session_state.setdefault(prob_key, "")
 
         st.text_input("Trajet compris", key=trajet_key)
 
@@ -4752,6 +4578,7 @@ def render_tab_chauffeur_driver():
         set_chauffeur_last_ack(ch_selected)
         st.success("✅ Confirmation enregistrée.")
         st.rerun()
+
 
 
 
@@ -4906,46 +4733,106 @@ def render_tab_feuil3():
 
 
 # ============================================================
-#   ONGLET 📂 EXCEL ↔ DB (SharePoint – Feuil1)
+#   ONGLET 📂 EXCEL ↔ DB (Dropbox)
 # ============================================================
 
 def render_tab_excel_sync():
-    st.subheader("📂 Synchronisation SharePoint → Base de données (Feuil1)")
+
+    from streamlit_autorefresh import st_autorefresh
+
+    # 🔁 Rafraîchissement automatique toutes les X minutes
+    AUTO_REFRESH_MINUTES = 5  # ⬅️ modifie ici si besoin
+    st_autorefresh(
+        interval=AUTO_REFRESH_MINUTES * 60 * 1000,
+        key="auto_refresh_excel_sync",
+    )
+    # 🔍 Vérification automatique : Dropbox modifié ?
+    last_dbx_mtime = get_dropbox_file_last_modified()
+    last_known = st.session_state.get("last_dropbox_mtime")
+
+    if last_dbx_mtime and last_dbx_mtime != last_known:
+        with st.spinner("🔁 Dropbox modifié — mise à jour automatique…"):
+            sync_planning_from_today()
+
+        st.session_state["last_dropbox_mtime"] = last_dbx_mtime
+
+    st.subheader("📂 Synchronisation Excel → Base de données (Dropbox)")
+
+    # 🟢 Affichage dernière synchronisation
+    last_sync = st.session_state.get("last_sync_time")
+    if last_sync:
+        st.success(f"🟢 Dernière mise à jour : {last_sync}")
+    else:
+        st.info("🔴 Aucune synchronisation effectuée dans cette session")
 
     st.markdown(
         """
-        **Source du planning : SharePoint (fichier Excel en ligne)**
+        **Source du planning : Dropbox (fichier Excel unique)**
 
         ---
         🔧 **Workflow conseillé :**
 
-        1. Ouvre le fichier Excel directement sur **SharePoint / OneDrive Web**  
-           → Tu modifies *Feuil1* comme d'habitude  
-           (groupage, indispos, partagée, chauffeurs, etc.).
-        2. Le fichier est **enregistré automatiquement** par SharePoint.
-        3. Tu reviens ici et cliques sur **🔄 Mettre à jour la base**  
-           → La table `planning` est synchronisée depuis SharePoint.
+        1. Ouvre le fichier **Planning 2026.xlsx** dans **Dropbox**
+        2. Modifie librement :
+           - *Feuil1* → planning (navettes, groupage, indispos, chauffeurs…)
+           - *Feuil2* → chauffeurs (GSM, mails, codes)
+           - *Feuil3* → données annexes
+        3. Enregistre le fichier (Dropbox synchronise automatiquement)
+        4. Clique ci-dessous sur **🔄 Forcer MAJ Dropbox → DB**
 
-        ⚠️ Les couleurs Excel sont traduites en colonnes  
-        (`GROUPAGE`, `PARTAGE`, `²²²²`, etc.)  
-        et réutilisées dans l’app pour l’affichage.
+        👉 La base est **reconstruite à partir d’aujourd’hui**  
+        👉 Les couleurs Excel (groupage / partagée / attente) sont conservées  
+        👉 Les vues *jour / 7 jours / complet* sont recréées automatiquement
         """
     )
 
     st.markdown("---")
 
-    if st.button("🔄 Mettre à jour la base depuis SharePoint"):
-        sync_planning_from_sharepoint()
-        st.success("Base de données mise à jour depuis SharePoint ✅")
-        st.toast("Planning synchronisé avec SharePoint.", icon="🚐")
+    # 🔐 Sécurité : admin uniquement
+    if st.session_state.get("role") != "admin":
+        st.warning("🔒 Seuls les administrateurs peuvent forcer la synchronisation.")
+        return
 
+    # 🔐 Confirmation explicite
+    confirm = st.checkbox(
+        "Je confirme vouloir forcer la mise à jour de la base depuis Dropbox",
+        key="confirm_force_sync_dropbox",
+    )
 
+    col1, col2 = st.columns([2, 3])
+
+    with col1:
+        btn_force = st.button(
+            "🔄 FORCER MAJ DROPBOX → DB",
+            type="primary",
+            disabled=not confirm,
+        )
+
+    with col2:
+        st.caption(
+            "⚠️ Cette action remplace toutes les navettes "
+            "à partir d’aujourd’hui dans la base."
+        )
+
+    # 🚀 ACTION
+    if btn_force:
+        with st.spinner("🔄 Synchronisation en cours depuis Dropbox…"):
+            inserted = sync_planning_from_today()
+
+        if inserted > 0:
+            st.success(f"✅ DB mise à jour depuis aujourd’hui ({inserted} lignes)")
+            st.toast("Planning mis à jour depuis Dropbox 🚐", icon="📂")
+        else:
+            st.warning("Aucune donnée n’a été modifiée.")
 
     st.markdown("---")
+
     st.info(
-        "💡 Le fichier Excel n’est plus ouvert localement.\n\n"
-        "Tu peux modifier le planning depuis **n’importe quel PC**, "
-        "la base sera toujours reconstruite depuis SharePoint."
+        "💡 **Dropbox est la source unique.**\n\n"
+        "- Aucun fichier local\n"
+        "- Aucune dépendance SharePoint / OneDrive\n"
+        "- Synchronisation identique sur tous les PC\n"
+        "- Base toujours alignée sur Excel"
     )
 
 
