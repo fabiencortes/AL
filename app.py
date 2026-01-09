@@ -331,36 +331,39 @@ import streamlit as st
 
 DROPBOX_FILE_PATH = "/Goldenlines/Planning 2026.xlsx"
 
-def download_dropbox_excel_bytes() -> bytes | None:
-    """
-    Télécharge le fichier Excel depuis Dropbox via l’API officielle
-    et retourne le contenu brut (bytes).
-    """
-    try:
-        token = "sl.u.AGOg7u6Wb1NbcZPXdLjf7RDd8X8232gbOD2lCD1Sc2Q9bGsIFhdbea9WACrqan1LkwIniLUpqaqYEk_MDUyIN6oKAp9n8LtO5ZngAJWPI196z5dx0eY66H7RlAhgGtLR_7_jo6yLjhImPsr8sBGaRXZiGasfLJIWFYXw34GzhShregG3M_LaMEMVw299I0pQ16zfThH683LuCGlt1MdmTWw_yPwTn6hrxund4ipgtDwJyxlGua7k66cKmIMOgyBku_n3WUlXv1Xe4l-zen8BcRw25PbWLgr_RtebeLdSBEf_r-IkKiadsh4zO3wMD2cEcBlqv2OIOMWVeUU1w-wVvUCSXimwzRFX4HCBXCXLdmt3Vx00gcDj1WpsMmaoEC1hQc-B3dbV67Kxu8Al1MXUjtqDRVZNPGSZg5_0AXZ9OYleeuTbwf4i-IUaeZFhROjhgYT6RDxaVTesTChWrEsKGy4YhlJYgIPsnJwCq2C86xzKllY2dWriBaYsnt4866dRIXHruhB_53BZzz43V0lCJ8bydYapCy8SFNsPYBXNjpB6WTqUOxgXjdFjJWFb0b1Pnuy4MzK7ySmpm5JAw6Fb3VvqcNRCa_UUEphZMppmlsjCZ6Q_RUSdAuMMf8YHx3fI9XUmdmFvsf70Fp8tKlxz5-DGcA72_J3nJja9wCPP0Ogp-4hrQyVB9ruB_RuRlMbni65wLBpLZj_MxXwVr_JGKHAyAf18bF8FJfJeWnMGsQdFU6jG3d3YDZoxdJTv6-DRsChdVBzfAdbqlYpss42dKTycT57r3x7y3qlffzCsuJ1NPJ_bb8NJ2yh985qobMLvBbyGCjOkxoaXu5u6oChl89D3yqKYzv8KDJRLBcWlHGHM3RNDi251H6xZqqTGGOcLHtmjkt5pTv6-NRFB9PAttpc2PFfbUrcE-AHmEHmAxQfP2DY560O2_R0Rn59iVX9o36m1dFSAmov19nXvx_Twi_YiP7gW-f1hK4zaGht8137pTcPxriz_m0a9EdZ_7XHixNgWbUr9nUq124AGmvXYHBdXMzb8d-GCDMYfzZ_WmF4_dewm12NGwpUrD2pKXshCzbz5soFvAVnvfmw93hX5jlldEeY2F06gvAXES0_UgY5q8aEvRBxAM5aD5mNBqFA9hoj3uvY7cJzl-j30_h9kbJfiCceHh-wGFAJMSJwgQY0RoMgaaCOmPGIopc80jrgZv0sEGfp4HEihXl-4L7jEIVjsWSSYdtBOoQGh0GJwOhxoVI9UfumqtQMoD9ZJ0RxS6YE_XZE0ckdASd26f1SLH5VZ"
+import os
+import requests
 
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Dropbox-API-Arg": '{"path": "/Goldenlines/Planning 2026.xlsx"}',
-            "Content-Type": "application/octet-stream",
-        }
+def get_dropbox_access_token():
+    r = requests.post(
+        "https://api.dropbox.com/oauth2/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": os.environ["DROPBOX_REFRESH_TOKEN"],
+            "client_id": os.environ["DROPBOX_APP_KEY"],
+            "client_secret": os.environ["DROPBOX_APP_SECRET"],
+        },
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]
 
-        r = requests.post(
-            "https://content.dropboxapi.com/2/files/download",
-            headers=headers,
-            data=b"",   # ⚠️ OBLIGATOIRE
-            timeout=30,
-        )
+def download_dropbox_excel_bytes(path="/Goldenlines/Planning 2026.xlsx"):
+    token = get_dropbox_access_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Dropbox-API-Arg": f'{{"path": "{path}"}}',
+        "Content-Type": "application/octet-stream",
+    }
+    r = requests.post(
+        "https://content.dropboxapi.com/2/files/download",
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.content
 
-        if r.status_code != 200:
-            st.error(f"Dropbox HTTP {r.status_code} : {r.text}")
-            return None
 
-        return r.content
-
-    except Exception as e:
-        st.error(f"❌ Erreur téléchargement Dropbox : {e}")
-        return None
 def load_planning_from_dropbox(sheet_name: str | None = None) -> pd.DataFrame:
     content = download_dropbox_excel_bytes()
     if not content:
@@ -870,6 +873,37 @@ def sync_planning_from_today():
     st.rerun()
 
     return inserts
+
+def sync_planning_from_uploaded_file(uploaded_file):
+    """
+    Synchronisation DB depuis un fichier Excel uploadé manuellement
+    (mode secours si Dropbox indisponible)
+    """
+    try:
+        # 🔹 Lire le fichier uploadé en mémoire
+        content = uploaded_file.getbuffer()
+
+        # 🔹 Monkey-patch temporaire : on remplace le downloader Dropbox
+        def _mock_download_dropbox_excel_bytes(path=None):
+            return content
+
+        # Sauvegarde de la fonction originale
+        original_download = download_dropbox_excel_bytes
+
+        # Remplacement temporaire
+        globals()["download_dropbox_excel_bytes"] = _mock_download_dropbox_excel_bytes
+
+        # 🔁 Réutilise EXACTEMENT la même logique que Dropbox
+        inserted = sync_planning_from_today()
+
+        # 🔙 Restauration fonction originale
+        globals()["download_dropbox_excel_bytes"] = original_download
+
+        return inserted
+
+    except Exception as e:
+        st.error(f"❌ Erreur synchronisation fichier manuel : {e}")
+        return 0
 
 
 
@@ -1485,17 +1519,10 @@ def build_planning_mail_body(
         heure = normalize_time_string(row.get("HEURE")) or "??:??"
 
         # -------------------------
-        # SENS (DE / VERS / A/R)
+        # SENS / DESTINATION
         # -------------------------
-        sens_raw = str(row.get("Unnamed: 8", "") or "")
-        sens_txt = format_sens_ar(sens_raw)
-
-        # -------------------------
-        # DESTINATION
-        # -------------------------
-        lieu = resolve_client_alias(
-            str(row.get("DESIGNATION", "") or "").strip()
-        )
+        sens_txt = format_sens_ar(str(row.get("Unnamed: 8", "") or ""))
+        lieu = resolve_client_alias(str(row.get("DESIGNATION", "") or "").strip())
 
         # -------------------------
         # CLIENT
@@ -1505,11 +1532,20 @@ def build_planning_mail_body(
         adr_full = build_full_address_from_row(row)
 
         # -------------------------
-        # VÉHICULE
+        # 🧾 NUMÉRO DE BDC (ROBUSTE)
+        # -------------------------
+        num_bdc = ""
+        for cand in ["NUM BDC", "Num BDC", "NUM_BDC", "BDC"]:
+            if cand in cols and row.get(cand):
+                num_bdc = str(row.get(cand)).strip()
+                break
+
+        # -------------------------
+        # 🚘 VÉHICULE (ALIGNÉ PARTOUT)
         # -------------------------
         immat = str(row.get("IMMAT", "") or "").strip()
+        siege_bebe = extract_positive_int(row.get("SIEGE", row.get("SIÈGE")))
         reh_n = extract_positive_int(row.get("REH"))
-        siege_n = extract_positive_int(row.get("SIEGE", "SIÈGE"))
 
         # -------------------------
         # AUTRES INFOS
@@ -1520,19 +1556,20 @@ def build_planning_mail_body(
         caisse = row.get("Caisse")
 
         # -------------------------
-        # GO (IMPORTANT)
+        # GO
         # -------------------------
         go_val = str(row.get("GO", "") or "").strip()
 
         # =============================
-        # LIGNE PRINCIPALE
+        # AFFICHAGE NAVETTE
         # =============================
-        lines.append(
-            f"📆 {date_txt} | ⏱ {heure} — {sens_txt} ({lieu})"
-        )
+        lines.append(f"📆 {date_txt} | ⏱ {heure} — {sens_txt} ({lieu})")
 
         if go_val:
             lines.append(f"🟢 GO : {go_val}")
+
+        if num_bdc:
+            lines.append(f"🧾 BDC : {num_bdc}")
 
         if nom:
             lines.append(f"👤 Client : {nom}")
@@ -1546,17 +1583,17 @@ def build_planning_mail_body(
         # -------------------------
         # VÉHICULE
         # -------------------------
-        if immat or reh_n or siege_n:
+        if immat or siege_bebe or reh_n:
             lines.append("🚘 Véhicule :")
             if immat:
                 lines.append(f"  - Plaque : {immat}")
-            if siege_n:
-                lines.append(f"  - Siège enfant : {siege_n}")
+            if siege_bebe:
+                lines.append(f"  - 🍼 Siège bébé : {siege_bebe}")
             if reh_n:
-                lines.append(f"  - REH : {reh_n}")
+                lines.append(f"  - 🪑 Rehausseur : {reh_n}")
 
         # -------------------------
-        # INFOS VOL / PAX / PAIEMENT
+        # VOL / PAX / PAIEMENT
         # -------------------------
         if vol:
             lines.append(f"✈️ Vol : {vol}")
@@ -1575,6 +1612,7 @@ def build_planning_mail_body(
         lines.append("")
 
     return "\n".join(lines).strip()
+
 
 
 
@@ -2652,79 +2690,6 @@ def render_tab_table():
 
     st.markdown("---")
 
-    # ======================================================
-    # 🔁 SYNCHRO MANUELLE (FORCE MAJEURE)
-    # ======================================================
-    if st.session_state.logged_in and st.session_state.role == "admin":
-
-        st.markdown("### 🔁 Synchronisation manuelle (force majeure)")
-
-        st.caption(
-            "À utiliser uniquement en cas de modification immédiate dans Excel "
-            "ou de problème constaté par un chauffeur."
-        )
-
-        confirm_sync = st.checkbox(
-            "⚠️ Forcer la synchronisation du planning futur",
-            key="confirm_force_sync_tableau",
-        )
-
-        if st.button(
-            "🔁 Forcer la synchronisation maintenant",
-            type="secondary",
-            disabled=not confirm_sync,
-            key="btn_force_sync_tableau",
-        ):
-            with st.status("⏳ Synchronisation en cours…", expanded=True):
-                sync_planning_from_today()
-                st.cache_data.clear()
-                st.session_state.last_auto_sync = time.time()
-                st.success("✅ Planning mis à jour")
-                st.rerun()
-
-        # 🕒 Dernière synchro
-        render_last_sync_info()
-
-        # ==================================================
-        # 🔴 COPIE EXCEL → ONEDRIVE + SYNCHRO DB
-        # ==================================================
-        st.markdown("---")
-        st.markdown("### 🔴 Copie forcée Excel → OneDrive → DB")
-
-        st.warning(
-            "⚠️ Cette action écrase le fichier Excel dans OneDrive.\n"
-            "À utiliser uniquement en cas de force majeure."
-        )
-
-        confirm_force_copy = st.checkbox(
-            "Je confirme vouloir écraser le fichier Excel OneDrive",
-            key="confirm_force_copy_cloud",
-        )
-
-        if st.button(
-            "🔴 FORCER LA COPIE + SYNCHRO DB",
-            disabled=not confirm_force_copy,
-            type="primary",
-            key="btn_force_copy_cloud",
-        ):
-            try:
-                from utils_paths import force_copy_planning_to_onedrive
-
-                # 🔁 COPIE DROPBOX → ONEDRIVE (MULTI-PC SAFE)
-                target = force_copy_planning_to_onedrive()
-
-                st.success(f"📄 Fichier OneDrive remplacé : {target}")
-
-                # 🔁 Même synchro DB que le bouton standard
-                sync_planning_from_today()
-                st.cache_data.clear()
-                st.session_state.last_auto_sync = time.time()
-
-                st.success("✅ Synchronisation DB terminée")
-                st.rerun()
-
-            except Exception as e:
-                st.error(f"❌ Erreur lors de la copie : {e}")
 
 # ============================================================
 #   ONGLET 🔍 CLIENTS — HISTORIQUE & CRÉATION RAPIDE
@@ -3938,22 +3903,34 @@ def render_tab_vue_chauffeur(forced_ch=None):
                 bloc_lines.append(f"🧑 {nom}")
 
             # ===================================================
-            # Véhicule
+            # NUMÉRO DE BDC
             # ===================================================
-            if row.get("IMMAT"):
-                bloc_lines.append(
-                    f"🚘 Plaque : {row.get('IMMAT')}"
-                )
+            num_bdc = ""
+            for cand in ["NUM BDC", "Num BDC", "NUM_BDC", "BDC"]:
+                if cand in cols and row.get(cand):
+                    num_bdc = str(row.get(cand)).strip()
+                    break
 
-            if extract_positive_int(row.get("SIEGE", "SIÈGE")):
-                bloc_lines.append(
-                    f"🪑 Siège enfant : {row.get('SIEGE')}"
-                )
+            if num_bdc:
+                bloc_lines.append(f"🧾 BDC : {num_bdc}")
 
-            if extract_positive_int(row.get("REH")):
-                bloc_lines.append(
-                    f"♿ REH : {row.get('REH')}"
-                )
+
+            # ===================================================
+            # Véhicule (SIÈGE BÉBÉ / RÉHAUSSEUR)
+            # ===================================================
+            immat = str(row.get("IMMAT", "") or "").strip()
+            siege_bebe = extract_positive_int(row.get("SIEGE", row.get("SIÈGE")))
+            reh_n = extract_positive_int(row.get("REH"))
+
+            if immat:
+                bloc_lines.append(f"🚘 Plaque : {immat}")
+
+            if siege_bebe:
+                bloc_lines.append(f"🍼 Siège bébé : {siege_bebe}")
+
+            if reh_n:
+                bloc_lines.append(f"🪑 Rehausseur : {reh_n}")
+
 
             # Adresse
             adr_full = build_full_address_from_row(row)
@@ -4120,18 +4097,13 @@ def export_chauffeur_planning_pdf(df_ch: pd.DataFrame, ch: str):
 
     cols = df_ch.columns.tolist()
 
-    # Petite fonction pour écrire une ligne et gérer les sauts de page
     def write_line(txt: str, indent: float = 0.0, bold: bool = False):
         nonlocal y
         if y < 2 * cm:
             new_page()
 
-        if bold:
-            c.setFont("Helvetica-Bold", 10)
-        else:
-            c.setFont("Helvetica", 10)
-
-        c.drawString(margin_x + indent, y, txt[:120])  # sécurité longueur
+        c.setFont("Helvetica-Bold" if bold else "Helvetica", 10)
+        c.drawString(margin_x + indent, y, txt[:120])
         y -= line_h
 
     for _, row in df_ch.iterrows():
@@ -4150,7 +4122,7 @@ def export_chauffeur_planning_pdf(df_ch: pd.DataFrame, ch: str):
         # --- Heure ---
         heure = normalize_time_string(row.get("HEURE")) or "??:??"
 
-        # --- Sens + destination (DE/VERS/A-R + DESIGNATION) ---
+        # --- Sens + destination ---
         sens_txt = format_sens_ar(row.get("Unnamed: 8"))
         lieu = resolve_client_alias(str(row.get("DESIGNATION", "") or "").strip())
         sens_dest = f"{sens_txt} ({lieu})" if sens_txt and lieu else (lieu or sens_txt or "Navette")
@@ -4160,10 +4132,22 @@ def export_chauffeur_planning_pdf(df_ch: pd.DataFrame, ch: str):
         tel_client = get_client_phone_from_row(row)
         adr_full = build_full_address_from_row(row)
 
-        # --- Véhicule ---
+        # --- NUMÉRO DE BDC (ROBUSTE) ---
+        num_bdc = ""
+        for cand in ["NUM BDC", "Num BDC", "NUM_BDC", "BDC"]:
+            if cand in cols and row.get(cand):
+                num_bdc = str(row.get(cand)).strip()
+                break
+
+        # --- Véhicule (SIÈGE BÉBÉ / RÉHAUSSEUR) ---
         immat = str(row.get("IMMAT", "") or "").strip()
-        siege_n = extract_positive_int(row.get("SIEGE", "SIÈGE"))
+
+        # 🍼 Siège bébé (SIEGE / SIÈGE)
+        siege_bebe = extract_positive_int(row.get("SIEGE", row.get("SIÈGE")))
+
+        # 🪑 Rehausseur
         reh_n = extract_positive_int(row.get("REH"))
+
 
         # --- Paiement / caisse / pax ---
         pax = row.get("PAX")
@@ -4184,6 +4168,9 @@ def export_chauffeur_planning_pdf(df_ch: pd.DataFrame, ch: str):
         if nom:
             write_line(f"👤 Client : {nom}", indent=10)
 
+        if num_bdc:
+            write_line(f"🧾 BDC : {num_bdc}", indent=10)
+
         if tel_client:
             write_line(f"📞 Client : {tel_client}", indent=10)
 
@@ -4191,14 +4178,19 @@ def export_chauffeur_planning_pdf(df_ch: pd.DataFrame, ch: str):
             write_line(f"📍 Adresse : {adr_full}", indent=10)
 
         veh_infos = []
+
         if immat:
             veh_infos.append(f"Plaque {immat}")
-        if siege_n:
-            veh_infos.append(f"Siège {siege_n}")
+
+        if siege_bebe:
+            veh_infos.append(f"🍼 Siège bébé {siege_bebe}")
+
         if reh_n:
-            veh_infos.append(f"REH {reh_n}")
+            veh_infos.append(f"🪑 Rehausseur {reh_n}")
+
         if veh_infos:
             write_line("🚘 " + " | ".join(veh_infos), indent=10)
+
 
         extra = []
         if vol:
@@ -4220,8 +4212,7 @@ def export_chauffeur_planning_pdf(df_ch: pd.DataFrame, ch: str):
         if go_val:
             write_line(f"🟢 GO : {go_val}", indent=10)
 
-        # espace entre navettes
-        write_line("", indent=0)
+        write_line("")
 
     c.save()
     buffer.seek(0)
@@ -4446,18 +4437,18 @@ def render_tab_chauffeur_driver():
                 bloc.append(f"👥 **{pax} pax**")
 
         # ------------------
-        # Véhicule
+        # 🚘 Véhicule (SIÈGE BÉBÉ / RÉHAUSSEUR)
         # ------------------
         if row.get("IMMAT"):
             bloc.append(f"🚘 Plaque : {row.get('IMMAT')}")
 
-        siege_n = extract_positive_int(row.get("SIEGE", row.get("SIÈGE")))
-        if siege_n:
-            bloc.append(f"🪑 Siège enfant : {siege_n}")
+        siege_bebe = extract_positive_int(row.get("SIEGE", row.get("SIÈGE")))
+        if siege_bebe:
+            bloc.append(f"🍼 Siège bébé : {siege_bebe}")
 
         reh_n = extract_positive_int(row.get("REH"))
         if reh_n:
-            bloc.append(f"♿ REH : {reh_n}")
+            bloc.append(f"🪑 Rehausseur : {reh_n}")
 
         # ------------------
         # Adresse / Tel
@@ -4508,6 +4499,18 @@ def render_tab_chauffeur_driver():
             bloc.append(f"🟢 {go_val}")
 
         # ------------------
+        # 🧾 BDC (juste après GO)
+        # ------------------
+        num_bdc = ""
+        for cand in ["NUM BDC", "Num BDC", "NUM_BDC", "BDC"]:
+            if cand in cols and row.get(cand):
+                num_bdc = str(row.get(cand)).strip()
+                break
+
+        if num_bdc:
+            bloc.append(f"🧾 **BDC : {num_bdc}**")
+
+        # ------------------
         # Actions
         # ------------------
         actions = []
@@ -4543,6 +4546,7 @@ def render_tab_chauffeur_driver():
             st.text_area("Décrire le problème", key=prob_key)
 
         st.markdown("---")
+
 
     # ===================================================
     # 📤 ENVOI CONFIRMATION
@@ -4740,60 +4744,128 @@ def render_tab_excel_sync():
 
     from streamlit_autorefresh import st_autorefresh
 
-    # 🔁 Rafraîchissement automatique toutes les X minutes
-    AUTO_REFRESH_MINUTES = 5  # ⬅️ modifie ici si besoin
+    # ===================================================
+    # 🔐 SÉCURITÉ — ADMIN UNIQUEMENT
+    # ===================================================
+    if st.session_state.get("role") != "admin":
+        st.warning("🔒 Seuls les administrateurs peuvent synchroniser la base.")
+        return
+
+    # ===================================================
+    # 🔁 RAFRAÎCHISSEMENT AUTOMATIQUE
+    # ===================================================
+    AUTO_REFRESH_MINUTES = 5  # ⬅️ modifiable si besoin
     st_autorefresh(
         interval=AUTO_REFRESH_MINUTES * 60 * 1000,
         key="auto_refresh_excel_sync",
     )
-    # 🔍 Vérification automatique : Dropbox modifié ?
-    last_dbx_mtime = get_dropbox_file_last_modified()
+
+    # ===================================================
+    # 🔍 VÉRIFICATION AUTO DROPBOX
+    # ===================================================
+    try:
+        last_dbx_mtime = get_dropbox_file_last_modified()
+    except Exception as e:
+        last_dbx_mtime = None
+        st.warning(f"⚠️ Dropbox indisponible : {e}")
+
     last_known = st.session_state.get("last_dropbox_mtime")
 
     if last_dbx_mtime and last_dbx_mtime != last_known:
         with st.spinner("🔁 Dropbox modifié — mise à jour automatique…"):
-            sync_planning_from_today()
+            inserted = sync_planning_from_today()
 
         st.session_state["last_dropbox_mtime"] = last_dbx_mtime
+        st.session_state["last_sync_time"] = datetime.now().strftime("%d/%m/%Y %H:%M")
 
-    st.subheader("📂 Synchronisation Excel → Base de données (Dropbox)")
+        if inserted > 0:
+            st.toast("Planning mis à jour automatiquement depuis Dropbox 🚐", icon="📂")
 
-    # 🟢 Affichage dernière synchronisation
+    # ===================================================
+    # 📂 TITRE
+    # ===================================================
+    st.subheader("📂 Synchronisation Excel → Base de données")
+
+    # ===================================================
+    # 🟢 DERNIÈRE SYNCHRO
+    # ===================================================
     last_sync = st.session_state.get("last_sync_time")
     if last_sync:
         st.success(f"🟢 Dernière mise à jour : {last_sync}")
     else:
         st.info("🔴 Aucune synchronisation effectuée dans cette session")
 
+    # ===================================================
+    # ℹ️ INFO WORKFLOW
+    # ===================================================
     st.markdown(
         """
-        **Source du planning : Dropbox (fichier Excel unique)**
+        **Source principale du planning : Dropbox (Excel unique)**
 
         ---
-        🔧 **Workflow conseillé :**
+        🔧 **Workflow normal :**
 
         1. Ouvre le fichier **Planning 2026.xlsx** dans **Dropbox**
-        2. Modifie librement :
-           - *Feuil1* → planning (navettes, groupage, indispos, chauffeurs…)
-           - *Feuil2* → chauffeurs (GSM, mails, codes)
+        2. Modifie :
+           - *Feuil1* → planning
+           - *Feuil2* → chauffeurs
            - *Feuil3* → données annexes
-        3. Enregistre le fichier (Dropbox synchronise automatiquement)
-        4. Clique ci-dessous sur **🔄 Forcer MAJ Dropbox → DB**
-
-        👉 La base est **reconstruite à partir d’aujourd’hui**  
-        👉 Les couleurs Excel (groupage / partagée / attente) sont conservées  
-        👉 Les vues *jour / 7 jours / complet* sont recréées automatiquement
+        3. Enregistre le fichier
+        4. La synchronisation se fait automatiquement
         """
     )
 
     st.markdown("---")
 
-    # 🔐 Sécurité : admin uniquement
-    if st.session_state.get("role") != "admin":
-        st.warning("🔒 Seuls les administrateurs peuvent forcer la synchronisation.")
-        return
+    # ===================================================
+    # 🆘 MODE SECOURS — UPLOAD MANUEL
+    # ===================================================
+    st.subheader("🆘 Mode secours — Charger un fichier Excel manuellement")
 
-    # 🔐 Confirmation explicite
+    st.warning(
+        "À utiliser uniquement en cas de problème avec Dropbox "
+        "(token expiré, réseau indisponible, erreur API…)."
+    )
+
+    uploaded_file = st.file_uploader(
+        "📤 Charger un fichier Planning Excel (.xlsx)",
+        type=["xlsx"],
+        accept_multiple_files=False,
+        help="Le fichier doit avoir exactement la même structure que Planning 2026.xlsx",
+    )
+
+    if uploaded_file:
+        st.info(
+            f"📄 Fichier chargé : {uploaded_file.name}\n\n"
+            "⚠️ Cette action remplacera les données à partir d’aujourd’hui dans la base."
+        )
+
+        confirm_upload = st.checkbox(
+            "Je confirme vouloir synchroniser la base depuis ce fichier",
+            key="confirm_manual_excel_upload",
+        )
+
+        if st.button(
+            "🆘 SYNCHRONISER DEPUIS LE FICHIER MANUEL",
+            type="secondary",
+            disabled=not confirm_upload,
+        ):
+            with st.spinner("🔄 Synchronisation depuis fichier manuel…"):
+                inserted = sync_planning_from_uploaded_file(uploaded_file)
+
+            st.session_state["last_sync_time"] = datetime.now().strftime("%d/%m/%Y %H:%M")
+
+            if inserted > 0:
+                st.success(f"✅ DB mise à jour ({inserted} lignes importées)")
+                st.toast("Planning synchronisé depuis fichier manuel 📄", icon="🆘")
+            else:
+                st.warning("Aucune donnée n’a été modifiée.")
+
+    st.markdown("---")
+
+    # ===================================================
+    # 🔄 SYNCHRO MANUELLE DROPBOX
+    # ===================================================
     confirm = st.checkbox(
         "Je confirme vouloir forcer la mise à jour de la base depuis Dropbox",
         key="confirm_force_sync_dropbox",
@@ -4814,10 +4886,11 @@ def render_tab_excel_sync():
             "à partir d’aujourd’hui dans la base."
         )
 
-    # 🚀 ACTION
     if btn_force:
         with st.spinner("🔄 Synchronisation en cours depuis Dropbox…"):
             inserted = sync_planning_from_today()
+
+        st.session_state["last_sync_time"] = datetime.now().strftime("%d/%m/%Y %H:%M")
 
         if inserted > 0:
             st.success(f"✅ DB mise à jour depuis aujourd’hui ({inserted} lignes)")
@@ -4827,15 +4900,16 @@ def render_tab_excel_sync():
 
     st.markdown("---")
 
+    # ===================================================
+    # ℹ️ INFO FINALE
+    # ===================================================
     st.info(
-        "💡 **Dropbox est la source unique.**\n\n"
-        "- Aucun fichier local\n"
-        "- Aucune dépendance SharePoint / OneDrive\n"
-        "- Synchronisation identique sur tous les PC\n"
-        "- Base toujours alignée sur Excel"
+        "💡 **Dropbox est la source principale du planning.**\n\n"
+        "- Synchronisation automatique quand Dropbox est disponible\n"
+        "- Mode secours possible via upload manuel\n"
+        "- Aucun SharePoint / OneDrive\n"
+        "- Base toujours alignée sur un Excel de référence"
     )
-
-
 
 # ============================================================
 #   ONGLET 📦 ADMIN TRANSFERTS (LISTE GLOBALE)
@@ -5367,5 +5441,4 @@ def main():
 
 
 if __name__ == "__main__":
-
     main()
