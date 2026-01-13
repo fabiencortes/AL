@@ -4784,10 +4784,6 @@ def render_tab_chauffeur_driver():
         if tel_client:
             actions.append(f"[📞 Appeler](tel:{clean_phone(tel_client)})")
 
-        if adr:
-            actions.append(f"[🧭 Waze]({build_waze_link(adr)})")
-            actions.append(f"[🗺 Google Maps]({build_google_maps_link(adr)})")
-
         # 💬 WhatsApp : vers le CLIENT, avec le numéro du CHAUFFEUR dans le message
         if tel_client and tel_chauffeur:
             msg = build_client_sms_from_driver(
