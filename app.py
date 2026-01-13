@@ -3333,7 +3333,7 @@ def make_row_key_from_row(row: dict) -> str:
     """
     parts = [
         str(row.get("DATE", "")).strip(),
-        normalize_time_string(row.get("HEURE", "")).strip(),
+        (normalize_time_string(row.get("HEURE", "")) or "").strip(),
         str(row.get("CH", "")).strip(),
         str(row.get("DESIGNATION", "")).strip(),
         str(row.get("NOM", "")).strip(),
