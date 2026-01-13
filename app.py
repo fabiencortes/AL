@@ -4,6 +4,11 @@
 # ============================================================
 DEBUG_SAFE_MODE = True
 AUTO_REFRESH_MINUTES = 5  # 🔁 auto-refresh toutes les X minutes
+DROPBOX_CHECK_EVERY_SEC = 45          # check mtime toutes les 45s (léger)
+AUTO_SYNC_COOLDOWN_SEC = 60           # évite 2 sync collées
+META_DBX_MTIME_KEY = "dropbox_mtime"
+META_SYNC_LOCK_KEY = "sync_lock"
+
 import os
 import io
 from datetime import datetime, date, timedelta
@@ -38,6 +43,8 @@ from database import (
     delete_planning_row,
     get_planning_columns,
     get_connection,
+    confirm_navette_row,
+    is_row_confirmed,
     init_indispo_table,
     create_indispo_request,
     get_indispo_requests,
@@ -57,6 +64,8 @@ from database import (
     ensure_meta_table,
     get_meta,
     set_meta,
+    get_chauffeur_phone,
+    init_chauffeur_ack_rows_table,
 
 )
 # ============================================================
@@ -82,6 +91,11 @@ def init_session_state():
 
         # 🧭 Rafraîchissement par onglet
         "tab_refresh": {},   # ex: {"admin": 123456789}
+        
+        # 🔄 Dropbox mtime cache (session)
+        "last_dropbox_check": 0,
+        "last_seen_dropbox_mtime": None,
+
     }
 
     for k, v in defaults.items():
@@ -148,6 +162,7 @@ def login_screen():
         "Utilisateur restreint : leon/leon — "
         "Chauffeur (GSM) : gg/gg, fa/fa, np/np"
     )
+FLIGHT_ALERT_DELAY_MIN = 30  # seuil d’alerte retard (modifiable)
 
 def extract_positive_int(val):
     """
@@ -206,6 +221,50 @@ def _cell_is_yellow(cell) -> bool:
     except Exception:
         return False
 
+
+import urllib.parse
+
+def normalize_address_for_gps(addr: str) -> str:
+    """
+    Nettoie et normalise une adresse pour Waze / Google Maps.
+    """
+    if not addr:
+        return ""
+
+    a = str(addr)
+
+    # Supprimer retours ligne et espaces multiples
+    a = a.replace("\n", " ").replace("\r", " ")
+    a = " ".join(a.split())
+
+    # Forcer le pays pour éviter les homonymes
+    if "belgique" not in a.lower() and "belgium" not in a.lower():
+        a = f"{a}, Belgique"
+
+    return a
+
+
+def build_waze_link(addr: str) -> str:
+    """
+    Génère un lien Waze fiable à partir d'une adresse texte.
+    """
+    addr = normalize_address_for_gps(addr)
+    if not addr:
+        return ""
+    return "https://waze.com/ul?q=" + urllib.parse.quote(addr)
+
+
+def build_google_maps_link(addr: str) -> str:
+    """
+    Génère un lien Google Maps fiable à partir d'une adresse texte.
+    """
+    addr = normalize_address_for_gps(addr)
+    if not addr:
+        return ""
+    return (
+        "https://www.google.com/maps/search/?api=1&query="
+        + urllib.parse.quote(addr)
+    )
 
 
 def add_excel_color_flags_from_dropbox(
@@ -298,30 +357,40 @@ def navette_badges(row) -> str:
 
 import time
 
-if "last_auto_sync" not in st.session_state:
-    # Empêche toute synchro auto au premier chargement
-    st.session_state.last_auto_sync = time.time()
+def auto_sync_planning_if_needed(silent: bool = True) -> bool:
 
+    now_ts = int(datetime.now().timestamp())
+    last_check = int(st.session_state.get("last_dropbox_check") or 0)
+    if (now_ts - last_check) < DROPBOX_CHECK_EVERY_SEC:
+        return False
 
-def auto_sync_planning_if_needed():
-    SYNC_INTERVAL = 15 * 60
-    now = time.time()
+    st.session_state["last_dropbox_check"] = now_ts
 
-    if st.session_state.sync_running:
-        return
+    mtime = get_dropbox_file_last_modified_safe()
+    if not mtime:
+        return False
 
-    if now - st.session_state.last_auto_sync < SYNC_INTERVAL:
-        return
+    ensure_meta_table()
+    last_global_mtime = get_meta("dropbox_mtime") or ""
+
+    if last_global_mtime == mtime:
+        return False
+
+    if not _try_acquire_sync_lock(ttl_seconds=240):
+        return False
 
     try:
-        st.session_state.sync_running = True
-        sync_planning_from_today()
-        st.session_state.last_auto_sync = now
-        st.cache_data.clear()
-    except Exception:
-        pass
+        sync_planning_from_today()   # ⚠️ ÉCRASEMENT ABSOLU
+        set_meta("dropbox_mtime", mtime)
+        set_last_sync_time(datetime.now())
+
+        if not silent:
+            st.success("Synchro effectuée")
+        return True
+
     finally:
-        st.session_state.sync_running = False
+        _release_sync_lock()
+
 
 import os, json
 from io import BytesIO
@@ -362,6 +431,36 @@ def download_dropbox_excel_bytes(path="/Goldenlines/Planning 2026.xlsx"):
     )
     r.raise_for_status()
     return r.content
+
+def _try_acquire_sync_lock(ttl_seconds: int = 180) -> bool:
+    ensure_meta_table()
+
+    now = datetime.now()
+    lock_val = get_meta("sync_lock")
+
+    if lock_val:
+        try:
+            lock_dt = datetime.fromisoformat(lock_val)
+            if (now - lock_dt).total_seconds() < ttl_seconds:
+                return False
+        except Exception:
+            pass
+
+    set_meta("sync_lock", now.isoformat(timespec="seconds"))
+    return True
+
+def _release_sync_lock():
+    try:
+        set_meta("sync_lock", "")
+    except Exception:
+        pass
+
+def get_dropbox_file_last_modified_safe() -> str | None:
+    try:
+        return get_dropbox_file_last_modified()  # ta fonction existante
+    except Exception:
+        return None
+
 
 
 def load_planning_from_dropbox(sheet_name: str | None = None) -> pd.DataFrame:
@@ -1140,6 +1239,7 @@ def ors_route_km_min(origin_text: str, dest_text: str):
         return km, minutes
     except Exception:
         return None, None
+
 # ============================================================
 #   CONFIG STREAMLIT
 # ============================================================
@@ -1149,9 +1249,26 @@ st.set_page_config(
     layout="wide",
 )
 
-# 🔐 INITIALISATION OBLIGATOIRE DU SESSION STATE
+# ============================================================
+# 🔐 INITIALISATION SESSION
+# ============================================================
 init_session_state()
 
+# 🧾 TABLE ACK CHAUFFEUR (PAR LIGNE)
+init_chauffeur_ack_rows_table()
+
+# ============================================================
+# 🔁 SYNCHRONISATION SILENCIEUSE (AVANT LOGIN)
+# 👉 fonctionne même sur l'écran login
+# ============================================================
+try:
+    auto_sync_planning_if_needed()
+except Exception:
+    pass
+
+# ============================================================
+# 🔐 LOGIN (PERSISTANT)
+# ============================================================
 if st.session_state.get("logged_in") is not True:
     login_screen()
     st.stop()
@@ -1500,119 +1617,150 @@ def build_planning_mail_body(
     # =============================
     for _, row in df_ch.iterrows():
 
-        # -------------------------
-        # DATE
-        # -------------------------
+        # ===================================================
+        # 🚖 NAVETTE — BLOC COMPLET (MAIL)
+        # ===================================================
+
+        # ------------------
+        # Flags groupage / partage / attente
+        # ------------------
+        is_groupage = int(row.get("IS_GROUPAGE", 0) or 0) == 1
+        is_partage = int(row.get("IS_PARTAGE", 0) or 0) == 1
+        is_attente = int(row.get("IS_ATTENTE", 0) or 0) == 1
+
+        prefix = ""
+        if is_groupage:
+            prefix += "[GROUPÉE] "
+        elif is_partage:
+            prefix += "[PARTAGÉE] "
+        if is_attente:
+            prefix += "⭐ "
+
+        # ------------------
+        # Chauffeur
+        # ------------------
+        ch_code = str(row.get("CH", "") or ch).strip()
+        lines.append(f"👨‍✈️ {ch_code}")
+
+        # ------------------
+        # Confirmation (par row_key)
+        # ------------------
+        row_key = row.get("ROW_KEY") or row.get("row_key")
+        if row_key and is_row_confirmed(ch, row_key):
+            lines.append("✅ Navette confirmée")
+        else:
+            lines.append("🕒 À confirmer")
+
+        # ------------------
+        # Date / Heure
+        # ------------------
         dv = row.get("DATE")
         if isinstance(dv, date):
             date_txt = dv.strftime("%d/%m/%Y")
         else:
-            try:
-                dtmp = pd.to_datetime(dv, dayfirst=True, errors="coerce")
-                date_txt = dtmp.strftime("%d/%m/%Y") if not pd.isna(dtmp) else "??/??/????"
-            except Exception:
-                date_txt = "??/??/????"
+            dtmp = pd.to_datetime(dv, dayfirst=True, errors="coerce")
+            date_txt = dtmp.strftime("%d/%m/%Y") if not pd.isna(dtmp) else ""
 
-        # -------------------------
-        # HEURE
-        # -------------------------
-        heure = normalize_time_string(row.get("HEURE")) or "??:??"
+        heure_txt = normalize_time_string(row.get("HEURE")) or "??:??"
+        lines.append(f"{prefix}📆 {date_txt} | ⏱ {heure_txt}")
 
-        # -------------------------
-        # SENS / DESTINATION
-        # -------------------------
-        sens_txt = format_sens_ar(str(row.get("Unnamed: 8", "") or ""))
-        lieu = resolve_client_alias(str(row.get("DESIGNATION", "") or "").strip())
+        # ------------------
+        # Sens / Destination
+        # ------------------
+        sens_txt = format_sens_ar(row.get("Unnamed: 8"))
+        dest = resolve_client_alias(str(row.get("DESIGNATION", "") or "").strip())
+        if sens_txt or dest:
+            lines.append(f"➡ {sens_txt} ({dest})".strip())
 
-        # -------------------------
-        # CLIENT
-        # -------------------------
+        # ------------------
+        # Client
+        # ------------------
         nom = str(row.get("NOM", "") or "").strip()
-        tel_client = get_client_phone_from_row(row)
-        adr_full = build_full_address_from_row(row)
+        if nom:
+            lines.append(f"🧑 {nom}")
 
-        # -------------------------
-        # 🧾 NUMÉRO DE BDC (ROBUSTE)
-        # -------------------------
-        num_bdc = ""
-        for cand in ["NUM BDC", "Num BDC", "NUM_BDC", "BDC"]:
-            if cand in cols and row.get(cand):
-                num_bdc = str(row.get(cand)).strip()
-                break
-
-        # -------------------------
-        # 🚘 VÉHICULE (ALIGNÉ PARTOUT)
-        # -------------------------
-        immat = str(row.get("IMMAT", "") or "").strip()
-        siege_bebe = extract_positive_int(row.get("SIEGE", row.get("SIÈGE")))
-        reh_n = extract_positive_int(row.get("REH"))
-
-        # -------------------------
-        # AUTRES INFOS
-        # -------------------------
-        vol = extract_vol_val(row, cols)
+        # ------------------
+        # 👥 PAX
+        # ------------------
         pax = row.get("PAX")
-        paiement = str(row.get("PAIEMENT", "") or "").lower()
+        if pax not in ("", None, 0, "0"):
+            try:
+                pax_i = int(pax)
+                if pax_i > 0:
+                    lines.append(f"👥 {pax_i} pax")
+            except Exception:
+                lines.append(f"👥 {pax} pax")
+
+        # ------------------
+        # 🚘 Véhicule
+        # ------------------
+        if row.get("IMMAT"):
+            lines.append(f"🚘 Plaque : {row.get('IMMAT')}")
+
+        siege_bebe = extract_positive_int(row.get("SIEGE", row.get("SIÈGE")))
+        if siege_bebe:
+            lines.append(f"🍼 Siège bébé : {siege_bebe}")
+
+        reh_n = extract_positive_int(row.get("REH"))
+        if reh_n:
+            lines.append(f"🪑 Rehausseur : {reh_n}")
+
+        # ------------------
+        # Adresse / Tel
+        # ------------------
+        adr = build_full_address_from_row(row)
+        if adr:
+            lines.append(f"📍 {adr}")
+
+        tel = get_client_phone_from_row(row)
+        if tel:
+            lines.append(f"📞 {tel}")
+
+        # ------------------
+        # Paiement
+        # ------------------
+        paiement = str(row.get("PAIEMENT", "") or "").lower().strip()
         caisse = row.get("Caisse")
 
-        # -------------------------
-        # GO
-        # -------------------------
-        go_val = str(row.get("GO", "") or "").strip()
-
-        # =============================
-        # AFFICHAGE NAVETTE
-        # =============================
-        lines.append(f"📆 {date_txt} | ⏱ {heure} — {sens_txt} ({lieu})")
-
-        if go_val:
-            lines.append(f"🟢 GO : {go_val}")
-
-        if num_bdc:
-            lines.append(f"🧾 BDC : {num_bdc}")
-
-        if nom:
-            lines.append(f"👤 Client : {nom}")
-
-        if tel_client:
-            lines.append(f"📞 Client : {tel_client}")
-
-        if adr_full:
-            lines.append(f"📍 Adresse : {adr_full}")
-
-        # -------------------------
-        # VÉHICULE
-        # -------------------------
-        if immat or siege_bebe or reh_n:
-            lines.append("🚘 Véhicule :")
-            if immat:
-                lines.append(f"  - Plaque : {immat}")
-            if siege_bebe:
-                lines.append(f"  - 🍼 Siège bébé : {siege_bebe}")
-            if reh_n:
-                lines.append(f"  - 🪑 Rehausseur : {reh_n}")
-
-        # -------------------------
-        # VOL / PAX / PAIEMENT
-        # -------------------------
-        if vol:
-            lines.append(f"✈️ Vol : {vol}")
-
-        if pax not in ("", None, 0, "0"):
-            lines.append(f"👥 PAX : {pax}")
-
         if paiement == "facture":
-            lines.append("💳 Paiement : Facture")
-        elif paiement in ("caisse", "bancontact"):
-            if caisse not in ("", None):
-                lines.append(f"💳 Paiement : {paiement} — {caisse} €")
-            else:
-                lines.append(f"💳 Paiement : {paiement}")
+            lines.append("🧾 FACTURE")
+        elif paiement == "caisse" and caisse:
+            lines.append(f"💶 {caisse} € (CASH)")
+        elif paiement == "bancontact" and caisse:
+            lines.append(f"💳 {caisse} € (BANCONTACT)")
 
+        # ------------------
+        # Vol + statut
+        # ------------------
+        vol = extract_vol_val(row, cols)
+        if vol:
+            lines.append(f"✈️ Vol {vol}")
+            status, delay_min, *_ = get_flight_status_cached(vol)
+            badge = flight_badge(status, delay_min)
+            if badge:
+                lines.append(f"📡 {badge}")
+
+        # ------------------
+        # GO
+        # ------------------
+        go_val = str(row.get("GO", "") or "").strip()
+        if go_val:
+            lines.append(f"🟢 {go_val}")
+
+        # ------------------
+        # 🧾 BDC
+        # ------------------
+        for cand in ["NUM BDC", "Num BDC", "NUM_BDC", "BDC"]:
+            if cand in cols and row.get(cand):
+                lines.append(f"🧾 BDC : {row.get(cand)}")
+                break
+
+        # ------------------
+        # Séparation navettes
+        # ------------------
         lines.append("")
 
     return "\n".join(lines).strip()
-
 
 
 
@@ -1719,10 +1867,13 @@ def build_client_sms(row: pd.Series, tel_chauffeur: str) -> str:
         f"Votre chauffeur sera {ch_code} (GSM {tel_chauffeur}).\n"
         f"Merci pour votre confiance."
     )
-def build_client_sms_from_driver(row: pd.Series, ch_code: str, tel_chauffeur: str) -> str:
+def build_client_sms_from_driver(
+    row: pd.Series,
+    ch_code: str,
+    tel_chauffeur: str,
+) -> str:
     """
-    Message WhatsApp envoyé par le chauffeur au client,
-    SANS mentionner l'adresse du point de rendez-vous.
+    Message WhatsApp envoyé par le chauffeur au client.
     """
 
     # DATE
@@ -1731,21 +1882,27 @@ def build_client_sms_from_driver(row: pd.Series, ch_code: str, tel_chauffeur: st
         d_txt = d_val.strftime("%d/%m/%Y")
     else:
         try:
-            d_txt = pd.to_datetime(d_val, dayfirst=True, errors="coerce").strftime("%d/%m/%Y")
+            d_txt = pd.to_datetime(
+                d_val, dayfirst=True, errors="coerce"
+            ).strftime("%d/%m/%Y")
         except Exception:
             d_txt = str(d_val or "").strip()
 
     # HEURE
     heure = normalize_time_string(row.get("HEURE", "")) or "??:??"
 
-    # Nom du client
+    # NOM CLIENT
     nom_client = str(row.get("NOM", "") or "").strip()
     if nom_client:
-        bonjour = f"Bonjour {nom_client}, c'est votre chauffeur {ch_code} pour Airports-Lines."
+        bonjour = (
+            f"Bonjour Mr/Mme {nom_client}, "
+            f"c'est votre chauffeur {ch_code} pour Airports-Lines."
+        )
     else:
-        bonjour = f"Bonjour, c'est votre chauffeur {ch_code} pour Airports-Lines."
+        bonjour = (
+            f"Bonjour, c'est votre chauffeur {ch_code} pour Airports-Lines."
+        )
 
-    # Message SANS adresse
     lignes = [
         bonjour,
         f"Je serai bien à l'heure prévue le {d_txt} à {heure}.",
@@ -1757,6 +1914,8 @@ def build_client_sms_from_driver(row: pd.Series, ch_code: str, tel_chauffeur: st
     lignes.append("En cas de problème, n’hésitez pas à me prévenir.")
 
     return "\n".join(lignes)
+
+
 
 def show_client_messages_for_period(df_base: pd.DataFrame, start: date, nb_days: int):
     """
@@ -3167,6 +3326,20 @@ def _sort_df_by_date_heure(df: pd.DataFrame) -> pd.DataFrame:
     )
     return df
 
+def make_row_key_from_row(row: dict) -> str:
+    """
+    Génère une clé stable pour une navette,
+    indépendante de l'ID DB et résistante aux sync.
+    """
+    parts = [
+        str(row.get("DATE", "")).strip(),
+        normalize_time_string(row.get("HEURE", "")).strip(),
+        str(row.get("CH", "")).strip(),
+        str(row.get("DESIGNATION", "")).strip(),
+        str(row.get("NOM", "")).strip(),
+    ]
+    return "|".join(parts)
+
 
 def build_chauffeur_future_message(df: pd.DataFrame, ch_selected: str, from_date: date) -> str:
     lines: List[str] = []
@@ -3817,25 +3990,27 @@ def render_tab_vue_chauffeur(forced_ch=None):
 
         for _, row in df_ch.iterrows():
 
+            # ===================================================
+            # INITIALISATION (OBLIGATOIRE)
+            # ===================================================
             bloc_lines = []
-            nav_id = row.get("id")
 
+            nav_id = row.get("id")
             is_new = bool(row.get("IS_NEW", False))
             heure_txt = normalize_time_string(row.get("HEURE", "")) or "??:??"
 
             # ===================================================
             # Groupage / Partage / Attente
             # ===================================================
-            is_groupage = int(row.get("IS_GROUPAGE", 0)) == 1
-            is_partage = int(row.get("IS_PARTAGE", 0)) == 1
-            is_attente = int(row.get("IS_ATTENTE", 0)) == 1
+            is_groupage = int(row.get("IS_GROUPAGE", 0) or 0) == 1
+            is_partage = int(row.get("IS_PARTAGE", 0) or 0) == 1
+            is_attente = int(row.get("IS_ATTENTE", 0) or 0) == 1
 
             prefix = ""
             if is_groupage:
                 prefix = "🟡 [GROUPÉE] "
             elif is_partage:
                 prefix = "🟡 [PARTAGÉE] "
-
             if is_attente:
                 prefix += "⭐ "
 
@@ -3844,22 +4019,24 @@ def render_tab_vue_chauffeur(forced_ch=None):
             # ===================================================
             date_val = row.get("DATE", "")
             if isinstance(date_val, (datetime, date)):
-                date_txt = date_val.strftime("%d/%m/%Y")
+                date_obj = date_val
             else:
-                dtmp = pd.to_datetime(date_val, dayfirst=True, errors="coerce")
-                date_txt = (
-                    dtmp.strftime("%d/%m/%Y")
-                    if not pd.isna(dtmp)
-                    else ""
+                date_obj = pd.to_datetime(
+                    date_val, dayfirst=True, errors="coerce"
                 )
+
+            date_txt = (
+                date_obj.strftime("%d/%m/%Y")
+                if not pd.isna(date_obj)
+                else ""
+            )
 
             # ===================================================
             # Indisponibilité
             # ===================================================
             if is_indispo_row(row, cols):
                 end_indispo = (
-                    normalize_time_string(row.get("²²²²", ""))
-                    or "??:??"
+                    normalize_time_string(row.get("²²²²", "")) or "??:??"
                 )
                 bloc_lines.append(
                     f"📆 {date_txt} | ⏱ {heure_txt} → {end_indispo} | 🚫 Indisponible"
@@ -3867,7 +4044,7 @@ def render_tab_vue_chauffeur(forced_ch=None):
                 bloc_lines.append(
                     f"👨‍✈️ {row.get('CH', ch_selected)}"
                 )
-                st.markdown("\n".join(bloc_lines))
+                st.markdown("<br>".join(bloc_lines), unsafe_allow_html=True)
                 st.markdown("---")
                 continue
 
@@ -3881,147 +4058,149 @@ def render_tab_vue_chauffeur(forced_ch=None):
             header += f"📆 {date_txt} | ⏱ {heure_txt}"
             bloc_lines.append(header)
 
+            # ===================================================
             # Chauffeur
+            # ===================================================
             bloc_lines.append(
                 f"👨‍✈️ {row.get('CH', ch_selected)}"
             )
 
-            # Destination
-            route_text = ""
-            for cand in ["Unnamed: 8", "DESIGNATION"]:
+            # ===================================================
+            # Sens / Destination (DE / VERS + BRU / CRL / etc.)
+            # ===================================================
+            sens_txt = format_sens_ar(row.get("Unnamed: 8"))
+
+            dest_raw = ""
+            for cand in ["DESIGNATION", "DESTINATION", "DE/VERS"]:
                 if cand in cols and row.get(cand):
-                    route_text = str(row.get(cand)).strip()
-                    break
+                    dest_raw = str(row.get(cand)).strip()
+                    if dest_raw:
+                        break
 
-            route_text = resolve_client_alias(route_text)
-            if route_text:
-                bloc_lines.append(f"➡ {route_text}")
+            dest = resolve_client_alias(dest_raw)
 
+            if sens_txt and dest:
+                bloc_lines.append(f"➡ {sens_txt} ({dest})")
+            elif sens_txt:
+                bloc_lines.append(f"➡ {sens_txt}")
+            elif dest:
+                bloc_lines.append(f"➡ {dest}")
+
+            # ===================================================
             # Client
+            # ===================================================
             nom = str(row.get("NOM", "") or "").strip()
             if nom:
                 bloc_lines.append(f"🧑 {nom}")
 
             # ===================================================
-            # NUMÉRO DE BDC
+            # BDC
             # ===================================================
-            num_bdc = ""
             for cand in ["NUM BDC", "Num BDC", "NUM_BDC", "BDC"]:
                 if cand in cols and row.get(cand):
-                    num_bdc = str(row.get(cand)).strip()
+                    bloc_lines.append(
+                        f"🧾 BDC : {str(row.get(cand)).strip()}"
+                    )
                     break
 
-            if num_bdc:
-                bloc_lines.append(f"🧾 BDC : {num_bdc}")
-
-
             # ===================================================
-            # Véhicule (SIÈGE BÉBÉ / RÉHAUSSEUR)
+            # Véhicule
             # ===================================================
             immat = str(row.get("IMMAT", "") or "").strip()
-            siege_bebe = extract_positive_int(row.get("SIEGE", row.get("SIÈGE")))
-            reh_n = extract_positive_int(row.get("REH"))
-
             if immat:
                 bloc_lines.append(f"🚘 Plaque : {immat}")
 
+            siege_bebe = extract_positive_int(row.get("SIEGE", row.get("SIÈGE")))
             if siege_bebe:
                 bloc_lines.append(f"🍼 Siège bébé : {siege_bebe}")
 
+            reh_n = extract_positive_int(row.get("REH"))
             if reh_n:
                 bloc_lines.append(f"🪑 Rehausseur : {reh_n}")
 
-
-            # Adresse
+            # ===================================================
+            # Adresse / Téléphone
+            # ===================================================
             adr_full = build_full_address_from_row(row)
             if adr_full:
                 bloc_lines.append(f"📍 {adr_full}")
 
-            # Téléphone
             client_phone = get_client_phone_from_row(row)
+            tel_clean = clean_phone(client_phone) if client_phone else ""
+
             if client_phone:
-                tel_clean = clean_phone(client_phone)
                 bloc_lines.append(
                     f"📞 Client : [{client_phone}](tel:{tel_clean})"
                 )
 
             # ===================================================
-            # Paiement / PAX (ULTRA LISIBLE)
+            # Paiement / PAX
             # ===================================================
             pay_lines = []
 
             if row.get("PAX"):
                 pay_lines.append(f"👥 {row.get('PAX')} pax")
 
-            paiement = str(row.get("PAIEMENT", "") or "").lower()
+            paiement = str(row.get("PAIEMENT", "") or "").lower().strip()
             caisse = row.get("Caisse")
 
             if paiement == "facture":
                 pay_lines.append("🧾 **FACTURE**")
-
             elif paiement == "caisse" and caisse:
                 pay_lines.append(
                     "<span style='color:#d32f2f;font-weight:800;'>"
-                    f"💶 {caisse} € (CASH)"
-                    "</span>"
+                    f"💶 {caisse} € (CASH)</span>"
                 )
-
             elif paiement == "bancontact" and caisse:
                 pay_lines.append(
                     "<span style='color:#1976d2;font-weight:800;'>"
-                    f"💳 {caisse} € (BANCONTACT)"
-                    "</span>"
+                    f"💳 {caisse} € (BANCONTACT)</span>"
                 )
 
             if pay_lines:
                 bloc_lines.append(" | ".join(pay_lines))
 
             # ===================================================
-            # GO (sans libellé)
+            # GO
             # ===================================================
             go_val = str(row.get("GO", "") or "").strip()
             if go_val:
                 bloc_lines.append(f"🟢 {go_val}")
 
+            # ===================================================
             # Confirmation
-            if is_navette_confirmed(row):
+            # ===================================================
+            row_key = make_row_key_from_row(row.to_dict())
+
+            if is_row_confirmed(ch_selected, row_key):
                 bloc_lines.append("✅ **Navette confirmée**")
+            else:
+                bloc_lines.append("🕒 **À confirmer**")
 
             # ===================================================
-            # Actions
+            # ✈️ Vol – statut (UNIQUEMENT AUJOURD'HUI)
             # ===================================================
-            actions = []
-
-            if client_phone:
-                actions.append(
-                    f"[📞 Appeler client](tel:{tel_clean})"
-                )
-
-            if adr_full:
-                waze = build_waze_link(adr_full)
-                gmaps = build_google_maps_link(adr_full)
-
-                if waze != "#":
-                    actions.append(f"[🧭 Waze]({waze})")
-                if gmaps != "#":
-                    actions.append(f"[🗺 Google Maps]({gmaps})")
-
-            if client_phone and tel_ch:
-                wa = build_whatsapp_link(
-                    client_phone,
-                    build_client_sms_from_driver(
-                        row, ch_selected, tel_ch
-                    ),
-                )
-                actions.append(f"[💬 WhatsApp client]({wa})")
-
-            if actions:
-                bloc_lines.append(" | ".join(actions))
-
-            # Vol
             vol = extract_vol_val(row, cols)
-            if vol:
+            if (
+                vol
+                and isinstance(date_obj, (datetime, date))
+                and date_obj == today
+            ):
                 bloc_lines.append(f"✈️ Vol {vol}")
+
+                status, delay_min, *_ = get_flight_status_cached(vol)
+                badge = flight_badge(status, delay_min)
+
+                if badge:
+                    bloc_lines.append(f"📡 {badge}")
+
+                if (
+                    delay_min is not None
+                    and delay_min >= FLIGHT_ALERT_DELAY_MIN
+                ):
+                    bloc_lines.append(
+                        f"🚨 **ATTENTION : retard {delay_min} min**"
+                    )
 
             # ===================================================
             # AFFICHAGE FINAL
@@ -4030,12 +4209,11 @@ def render_tab_vue_chauffeur(forced_ch=None):
                 "<br>".join(bloc_lines),
                 unsafe_allow_html=True,
             )
-
             # ===================================================
             # Saisie chauffeur
             # ===================================================
-            trajet_key = f"trajet_nav_{nav_id}"
-            prob_key = f"prob_nav_{nav_id}"
+            trajet_key = f"trajet_{row_key}"
+            prob_key = f"prob_{row_key}"
 
             st.session_state.setdefault(trajet_key, "")
             st.session_state.setdefault(prob_key, "")
@@ -4068,8 +4246,6 @@ def render_tab_vue_chauffeur(forced_ch=None):
                 file_name=f"planning_{ch_selected}.pdf",
                 mime="application/pdf",
             )
-
-
 
 def export_chauffeur_planning_pdf(df_ch: pd.DataFrame, ch: str):
     buffer = io.BytesIO()
@@ -4280,6 +4456,36 @@ def export_chauffeur_planning_pdf(df_ch: pd.DataFrame, ch: str):
         st.success(f"✅ {nb_remplies} navette(s) envoyée(s) au bureau.")
         st.rerun()
 
+def mark_new_rows_for_chauffeur(
+    df: pd.DataFrame,
+    ch_code: str,
+) -> pd.DataFrame:
+    """
+    Marque les navettes 🆕 si elles ont été modifiées
+    après la dernière confirmation du chauffeur.
+    """
+
+    last_ack = get_chauffeur_last_ack(ch_code)
+
+    # Chauffeur n'a jamais confirmé → tout est nouveau
+    if not last_ack:
+        df["IS_NEW"] = True
+        return df
+
+    def _is_new(row):
+        upd = row.get("UPDATED_AT")
+        if not upd:
+            return False
+
+        try:
+            upd_dt = pd.to_datetime(upd)
+        except Exception:
+            return False
+
+        return upd_dt > last_ack
+
+    df["IS_NEW"] = df.apply(_is_new, axis=1)
+    return df
 
 # ============================================================
 #   🚖 ONGLET CHAUFFEUR — MON PLANNING COMPLET
@@ -4313,20 +4519,22 @@ def render_tab_chauffeur_driver():
     if scope == "📍 Aujourd’hui":
         from_date = today
         to_date = today
-        mode_all = False
         scope_label = "du jour"
 
     elif scope == "➡️ À partir de demain":
         from_date = today + timedelta(days=1)
         to_date = None
-        mode_all = False
         scope_label = "à partir de demain"
 
     else:  # 📆 Tout
         from_date = None
         to_date = None
-        mode_all = False   # ⚠️ chauffeur = uniquement SES navettes
         scope_label = "complet"
+
+    # ===================================================
+    # 🔄 AUTO-SYNC SILENCIEUSE (DROPBOX → DB)
+    # ===================================================
+    auto_sync_planning_if_needed(silent=True)
 
     # ===================================================
     # 🔄 CHARGEMENT DU PLANNING
@@ -4342,13 +4550,32 @@ def render_tab_chauffeur_driver():
         return
 
     df_ch = _sort_df_by_date_heure(df_ch)
+    # ===================================================
+    # 🔑 CALCUL DU ROW_KEY (OBLIGATOIRE POUR CONFIRMATION)
+    # ===================================================
+    if "ROW_KEY" not in df_ch.columns and "row_key" not in df_ch.columns:
+        df_ch = df_ch.copy()
+        df_ch["ROW_KEY"] = df_ch.apply(
+            lambda r: make_row_key_from_row(r.to_dict()),
+            axis=1,
+        )
+
+    # ===================================================
+    # 🆕 MARQUAGE DES LIGNES NOUVELLES / MODIFIÉES
+    # ===================================================
+    df_ch = mark_new_rows_for_chauffeur(df_ch, ch_selected)
+
     cols = df_ch.columns.tolist()
 
     # ===================================================
     # 📄 PDF
     # ===================================================
     st.markdown("### 📄 Mon planning")
-    if st.button("📄 Télécharger mon planning en PDF"):
+
+    if st.button(
+        "📄 Télécharger mon planning en PDF",
+        key=f"pdf_chauffeur_{ch_selected}_{scope}",
+    ):
         pdf = export_chauffeur_planning_pdf(df_ch, ch_selected)
         st.download_button(
             label="⬇️ Télécharger le PDF",
@@ -4366,6 +4593,7 @@ def render_tab_chauffeur_driver():
 
         nav_id = row.get("id")
         bloc = []
+        actions = []
 
         # ------------------
         # Flags groupage / partage / attente
@@ -4391,20 +4619,25 @@ def render_tab_chauffeur_driver():
         # ------------------
         # Confirmation
         # ------------------
-        if is_navette_confirmed(row):
+        row_key = make_row_key_from_row(row.to_dict())
+
+        if is_row_confirmed(ch_selected, row_key):
             bloc.append("✅ **Navette confirmée**")
         else:
             bloc.append("🕒 **À confirmer**")
+
 
         # ------------------
         # Date / Heure
         # ------------------
         dv = row.get("DATE")
-        if isinstance(dv, date):
-            date_txt = dv.strftime("%d/%m/%Y")
+        if isinstance(dv, (datetime, date)):
+            date_obj = dv if isinstance(dv, date) else dv.date()
+            date_txt = date_obj.strftime("%d/%m/%Y")
         else:
             dtmp = pd.to_datetime(dv, dayfirst=True, errors="coerce")
-            date_txt = dtmp.strftime("%d/%m/%Y") if not pd.isna(dtmp) else ""
+            date_obj = dtmp.date() if not pd.isna(dtmp) else None
+            date_txt = date_obj.strftime("%d/%m/%Y") if date_obj else ""
 
         heure_txt = normalize_time_string(row.get("HEURE")) or "??:??"
         bloc.append(f"{prefix}📆 {date_txt} | ⏱ {heure_txt}")
@@ -4413,9 +4646,22 @@ def render_tab_chauffeur_driver():
         # Sens / Destination
         # ------------------
         sens_txt = format_sens_ar(row.get("Unnamed: 8"))
-        dest = resolve_client_alias(str(row.get("DESIGNATION", "") or "").strip())
-        if sens_txt or dest:
-            bloc.append(f"➡ {sens_txt} ({dest})".strip())
+
+        dest_raw = ""
+        for cand in ["DESIGNATION", "DESTINATION", "DE/VERS"]:
+            if cand in cols and row.get(cand):
+                dest_raw = str(row.get(cand)).strip()
+                if dest_raw:
+                    break
+
+        dest = resolve_client_alias(dest_raw)
+
+        if sens_txt and dest:
+            bloc.append(f"➡ {sens_txt} ({dest})")
+        elif sens_txt:
+            bloc.append(f"➡ {sens_txt}")
+        elif dest:
+            bloc.append(f"➡ {dest}")
 
         # ------------------
         # Client
@@ -4439,8 +4685,9 @@ def render_tab_chauffeur_driver():
         # ------------------
         # 🚘 Véhicule (SIÈGE BÉBÉ / RÉHAUSSEUR)
         # ------------------
-        if row.get("IMMAT"):
-            bloc.append(f"🚘 Plaque : {row.get('IMMAT')}")
+        immat = str(row.get("IMMAT", "") or "").strip()
+        if immat:
+            bloc.append(f"🚘 Plaque : {immat}")
 
         siege_bebe = extract_positive_int(row.get("SIEGE", row.get("SIÈGE")))
         if siege_bebe:
@@ -4451,11 +4698,18 @@ def render_tab_chauffeur_driver():
             bloc.append(f"🪑 Rehausseur : {reh_n}")
 
         # ------------------
-        # Adresse / Tel
+        # Adresse / GPS
         # ------------------
         adr = build_full_address_from_row(row)
-        if adr:
-            bloc.append(f"📍 {adr}")
+        adr_gps = normalize_address_for_gps(adr)
+
+        if adr_gps:
+            actions.append(
+                f"[🧭 Waze]({build_waze_link(adr_gps)})"
+            )
+            actions.append(
+                f"[🗺 Google Maps]({build_google_maps_link(adr_gps)})"
+            )
 
         tel = get_client_phone_from_row(row)
         if tel:
@@ -4480,16 +4734,24 @@ def render_tab_chauffeur_driver():
                 f"💳 {caisse} € (BANCONTACT)</span>"
             )
 
-        # ------------------
-        # Vol + statut
-        # ------------------
+        # ===================================================
+        # ✈️ Vol – statut (UNIQUEMENT AUJOURD'HUI)
+        # ===================================================
         vol = extract_vol_val(row, cols)
-        if vol:
+        if vol and date_obj == today:
+
             bloc.append(f"✈️ Vol {vol}")
+
             status, delay_min, *_ = get_flight_status_cached(vol)
             badge = flight_badge(status, delay_min)
+
             if badge:
                 bloc.append(f"📡 {badge}")
+
+            if delay_min is not None and delay_min >= FLIGHT_ALERT_DELAY_MIN:
+                bloc.append(
+                    f"🚨 **ATTENTION : retard {delay_min} min**"
+                )
 
         # ------------------
         # GO
@@ -4501,87 +4763,126 @@ def render_tab_chauffeur_driver():
         # ------------------
         # 🧾 BDC (juste après GO)
         # ------------------
-        num_bdc = ""
         for cand in ["NUM BDC", "Num BDC", "NUM_BDC", "BDC"]:
             if cand in cols and row.get(cand):
-                num_bdc = str(row.get(cand)).strip()
+                bloc.append(f"🧾 **BDC : {row.get(cand)}**")
                 break
 
-        if num_bdc:
-            bloc.append(f"🧾 **BDC : {num_bdc}**")
+        # 📞 Numéro CLIENT
+        tel_client = get_client_phone_from_row(row)
 
-        # ------------------
-        # Actions
-        # ------------------
-        actions = []
+        # 📱 Numéro CHAUFFEUR (Feuil2 → PHONE)
+        tel_chauffeur = get_chauffeur_phone(ch_selected)
 
-        if tel:
-            actions.append(f"[📞 Appeler](tel:{clean_phone(tel)})")
+        if tel_client:
+            actions.append(f"[📞 Appeler](tel:{clean_phone(tel_client)})")
 
         if adr:
             actions.append(f"[🧭 Waze]({build_waze_link(adr)})")
             actions.append(f"[🗺 Google Maps]({build_google_maps_link(adr)})")
 
-        if tel:
-            msg = build_client_sms_from_driver(row, ch_selected, tel)
-            actions.append(f"[💬 WhatsApp]({build_whatsapp_link(tel, msg)})")
+        # 💬 WhatsApp : vers le CLIENT, avec le numéro du CHAUFFEUR dans le message
+        if tel_client and tel_chauffeur:
+            msg = build_client_sms_from_driver(
+                row=row,
+                ch_code=ch_selected,
+                tel_chauffeur=tel_chauffeur,
+            )
+
+            actions.append(
+                f"[💬 WhatsApp]({build_whatsapp_link(tel_client, msg)})"
+            )
 
         if actions:
             bloc.append(" | ".join(actions))
+
 
         # ------------------
         # Affichage
         # ------------------
         st.markdown("<br>".join(bloc), unsafe_allow_html=True)
 
-        # ------------------
-        # Saisie chauffeur
-        # ------------------
-        trajet_key = f"trajet_nav_{nav_id}"
-        prob_key = f"prob_nav_{nav_id}"
+        # =========================
+        # 🔑 ROW_KEY
+        # =========================
+        row_key = (
+            row.get("ROW_KEY")
+            or row.get("row_key")
+            or row.get("id")
+            or nav_id
+            or ""
+        )
+        row_key = str(row_key).strip()
 
-        st.text_input("Trajet compris", key=trajet_key)
+        # =========================
+        # 📝 SAISIE CHAUFFEUR (PAS D’ENVOI ICI)
+        # =========================
+        trajet_key = f"trajet_{row_key}"
+        prob_key = f"prob_{row_key}"
+
+        st.text_input(
+            "Trajet compris",
+            key=trajet_key,
+        )
 
         with st.expander("🚨 Signaler un problème"):
-            st.text_area("Décrire le problème", key=prob_key)
+            st.text_area(
+                "Décrire le problème",
+                key=prob_key,
+            )
 
         st.markdown("---")
-
-
     # ===================================================
-    # 📤 ENVOI CONFIRMATION
+    # 📤 ENVOI GLOBAL DES INFORMATIONS CHAUFFEUR
     # ===================================================
-    if st.button("📤 Envoyer mes informations"):
+    st.markdown("### 📤 Envoi des informations chauffeur")
+
+    if st.button("📤 Envoyer toutes mes informations"):
         recap = []
 
         for _, row in df_ch.iterrows():
-            nav_id = row.get("id")
-            trajet = st.session_state.get(f"trajet_nav_{nav_id}", "").strip()
-            prob = st.session_state.get(f"prob_nav_{nav_id}", "").strip()
 
-            if trajet or prob:
-                recap.append(
-                    format_navette_ack(
-                        row=row,
-                        ch_selected=ch_selected,
-                        trajet=trajet,
-                        probleme=prob,
-                    )
+            nav_id = row.get("id")
+
+            row_key = (
+                row.get("ROW_KEY")
+                or row.get("row_key")
+                or row.get("id")
+                or nav_id
+                or ""
+            )
+            row_key = str(row_key).strip()
+
+            trajet = st.session_state.get(f"trajet_{row_key}", "") or ""
+            prob = st.session_state.get(f"prob_{row_key}", "") or ""
+
+            if not trajet and not prob:
+                continue
+
+            recap.append(
+                format_navette_ack(
+                    row=row,
+                    ch_selected=ch_selected,
+                    trajet=trajet,
+                    probleme=prob,
                 )
-                mark_navette_confirmed(nav_id, ch_selected)
+            )
+
+            if row_key:
+                confirm_navette_row(ch_selected, row_key)
 
         if not recap:
             st.warning("Aucune information encodée.")
-            return
+        else:
+            send_mail_admin(
+                subject=f"[INFOS CHAUFFEUR] {ch_selected}",
+                body="\n\n".join(recap),
+            )
 
-        send_mail_admin(
-            subject=f"[INFOS CHAUFFEUR] {ch_selected}",
-            body="\n\n".join(recap),
-        )
+            set_chauffeur_last_ack(ch_selected)
+            st.success("✅ Toutes les informations ont été envoyées.")
+            st.rerun()
 
-        set_chauffeur_last_ack(ch_selected)
-        st.success("✅ Confirmation enregistrée.")
-        st.rerun()
 
 
 
@@ -5320,7 +5621,7 @@ def main():
     # ======================================
     if not st.session_state.logged_in:
         login_screen()
-        return
+        st.stop()
 
     # ======================================
     # 4️⃣ UI PRINCIPALE
@@ -5441,4 +5742,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()

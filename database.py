@@ -562,7 +562,6 @@ def insert_planning_row(data: Dict[str, Any]) -> int:
         return cur.lastrowid
 
 
-
 def update_planning_row(row_id: int, data: Dict[str, Any]) -> None:
     """
     Met à jour une navette existante (par id) avec les colonnes fournies.
@@ -581,14 +580,14 @@ def update_planning_row(row_id: int, data: Dict[str, Any]) -> None:
 
     set_parts = []
     values: List[Any] = []
+
     for col, val in data.items():
         set_parts.append(f'"{col}" = ?')
         values.append(sqlite_safe(val))
 
+    # ⚠️ UNE SEULE FOIS
     values.append(row_id)
 
-
-    values.append(row_id)
     set_clause = ", ".join(set_parts)
 
     with get_connection() as conn:
@@ -596,6 +595,7 @@ def update_planning_row(row_id: int, data: Dict[str, Any]) -> None:
         sql = f"UPDATE planning SET {set_clause} WHERE id = ?"
         cur.execute(sql, values)
         conn.commit()
+
 
 
 
@@ -778,6 +778,86 @@ def init_chauffeur_ack_table() -> None:
             """
         )
         conn.commit()
+
+def init_chauffeur_ack_rows_table():
+    with get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS chauffeur_ack_rows (
+                chauffeur TEXT NOT NULL,
+                row_key TEXT NOT NULL,
+                confirmed_at TIMESTAMP NOT NULL,
+                PRIMARY KEY (chauffeur, row_key)
+            )
+        """)
+        conn.commit()
+
+def confirm_navette_row(chauffeur: str, row_key: str):
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO chauffeur_ack_rows
+            (chauffeur, row_key, confirmed_at)
+            VALUES (?, ?, ?)
+            """,
+            (chauffeur, row_key, datetime.now()),
+        )
+        conn.commit()
+
+def get_chauffeur_phone(ch_code: str) -> str:
+    """
+    Retourne le numéro GSM du chauffeur depuis la table 'chauffeurs' (Feuil2).
+
+    - ch_code : FA, DO, NP, GD, FA1, etc.
+    - correspond à la colonne INITIALE
+    """
+    if not ch_code:
+        return ""
+
+    ch = str(ch_code).strip().upper()
+
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT PHONE
+                FROM chauffeurs
+                WHERE UPPER(TRIM(INITIALE)) = ?
+                LIMIT 1
+                """,
+                (ch,),
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                return str(row[0]).strip()
+    except Exception as e:
+        print("❌ get_chauffeur_phone error:", e)
+
+    return ""
+
+
+
+def is_row_confirmed(chauffeur: str, row_key: str) -> bool:
+    """
+    Retourne True si le chauffeur a confirmé cette navette (row_key).
+    """
+    if not chauffeur or not row_key:
+        return False
+
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT 1
+            FROM chauffeur_ack_rows
+            WHERE chauffeur = ?
+              AND row_key = ?
+            LIMIT 1
+            """,
+            (chauffeur, row_key),
+        )
+        return cur.fetchone() is not None
+
 
 
 def get_chauffeur_last_ack(chauffeur: str) -> Optional[datetime]:
