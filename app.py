@@ -117,7 +117,7 @@ USERS = {
     "np": {"password": "np", "role": "driver", "chauffeur_code": "NP"},
     "do": {"password": "do", "role": "driver", "chauffeur_code": "DO"},
     "ma": {"password": "ma", "role": "driver", "chauffeur_code": "MA"},
-    "fa1": {"password": "fa1", "role": "driver", "chauffeur_code": "FA1"},
+    "po": {"password": "po", "role": "driver", "chauffeur_code": "PO"},
     "gd": {"password": "gd", "role": "driver", "chauffeur_code": "GD"},
     "om": {"password": "om", "role": "driver", "chauffeur_code": "OM"},
     "ad": {"password": "ad", "role": "driver", "chauffeur_code": "AD"},
