@@ -4641,6 +4641,13 @@ def render_tab_chauffeur_driver():
 
         heure_txt = normalize_time_string(row.get("HEURE")) or "??:??"
         bloc.append(f"{prefix}📆 {date_txt} | ⏱ {heure_txt}")
+        # ------------------
+        # Adresse de départ
+        # ------------------
+        adresse_depart = build_full_address_from_row(row)
+        if adresse_depart:
+            bloc.append(f"📍  {adresse_depart}")
+
 
         # ------------------
         # Sens / Destination
