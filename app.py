@@ -470,16 +470,26 @@ def load_planning_from_dropbox(sheet_name: str | None = None) -> pd.DataFrame:
 
     try:
         bio = BytesIO(content)
+
+        # 📌 Règle des en-têtes selon la feuille
+        if sheet_name == "Feuil1":
+            header_row = 1   # en-tête ligne 2
+        else:
+            header_row = 0   # Feuil2, Feuil3 → ligne 1
+
         df = pd.read_excel(
             bio,
             sheet_name=sheet_name,
             engine="openpyxl",
-            header=1  # ⬅️ en-tête sur la ligne 2
+            header=header_row
         )
+
         return df.fillna("")
+
     except Exception as e:
-        st.error(f"❌ Erreur lecture Excel : {e}")
+        st.error(f"❌ Erreur lecture Excel ({sheet_name}) : {e}")
         return pd.DataFrame()
+
 
 
 def get_dropbox_file_last_modified() -> datetime | None:
@@ -5753,3 +5763,4 @@ if __name__ == "__main__":
 
 
     main()
+
