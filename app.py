@@ -470,7 +470,12 @@ def load_planning_from_dropbox(sheet_name: str | None = None) -> pd.DataFrame:
 
     try:
         bio = BytesIO(content)
-        df = pd.read_excel(bio, sheet_name=sheet_name, engine="openpyxl")
+        df = pd.read_excel(
+            bio,
+            sheet_name=sheet_name,
+            engine="openpyxl",
+            header=1  # ⬅️ en-tête sur la ligne 2
+        )
         return df.fillna("")
     except Exception as e:
         st.error(f"❌ Erreur lecture Excel : {e}")
@@ -5745,5 +5750,6 @@ def main():
 
 
 if __name__ == "__main__":
+
 
     main()
