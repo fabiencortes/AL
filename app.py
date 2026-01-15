@@ -63,6 +63,7 @@ from database import (
     split_chauffeurs,
     ensure_planning_row_key_column,
     ensure_planning_row_key_index,
+    get_planning_table_columns,
 )
 # ============================================================
 #   SESSION STATE
@@ -108,7 +109,7 @@ USERS = {
     "np": {"password": "np", "role": "driver", "chauffeur_code": "NP"},
     "do": {"password": "do", "role": "driver", "chauffeur_code": "DO"},
     "ma": {"password": "ma", "role": "driver", "chauffeur_code": "MA"},
-    "fa1": {"password": "fa1", "role": "driver", "chauffeur_code": "FA1"},
+    "po": {"password": "po", "role": "driver", "chauffeur_code": "PO"},
     "gd": {"password": "gd", "role": "driver", "chauffeur_code": "GD"},
     "om": {"password": "om", "role": "driver", "chauffeur_code": "OM"},
     "ad": {"password": "ad", "role": "driver", "chauffeur_code": "AD"},
@@ -118,7 +119,7 @@ USERS = {
 CH_CODES = [
     "AU", "FA", "GD", "GG", "LL", "MA", "O", "RK", "RO", "SW", "NP", "DO",
     "OM", "AD", "CB", "CF", "CM", "EM", "GE", "HM", "JF", "KM", "LILLO",
-    "MF", "WS", "FA1"
+    "MF", "WS", "PO"
 ]
 
 # ============================================================
@@ -915,16 +916,46 @@ def sync_planning_from_today():
     # ======================================================
     inserts = 0
 
+    # 🔑 Colonnes réellement présentes dans la table planning
+    planning_cols = get_planning_table_columns()
+
+    # 🧠 Mapping Excel → DB (noms différents)
+    EXCEL_TO_DB_COLS = {
+        "N° Vol": "N° Vol",
+        "Num BDC": "Num BDC",
+        "NUM BDC": "Num BDC",
+        "BDC": "Num BDC",
+        "Paiement": "PAIEMENT",
+        "PAIEMENT": "PAIEMENT",
+        "Caisse": "Caisse",
+        "GO": "GO",
+        "Reh": "Reh",
+        "REH": "Reh",
+        "Siège": "Siège",
+    }
+
     for _, row in df_excel.iterrows():
+
         if not row["row_key"]:
             continue  # sécurité ultime
 
-        data = {
-            col: sqlite_safe(row.get(col))
-            for col in df_excel.columns
-            if col not in ("id",)
-        }
+        data = {}
 
+        # 1️⃣ Copier les colonnes IDENTIQUES Excel → DB
+        for col in df_excel.columns:
+            if col in planning_cols and col not in ("id",):
+                val = row.get(col)
+                if val not in (None, "", "nan"):
+                    data[col] = sqlite_safe(val)
+
+        # 2️⃣ Mapping Excel → DB (noms différents)
+        for excel_col, db_col in EXCEL_TO_DB_COLS.items():
+            if excel_col in df_excel.columns and db_col in planning_cols:
+                val = row.get(excel_col)
+                if val not in (None, "", "nan"):
+                    data[db_col] = sqlite_safe(val)
+
+        # 3️⃣ Champs techniques
         data["row_key"] = row["row_key"]
         data["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -934,6 +965,7 @@ def sync_planning_from_today():
                 inserts += 1
         except Exception:
             pass
+
 
     # ======================================================
     # 7️⃣ Recréer les vues
@@ -1423,7 +1455,6 @@ init_session_state()
 if st.session_state.get("logged_in") is not True:
     login_screen()
     st.stop()
-
 
 def get_chauffeurs_for_ui() -> List[str]:
     """
@@ -4894,23 +4925,24 @@ def render_tab_chauffeur_driver():
             )
 
         # ===================================================
-        # ✈️ Vol – statut (UNIQUEMENT AUJOURD'HUI)
+        # ✈️ Vol – TOUJOURS AFFICHÉ / STATUT = JOUR J
         # ===================================================
         vol = extract_vol_val(row, cols)
-        if vol and date_obj == today:
+        if vol:
+            bloc.append(f"✈️ Vol **{vol}**")
 
-            bloc.append(f"✈️ Vol {vol}")
+            # 🔎 Vérification statut UNIQUEMENT le jour J
+            if date_obj and date_obj == today:
+                status, delay_min, *_ = get_flight_status_cached(vol)
+                badge = flight_badge(status, delay_min)
 
-            status, delay_min, *_ = get_flight_status_cached(vol)
-            badge = flight_badge(status, delay_min)
+                if badge:
+                    bloc.append(f"📡 {badge}")
 
-            if badge:
-                bloc.append(f"📡 {badge}")
-
-            if delay_min is not None and delay_min >= FLIGHT_ALERT_DELAY_MIN:
-                bloc.append(
-                    f"🚨 **ATTENTION : retard {delay_min} min**"
-                )
+                if delay_min is not None and delay_min >= FLIGHT_ALERT_DELAY_MIN:
+                    bloc.append(
+                        f"🚨 **ATTENTION : retard {delay_min} min**"
+                    )
 
         # ------------------
         # GO
@@ -5489,11 +5521,13 @@ def render_tab_admin_transferts():
     with tab_transferts:
 
         today = date.today()
+        start_60j = today - timedelta(days=60)
+
         col1, col2 = st.columns(2)
         with col1:
             start_date = st.date_input(
                 "Date de début",
-                value=today.replace(day=1),
+                value=start_60j,
                 key="admin_start_date",
             )
         with col2:
@@ -5503,7 +5537,7 @@ def render_tab_admin_transferts():
                 key="admin_end_date",
             )
 
-        # ✅ ADMIN = planning_full
+        # ✅ ADMIN = HISTORIQUE COMPLET (60 derniers jours par défaut)
         df = get_planning(
             start_date=start_date,
             end_date=end_date,
@@ -5511,24 +5545,18 @@ def render_tab_admin_transferts():
             type_filter=None,
             search="",
             max_rows=5000,
-            source="7j",
+            source="full",   # ⬅️ IMPORTANT
         )
-        st.write("DEBUG nb lignes total:", len(df))
-        if not df.empty and "DATE" in df.columns:
-            st.write("DEBUG min date:", df["DATE"].min())
-            st.write("DEBUG max date:", df["DATE"].max())
-        # 🔧 NORMALISATION DATE (ADMIN TRANSFERTS)
-        import pandas as pd
 
-        if "DATE" in df.columns:
+        # 🔧 NORMALISATION DATE (ADMIN TRANSFERTS)
+        if not df.empty and "DATE" in df.columns:
             df["DATE"] = pd.to_datetime(
                 df["DATE"],
                 dayfirst=True,
                 errors="coerce"
             ).dt.date
 
-
-        # ✅ Appliquer les overrides + flag Excel
+        # ✅ Appliquer les overrides + flags Excel
         try:
             df = apply_actions_overrides(df)
         except Exception:
@@ -5537,6 +5565,7 @@ def render_tab_admin_transferts():
         if df.empty:
             st.warning("Aucun transfert pour cette période.")
             return
+
 
         # 🔽 Filtres avancés
         col3, col4, col5 = st.columns(3)
