@@ -161,16 +161,6 @@ def get_planning(
     max_rows=2000,
     source="7j",   # "day" | "7j" | "full"
 ) -> pd.DataFrame:
-    """
-    Retourne un DataFrame filtré depuis la DB.
-
-    source :
-        - "day"  -> planning_day   (vue jour mobile)
-        - "7j"   -> planning_7j    (planning / édition / chauffeur)
-        - "full" -> planning_full  (admin / clients / historique)
-    """
-    ...
-
 
     # =========================
     # Choix de la table
@@ -183,7 +173,7 @@ def get_planning(
         table = "planning_7j"
 
     # =========================
-    # Lecture DB
+    # Lecture DB (ORDER BY robuste)
     # =========================
     try:
         with get_connection() as conn:
@@ -191,7 +181,7 @@ def get_planning(
                 f"""
                 SELECT *
                 FROM {table}
-                ORDER BY DATE_ISO, HEURE
+                ORDER BY DATE, HEURE
                 LIMIT ?
                 """,
                 conn,
@@ -208,21 +198,15 @@ def get_planning(
     # Conversion DATE propre
     # =========================
     if "DATE" in df.columns:
-        df["DATE"] = pd.to_datetime(
-            df["DATE"],
-            dayfirst=True,
-            errors="coerce"
-        ).dt.date
+        df["DATE"] = pd.to_datetime(df["DATE"], dayfirst=True, errors="coerce").dt.date
 
     # =========================
-    # Filtre date (si demandé)
+    # Filtre date
     # =========================
     if start_date or end_date:
         if "DATE" in df.columns:
             def _keep_date(d):
-                if pd.isna(d):
-                    return False
-                if not isinstance(d, date):
+                if pd.isna(d) or not isinstance(d, date):
                     return False
                 if start_date and d < start_date:
                     return False
@@ -247,7 +231,6 @@ def get_planning(
             next_char = ch_series.str.slice(len(ch), len(ch) + 1)
             mask_non_digit_after = (next_char == "") | (~next_char.str.match(r"\d"))
             mask_prefix = starts_with & mask_non_digit_after
-
             df = df[mask_exact | mask_prefix].copy()
 
     # =========================
@@ -255,7 +238,6 @@ def get_planning(
     # =========================
     if "GO" in df.columns and type_filter:
         go_series = df["GO"].astype(str).str.strip().str.upper()
-
         if type_filter == "AL":
             df = df[~go_series.isin(["GO", "GL"])].copy()
         elif type_filter == "GO_GL":
@@ -275,10 +257,9 @@ def get_planning(
 
         df = df[df.apply(_row_match, axis=1)].copy()
 
-    return df
-
-
-    # Tri par DATE + HEURE
+    # =========================
+    # Tri final DATE + HEURE (garanti)
+    # =========================
     if "HEURE" in df.columns:
         def _heure_sort_tuple(h):
             h2 = _normalize_heure_str(h)
@@ -294,7 +275,7 @@ def get_planning(
     else:
         df["_HSORT"] = (99, 99)
 
-    sort_cols: List[str] = []
+    sort_cols = []
     if "DATE" in df.columns:
         sort_cols.append("DATE")
     sort_cols.append("_HSORT")
@@ -382,6 +363,59 @@ def get_chauffeurs() -> List[str]:
     # Tri alphabétique insensible à la casse (mais on garde la forme originale)
     all_codes = sorted(all_codes, key=lambda x: x.upper())
     return all_codes
+def split_chauffeurs(ch_raw: str) -> list[str]:
+    """
+    Décompose un code chauffeur du planning en chauffeurs réels.
+    Gère TOUS les cas :
+    FA*DO, NPFA, FADONP, FADO*NP*, FA*DONP, etc.
+    """
+
+    if not ch_raw:
+        return []
+
+    raw = str(ch_raw).upper().replace("*", "").strip()
+
+    try:
+        with get_connection() as conn:
+            df = pd.read_sql_query("SELECT INITIALE FROM chauffeurs", conn)
+        known = (
+            df["INITIALE"]
+            .astype(str)
+            .str.strip()
+            .str.upper()
+            .tolist()
+        )
+    except Exception:
+        known = []
+
+    if not known:
+        known = ["FA1", "FA", "DO", "NP", "AD", "GG", "MA", "OM"]
+
+    known = sorted(set(known), key=len, reverse=True)
+
+    found = []
+    remaining = raw
+
+    while remaining:
+        matched = False
+        for ch in known:
+            if remaining.startswith(ch):
+                found.append(ch)
+                remaining = remaining[len(ch):]
+                matched = True
+                break
+        if not matched:
+            remaining = remaining[1:]
+
+    result = []
+    seen = set()
+    for ch in found:
+        if ch not in seen:
+            seen.add(ch)
+            result.append(ch)
+
+    return result
+
 
 @st.cache_data(ttl=300)
 def get_chauffeur_planning(
@@ -530,21 +564,34 @@ def get_row_by_id(row_id: int) -> Optional[Dict[str, Any]]:
         data = {cols[i]: row[i] for i in range(len(cols))}
     return data
 
-
-def insert_planning_row(data: Dict[str, Any]) -> int:
+def insert_planning_row(
+    data: Dict[str, Any],
+    ignore_conflict: bool = False,
+) -> int:
     """
     Insère une nouvelle navette dans la table planning.
-    Retourne l'id créé.
+
+    - ignore_conflict=True  → INSERT OR IGNORE (anti-doublon)
+    - utilise row_key comme clé logique unique
+    - retourne :
+        • id créé
+        • -1 si insertion ignorée (doublon)
     """
+
     if not data:
         return -1
 
-    # s'assurer que la colonne existe
+    # ✅ S'assurer que la colonne updated_at existe
     ensure_planning_updated_at_column()
 
-    # Normaliser DATE en texte dd/mm/YYYY
+    # ✅ Normaliser DATE en texte dd/mm/YYYY (logique existante)
     if "DATE" in data:
         data["DATE"] = _normalize_date_str(data["DATE"])
+
+    # ⚠️ row_key STRICTEMENT obligatoire
+    if not data.get("row_key"):
+        # Interdiction ABSOLUE de recalculer le row_key ici
+        return -1
 
     # Timestamp de mise à jour
     data["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -554,12 +601,25 @@ def insert_planning_row(data: Dict[str, Any]) -> int:
     placeholders = ",".join("?" for _ in cols)
     values = [sqlite_safe(data[c]) for c in cols]
 
+    insert_mode = "INSERT OR IGNORE" if ignore_conflict else "INSERT"
+
+    sql = f"""
+        {insert_mode}
+        INTO planning ({col_list_sql})
+        VALUES ({placeholders})
+    """
+
     with get_connection() as conn:
         cur = conn.cursor()
-        sql = f"INSERT INTO planning ({col_list_sql}) VALUES ({placeholders})"
         cur.execute(sql, values)
         conn.commit()
+
+        # 🔒 Si OR IGNORE → aucun insert → lastrowid = 0
+        if ignore_conflict and cur.rowcount == 0:
+            return -1
+
         return cur.lastrowid
+
 
 
 def update_planning_row(row_id: int, data: Dict[str, Any]) -> None:
@@ -595,7 +655,243 @@ def update_planning_row(row_id: int, data: Dict[str, Any]) -> None:
         sql = f"UPDATE planning SET {set_clause} WHERE id = ?"
         cur.execute(sql, values)
         conn.commit()
+def get_planning_table_columns() -> set[str]:
+    """
+    Retourne l'ensemble des colonnes existantes
+    dans la table planning (SQLite).
+    """
+    with get_connection() as conn:
+        cur = conn.execute("PRAGMA table_info(planning)")
+        return {row[1] for row in cur.fetchall()}
+def ensure_planning_row_key_column():
+    """
+    S'assure que la colonne row_key existe dans la table planning.
+    """
+    with get_connection() as conn:
+        cur = conn.execute("PRAGMA table_info(planning)")
+        cols = {row[1] for row in cur.fetchall()}
 
+        if "row_key" not in cols:
+            conn.execute('ALTER TABLE planning ADD COLUMN "row_key" TEXT')
+            conn.commit()
+def ensure_planning_row_key_index():
+    with get_connection() as conn:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_planning_row_key "
+            "ON planning(row_key)"
+        )
+        conn.commit()
+
+
+def rebuild_planning_db_from_two_excel_files(file_1, file_2) -> int:
+    """
+    🔥 Reconstruction complète de la DB (table planning)
+    à partir de 2 fichiers Excel (ex: Planning 2025 + Planning 2026).
+
+    - Supprime toute la table planning
+    - Réimporte Feuil1 des 2 fichiers
+    - Déduplique par row_key (zéro doublon)
+    - Recrée les vues SQL
+    - Réimporte Feuil2 et Feuil3 (depuis le 2e fichier si possible, sinon le 1er)
+    """
+
+    import pandas as pd
+    from io import BytesIO
+    from datetime import datetime
+
+    def _read_excel_uploaded(uploaded_file, sheet_name: str) -> pd.DataFrame:
+        """
+        uploaded_file peut être un streamlit UploadedFile ou bytes-like.
+        """
+        if uploaded_file is None:
+            return pd.DataFrame()
+
+        # Streamlit UploadedFile -> .getvalue()
+        try:
+            content = uploaded_file.getvalue()
+        except Exception:
+            # fallback: si on reçoit déjà des bytes
+            content = uploaded_file
+
+        if not content:
+            return pd.DataFrame()
+
+        try:
+            return pd.read_excel(BytesIO(content), sheet_name=sheet_name, engine="openpyxl")
+        except Exception:
+            return pd.DataFrame()
+
+    def _prepare_feuil1_df(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        # DATE -> date python (robuste)
+        if "DATE" in df.columns:
+            df["DATE"] = pd.to_datetime(df["DATE"], dayfirst=True, errors="coerce").dt.date
+        df = df[df.get("DATE").notna()] if "DATE" in df.columns else df
+
+        # HEURE normalisée si existe
+        if "HEURE" in df.columns:
+            df["HEURE"] = df["HEURE"].apply(_normalize_heure_str)
+
+        # row_key (obligatoire)
+        df["row_key"] = df.apply(lambda r: make_row_key_from_row(r.to_dict()), axis=1)
+
+        # suppression doublons
+        df = df.drop_duplicates(subset=["row_key"]).copy()
+
+        return df
+
+    # 🔑 Mise à niveau structure DB (OBLIGATOIRE)
+    ensure_planning_row_key_column()
+    ensure_planning_row_key_index()
+
+    # ======================================================
+    # 1️⃣ Lire Feuil1 des 2 fichiers
+    # ======================================================
+    df1 = _read_excel_uploaded(file_1, "Feuil1")
+    df2 = _read_excel_uploaded(file_2, "Feuil1")
+
+    df1 = _prepare_feuil1_df(df1)
+    df2 = _prepare_feuil1_df(df2)
+
+    df_all = pd.concat([df1, df2], ignore_index=True)
+    if df_all.empty:
+        return 0
+
+    # sécurité finale anti-doublon
+    df_all = df_all.drop_duplicates(subset=["row_key"]).copy()
+
+    # ======================================================
+    # 2️⃣ Purge totale planning
+    # ======================================================
+    with get_connection() as conn:
+        conn.execute("DELETE FROM planning")
+        conn.commit()
+
+    # ======================================================
+    # 3️⃣ Insertion (OR IGNORE) — via insert_planning_row(ignore_conflict=True)
+    # ======================================================
+
+    inserts = 0
+    now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # 🔑 Colonnes réellement présentes dans la table planning
+    planning_cols = get_planning_table_columns()
+
+    for _, row in df_all.iterrows():
+
+        data = {}
+
+        # --------------------------------------------------
+        # Copier UNIQUEMENT les colonnes Excel existantes en DB
+        # --------------------------------------------------
+        for c in df_all.columns:
+            if c == "id":
+                continue
+            if c not in planning_cols:
+                continue  # ⛔ colonne Excel absente de la DB → ignorée
+
+            v = row.get(c)
+            data[c] = sqlite_safe(v)
+
+        # --------------------------------------------------
+        # DATE (format attendu par la table planning)
+        # --------------------------------------------------
+        if isinstance(row.get("DATE"), (datetime,)):
+            data["DATE"] = row["DATE"].strftime("%d/%m/%Y")
+        else:
+            try:
+                data["DATE"] = row["DATE"].strftime("%d/%m/%Y")
+            except Exception:
+                data["DATE"] = sqlite_safe(row.get("DATE"))
+
+        # --------------------------------------------------
+        # Champs techniques obligatoires
+        # --------------------------------------------------
+        data["updated_at"] = now_ts
+        data["row_key"] = row["row_key"]
+
+        if "HEURE" in planning_cols:
+            data["HEURE"] = row.get("HEURE", "")
+
+        # --------------------------------------------------
+        # Insertion sécurisée (anti-doublon)
+        # --------------------------------------------------
+        rid = insert_planning_row(
+            data,
+            ignore_conflict=True,
+        )
+
+        if rid != -1:
+            inserts += 1
+
+    # ======================================================
+    # 4️⃣ Recréer les vues SQL
+    # ======================================================
+    rebuild_planning_views()
+
+    # ======================================================
+    # 5️⃣ Import Feuil2 → chauffeurs (depuis file_2 si possible)
+    # ======================================================
+    df_ch = _read_excel_uploaded(file_2, "Feuil2")
+    if df_ch.empty:
+        df_ch = _read_excel_uploaded(file_1, "Feuil2")
+
+    if not df_ch.empty:
+        with get_connection() as conn:
+            conn.execute("DROP TABLE IF EXISTS chauffeurs")
+            conn.commit()
+
+        cols = [c for c in df_ch.columns if c]
+        col_defs = ", ".join(f'"{c}" TEXT' for c in cols)
+        cols_sql = ",".join(f'"{c}"' for c in cols)
+        placeholders = ",".join("?" for _ in cols)
+
+        with get_connection() as conn:
+            conn.execute(f'CREATE TABLE chauffeurs ({col_defs})')
+            conn.commit()
+
+        for _, r in df_ch.iterrows():
+            values = [sqlite_safe(r.get(c)) for c in cols]
+            with get_connection() as conn:
+                conn.execute(
+                    f'INSERT INTO chauffeurs ({cols_sql}) VALUES ({placeholders})',
+                    values,
+                )
+                conn.commit()
+
+    # ======================================================
+    # 6️⃣ Import Feuil3 → feuil3 (depuis file_2 si possible)
+    # ======================================================
+    df_f3 = _read_excel_uploaded(file_2, "Feuil3")
+    if df_f3.empty:
+        df_f3 = _read_excel_uploaded(file_1, "Feuil3")
+
+    if not df_f3.empty:
+        with get_connection() as conn:
+            conn.execute("DROP TABLE IF EXISTS feuil3")
+            conn.commit()
+
+        cols3 = [c for c in df_f3.columns if c]
+        col_defs3 = ", ".join(f'"{c}" TEXT' for c in cols3)
+        cols_sql3 = ",".join(f'"{c}"' for c in cols3)
+        placeholders3 = ",".join("?" for _ in cols3)
+
+        with get_connection() as conn:
+            conn.execute(f'CREATE TABLE feuil3 ({col_defs3})')
+            conn.commit()
+
+        for _, r in df_f3.iterrows():
+            values = [sqlite_safe(r.get(c)) for c in cols3]
+            with get_connection() as conn:
+                conn.execute(
+                    f'INSERT INTO feuil3 ({cols_sql3}) VALUES ({placeholders3})',
+                    values,
+                )
+                conn.commit()
+
+    return inserts
 
 
 
@@ -1591,4 +1887,63 @@ def set_meta(key: str, value: str):
         )
         conn.commit()
 
+def rebuild_planning_db_from_dropbox_full():
+    """
+    🔥 Reconstruction complète de planning_full depuis Dropbox
+    (2025 + 2026) — SANS DOUBLONS
+    """
+    import pandas as pd
+    from io import BytesIO
+    from datetime import datetime, date
 
+    content = download_dropbox_excel_bytes()
+    if not content:
+        return 0
+
+    df = pd.read_excel(
+        BytesIO(content),
+        sheet_name="Feuil1",
+        engine="openpyxl",
+    )
+
+    if df.empty:
+        return 0
+
+    # 🔧 Normalisation DATE
+    df["DATE"] = pd.to_datetime(
+        df["DATE"], dayfirst=True, errors="coerce"
+    ).dt.date
+
+    df = df[df["DATE"].notna()].copy()
+
+    # 🔑 Génération row_key AVANT insertion
+    df["row_key"] = df.apply(
+        lambda r: make_row_key_from_row(r.to_dict()),
+        axis=1,
+    )
+
+    # ❌ Suppression doublons Excel
+    df = df.drop_duplicates(subset=["row_key"])
+
+    with get_db_conn() as conn:
+        cur = conn.cursor()
+
+        # 🔥 PURGE TOTALE
+        cur.execute("DELETE FROM planning_full")
+        conn.commit()
+
+        inserted = 0
+        for _, row in df.iterrows():
+            try:
+                insert_planning_row(
+                    row.to_dict(),
+                    table="planning_full",
+                    ignore_conflict=True,  # sécurité
+                )
+                inserted += 1
+            except Exception:
+                pass
+
+        conn.commit()
+
+    return inserted
