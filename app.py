@@ -3308,6 +3308,31 @@ def render_chauffeur_stats(df_ch: pd.DataFrame):
         st.metric("👥 PAX total", int(pax_total))
     with c3:
         st.metric("💶 Caisse totale", float(caisse_total))
+import re
+
+def match_ch_for_mail(cell, ch):
+    """
+    Retourne True si le chauffeur ch doit recevoir la ligne CH.
+    Gère NPFA, FANP, NP*FA, FA-NP, etc.
+    """
+    if not cell or not ch:
+        return False
+
+    s = str(cell).upper()
+
+    # Normalisation
+    s = (
+        s.replace(" ", "")
+         .replace("*", "")
+         .replace("/", "")
+         .replace("-", "")
+         .replace(",", "")
+    )
+
+    # Découpage en blocs de 2 lettres
+    parts = re.findall(r"[A-Z]{2}", s)
+
+    return ch in parts
 
 # ============================================================
 #   ENVOI PLANNING AUX CHAUFFEURS (MAIL + WHATSAPP)
@@ -3322,53 +3347,80 @@ def send_planning_to_chauffeurs(
     """
     Envoie à chaque chauffeur un mail avec SON planning individuel
     et prépare les liens WhatsApp.
+
+    ⚠️ Logique chauffeur STRICTEMENT IDENTIQUE à la vue chauffeur :
+    - NPFA / FANP / NP*FA / DOFA → NP et FA reçoivent
     """
 
     if not chauffeurs:
         st.warning("Aucun chauffeur sélectionné.")
         return
 
-    # 🔥 IMPORTANT : données fraîches (pas de cache pendant l’envoi)
-    st.cache_data.clear()
-
     sent = 0
     no_email: list[str] = []
     wa_links: list[dict] = []
 
+    # ===================================================
+    # 🔍 Chargement planning (UNE SEULE FOIS, SANS FILTRE CH)
+    # ===================================================
+    df_all = get_planning(
+        start_date=from_date,
+        end_date=to_date,
+        chauffeur=None,          # ⚠️ IMPORTANT
+        type_filter=None,
+        search="",
+        max_rows=5000,
+        source="7j",
+    )
+
+    if df_all is None or df_all.empty:
+        st.warning("Aucune navette sur la période sélectionnée.")
+        return
+
+    # ===================================================
+    # 📧 BOUCLE CHAUFFEURS
+    # ===================================================
     for ch in chauffeurs:
 
         ch = str(ch).strip().upper()
         if not ch:
             continue
 
-        # ==========================
-        # 🔍 Chargement planning DU chauffeur (DB)
-        # ==========================
-        df_ch = get_planning(
-            start_date=from_date,
-            end_date=to_date,
-            chauffeur=ch,
-            source="7j",
-            max_rows=200,
-        )
-
-        # appliquer overrides Admin transferts
-        df_ch = apply_actions_overrides(df_ch)
-
-        if df_ch is None or df_ch.empty:
-            continue
-
-        # 🔒 Sécurité anti-freeze
-        if len(df_ch) > 200:
-            raise RuntimeError(
-                f"Planning trop volumineux pour {ch} – envoi bloqué (sécurité)"
-            )
-
         tel, mail = get_chauffeur_contact(ch)
 
-        # ==========================
-        # 📧 Construction du mail
-        # ==========================
+        # ===================================================
+        # ⚡ FILTRAGE CHAUFFEUR (COPIÉ DE LA VUE CHAUFFEUR)
+        # ===================================================
+        ch_series = (
+            df_all["CH"]
+            .fillna("")
+            .astype(str)
+            .str.upper()
+            .str.strip()
+        )
+
+        mask_exact = ch_series == ch
+        mask_star = ch_series == f"{ch}*"
+        mask_contains = ch_series.str.contains(ch, regex=False)
+        mask_not_digit_suffix = ~ch_series.str.match(rf"{ch}\d")
+
+        df_ch = df_all[
+            (mask_exact | mask_star | mask_contains) & mask_not_digit_suffix
+        ].copy()
+
+        if df_ch.empty:
+            continue
+
+        # 🔒 Sécurité anti-mails énormes
+        if len(df_ch) > 400:
+            st.warning(
+                f"⚠️ {ch} : trop de lignes ({len(df_ch)}) — envoi ignoré."
+            )
+            continue
+
+        # ===================================================
+        # 📧 CONSTRUCTION DU MAIL
+        # ===================================================
         if message_type == "planning":
             subject = f"🚖 Planning — {ch} ({from_date.strftime('%d/%m/%Y')})"
             msg_txt = build_planning_mail_body(
@@ -3387,18 +3439,18 @@ def send_planning_to_chauffeurs(
                 "— Airports Lines"
             )
 
-        # ==========================
-        # 📧 Envoi email
-        # ==========================
+        # ===================================================
+        # 📧 ENVOI EMAIL
+        # ===================================================
         if mail:
             if send_email_smtp(mail, subject, msg_txt):
                 sent += 1
         else:
             no_email.append(ch)
 
-        # ==========================
-        # 💬 Lien WhatsApp
-        # ==========================
+        # ===================================================
+        # 💬 LIEN WHATSAPP
+        # ===================================================
         if tel:
             wa_msg = build_chauffeur_new_planning_message(ch, from_date)
             wa_url = build_whatsapp_link(tel, wa_msg)
@@ -3408,9 +3460,9 @@ def send_planning_to_chauffeurs(
                 "url": wa_url,
             })
 
-    # ===============================
+    # ===================================================
     # 📊 RETOUR UI
-    # ===============================
+    # ===================================================
     st.success(f"📧 Emails envoyés pour {sent} chauffeur(s).")
 
     if no_email:
@@ -3428,7 +3480,6 @@ def send_planning_to_chauffeurs(
                 f"- {item['ch']} ({item['tel']}) → "
                 f"[Envoyer WhatsApp]({item['url']})"
             )
-
 
 
 
@@ -3894,7 +3945,7 @@ def render_tab_vue_chauffeur(forced_ch=None):
                         df_ch_wa = df_all[
                             df_all["CH"]
                             .astype(str)
-                            .apply(lambda x: ch in split_chauffeurs(x))
+                            .apply(lambda x: match_ch_for_mail(x, ch))
                         ]
 
                         if df_ch_wa.empty:
