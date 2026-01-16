@@ -66,6 +66,8 @@ from database import (
     get_planning_table_columns,
     get_chauffeurs_phones,
 )
+from utils import add_excel_color_flags_from_dropbox
+
 # ============================================================
 #   SESSION STATE
 # ============================================================
@@ -214,93 +216,6 @@ def _cell_is_yellow(cell) -> bool:
     except Exception:
         return False
 
-
-
-def add_excel_color_flags_from_dropbox(
-    df: pd.DataFrame,
-    sheet_name: str = "Feuil1"
-) -> pd.DataFrame:
-    df = df.copy().reset_index(drop=True)
-
-    try:
-        # 🔐 Télécharger le fichier Excel via l’API Dropbox (UNE seule source)
-        content = download_dropbox_excel_bytes()
-        if not content:
-            raise RuntimeError("Fichier Dropbox inaccessible")
-
-        wb = load_workbook(BytesIO(content), data_only=True)
-        ws = wb[sheet_name]
-
-        # ⚠️ IMPORTANT :
-        # L’en-tête du fichier Excel est en ligne 2
-        headers = [str(c.value).strip() if c.value else "" for c in ws[2]]
-
-        def col_idx(name: str):
-            name = name.strip().upper()
-            for i, h in enumerate(headers):
-                if h.upper() == name:
-                    return i + 1
-            return None
-
-        # Colonnes utilisées pour les couleurs
-        col_date = col_idx("DATE")
-        col_heure = col_idx("HEURE")
-
-        is_groupage: list[int] = []
-        is_partage: list[int] = []
-
-        # ======================================================
-        # 🎨 Lecture couleurs Excel (groupage / partage)
-        # ======================================================
-        # Les données commencent en ligne 3 (car header = ligne 2)
-        for excel_row in range(3, 3 + len(df)):
-            c_date = ws.cell(excel_row, col_date) if col_date else None
-            c_heure = ws.cell(excel_row, col_heure) if col_heure else None
-
-            date_y = _cell_is_yellow(c_date) if c_date else False
-            heure_y = _cell_is_yellow(c_heure) if c_heure else False
-
-            is_groupage.append(1 if date_y and heure_y else 0)
-            is_partage.append(1 if (not date_y) and heure_y else 0)
-
-        df["IS_GROUPAGE"] = is_groupage
-        df["IS_PARTAGE"] = is_partage
-
-        # ======================================================
-        # ⭐ ATTENTE — détection étoile sur colonne chauffeur
-        # ======================================================
-        ch_col = None
-        for c in df.columns:
-            if str(c).strip().upper() in ("CH", "CHAUFFEUR"):
-                ch_col = c
-                break
-
-        if ch_col:
-            df["IS_ATTENTE"] = (
-                df[ch_col]
-                .astype(str)
-                .str.contains(r"\*", na=False)
-                .astype(int)
-            )
-
-            # 🔒 Garantir une colonne CH standard pour la suite du flux
-            if "CH" not in df.columns:
-                df["CH"] = df[ch_col]
-        else:
-            df["IS_ATTENTE"] = 0
-
-        return df
-
-    except Exception as e:
-        # 🛡️ Fallback sûr ABSOLU (aucun accès à df["CH"])
-        df["IS_GROUPAGE"] = 0
-        df["IS_PARTAGE"] = 0
-        df["IS_ATTENTE"] = 0
-
-        st.error(f"❌ Couleurs Excel non lues : {e}")
-        return df
-
-
 # ============================================================
 #   BADGES VISUELS NAVETTES
 # ============================================================
@@ -374,40 +289,13 @@ DROPBOX_FILE_PATH = "/Goldenlines/Planning 2026.xlsx"
 import os
 import requests
 
-def get_dropbox_access_token():
-    r = requests.post(
-        "https://api.dropbox.com/oauth2/token",
-        data={
-            "grant_type": "refresh_token",
-            "refresh_token": os.environ["DROPBOX_REFRESH_TOKEN"],
-            "client_id": os.environ["DROPBOX_APP_KEY"],
-            "client_secret": os.environ["DROPBOX_APP_SECRET"],
-        },
-        timeout=10,
-    )
-    r.raise_for_status()
-    return r.json()["access_token"]
-
-def download_dropbox_excel_bytes(path="/Goldenlines/Planning 2026.xlsx"):
-    token = get_dropbox_access_token()
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Dropbox-API-Arg": f'{{"path": "{path}"}}',
-        "Content-Type": "application/octet-stream",
-    }
-    r = requests.post(
-        "https://content.dropboxapi.com/2/files/download",
-        headers=headers,
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.content
-
-
 def load_planning_from_dropbox(sheet_name: str | None = None) -> pd.DataFrame:
-    content = download_dropbox_excel_bytes()
+    from utils import get_dropbox_excel_cached
+
+    content = get_dropbox_excel_cached()
     if not content:
         return pd.DataFrame()
+
 
     bio = BytesIO(content)
 
@@ -1212,31 +1100,65 @@ def rebuild_planning_db_from_dropbox_full() -> int:
 from database import make_row_key_from_row, get_latest_ch_overrides_map
 
 def apply_actions_overrides(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Applique les overrides chauffeur (CH) sur le DataFrame.
+    ⚡ Optimisée :
+    - PAS de recalcul de row_key
+    - DB lue UNE SEULE FOIS
+    - Logique métier identique
+    """
+
     if df is None or df.empty:
+        return df
+
+    # ⛔ Ne jamais recalculer row_key en UI
+    if "row_key" not in df.columns:
         return df
 
     df = df.copy()
 
-    # calc row_key
-    keys = []
-    row_keys = []
-    for _, r in df.iterrows():
-        rk = make_row_key_from_row(r.to_dict())
-        row_keys.append(rk)
-        keys.append(rk)
+    # ==================================================
+    # 🔑 Charger les overrides UNE SEULE FOIS
+    # ==================================================
+    row_keys = (
+        df["row_key"]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    )
 
-    df["row_key"] = row_keys
-
-    # overrides
-    mp = get_latest_ch_overrides_map(keys)
-    if mp:
-        df["_CH_ORIG"] = df.get("CH", "")
-        df["CH"] = df.apply(lambda x: mp.get(x["row_key"], x.get("CH", "")), axis=1)
-        df["_needs_excel_update"] = df["row_key"].apply(lambda k: 1 if k in mp else 0)
-    else:
+    if not row_keys:
         df["_needs_excel_update"] = 0
+        return df
+
+    mp = get_latest_ch_overrides_map(row_keys)
+
+    if not mp:
+        df["_needs_excel_update"] = 0
+        return df
+
+    # ==================================================
+    # ⚡ Application rapide des overrides
+    # ==================================================
+    df["_CH_ORIG"] = df.get("CH", "")
+
+    ch_series = df["CH"] if "CH" in df.columns else pd.Series("", index=df.index)
+
+    df["CH"] = (
+        df["row_key"]
+        .map(mp)
+        .combine_first(ch_series)
+    )
+
+    df["_needs_excel_update"] = (
+        df["row_key"]
+        .isin(mp.keys())
+        .astype(int)
+    )
 
     return df
+
 
 import requests
 def flight_badge(status: str, delay_min: int = 0) -> str:
@@ -3406,16 +3328,8 @@ def send_planning_to_chauffeurs(
         st.warning("Aucun chauffeur sélectionné.")
         return
 
-    df_all = get_planning(
-        start_date=from_date,
-        end_date=to_date,
-        max_rows=5000,
-        source="7j",
-    )
-
-    if df_all.empty:
-        st.warning("Aucune navette sur la période sélectionnée.")
-        return
+    # 🔥 IMPORTANT : données fraîches (pas de cache pendant l’envoi)
+    st.cache_data.clear()
 
     sent = 0
     no_email: list[str] = []
@@ -3427,20 +3341,34 @@ def send_planning_to_chauffeurs(
         if not ch:
             continue
 
-        tel, mail = get_chauffeur_contact(ch)
+        # ==========================
+        # 🔍 Chargement planning DU chauffeur (DB)
+        # ==========================
+        df_ch = get_planning(
+            start_date=from_date,
+            end_date=to_date,
+            chauffeur=ch,
+            source="7j",
+            max_rows=200,
+        )
 
-        # 🔥 FILTRAGE MÉTIER CORRECT
-        # Une ligne appartient au chauffeur SI ch ∈ split_chauffeurs(CH)
-        df_ch = df_all[
-            df_all["CH"]
-            .astype(str)
-            .apply(lambda x: ch in split_chauffeurs(x))
-        ]
+        # appliquer overrides Admin transferts
+        df_ch = apply_actions_overrides(df_ch)
 
-        if df_ch.empty:
+        if df_ch is None or df_ch.empty:
             continue
 
-        # ---------------- MAIL ----------------
+        # 🔒 Sécurité anti-freeze
+        if len(df_ch) > 200:
+            raise RuntimeError(
+                f"Planning trop volumineux pour {ch} – envoi bloqué (sécurité)"
+            )
+
+        tel, mail = get_chauffeur_contact(ch)
+
+        # ==========================
+        # 📧 Construction du mail
+        # ==========================
         if message_type == "planning":
             subject = f"🚖 Planning — {ch} ({from_date.strftime('%d/%m/%Y')})"
             msg_txt = build_planning_mail_body(
@@ -3459,13 +3387,18 @@ def send_planning_to_chauffeurs(
                 "— Airports Lines"
             )
 
+        # ==========================
+        # 📧 Envoi email
+        # ==========================
         if mail:
             if send_email_smtp(mail, subject, msg_txt):
                 sent += 1
         else:
             no_email.append(ch)
 
-        # ---------------- WHATSAPP ----------------
+        # ==========================
+        # 💬 Lien WhatsApp
+        # ==========================
         if tel:
             wa_msg = build_chauffeur_new_planning_message(ch, from_date)
             wa_url = build_whatsapp_link(tel, wa_msg)
@@ -3476,7 +3409,7 @@ def send_planning_to_chauffeurs(
             })
 
     # ===============================
-    # RETOUR UI
+    # 📊 RETOUR UI
     # ===============================
     st.success(f"📧 Emails envoyés pour {sent} chauffeur(s).")
 
@@ -5617,6 +5550,426 @@ def render_tab_admin_transferts():
 
         df_display = df.copy()
         st.dataframe(df_display, use_container_width=True, height=500)
+
+    # ======================================================
+    # ⏱️ ONGLET CALCUL D’HEURES
+    # ======================================================
+    with tab_heures:
+        render_tab_calcul_heures()
+# ============================================================
+# ⏱️ HELPERS RÈGLES HEURES (OBLIGATOIRES)
+# ============================================================
+
+def _coerce_minutes(val) -> int:
+    """
+    Accepte: 150 | "150" | "2h30" | "2:30" | "2.5"
+    Retourne des minutes (int)
+    """
+    if val is None:
+        return 0
+
+    if isinstance(val, (int, float)):
+        return int(val * 60) if val < 24 else int(val)
+
+    s = str(val).strip().lower()
+    if not s:
+        return 0
+
+    # 2h30
+    if "h" in s:
+        try:
+            h, m = s.split("h", 1)
+            return int(h) * 60 + int(m or 0)
+        except Exception:
+            return 0
+
+    # 2:30
+    if ":" in s:
+        try:
+            h, m = s.split(":", 1)
+            return int(h) * 60 + int(m)
+        except Exception:
+            return 0
+
+    # 2.5
+    try:
+        f = float(s.replace(",", "."))
+        return int(f * 60) if f < 24 else int(f)
+    except Exception:
+        return 0
+
+
+def _rules_prepare(df_rules: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalise les règles pour calcul heures
+    Colonnes attendues :
+    - ch_base
+    - is_star (0/1)
+    - sens
+    - dest_contains
+    - minutes
+    """
+    if df_rules is None or df_rules.empty:
+        return pd.DataFrame()
+
+    df = df_rules.copy()
+
+    for col in ["ch_base", "sens", "dest_contains"]:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = (
+            df[col]
+            .fillna("")
+            .astype(str)
+            .str.upper()
+            .str.strip()
+        )
+
+    if "is_star" not in df.columns:
+        df["is_star"] = 0
+
+    df["is_star"] = df["is_star"].fillna(0).astype(int)
+
+    if "minutes" not in df.columns:
+        df["minutes"] = 0
+
+    df["minutes_norm"] = df["minutes"].apply(_coerce_minutes)
+
+    # garder uniquement règles valides
+    df = df[df["minutes_norm"] > 0]
+
+    return df
+
+
+def _match_rule_minutes(
+    rules_df: pd.DataFrame,
+    ch: str,
+    sens: str,
+    dest: str,
+) -> int:
+    """
+    Retourne le nombre de minutes correspondant à une règle
+    """
+    if rules_df is None or rules_df.empty:
+        return 0
+
+    ch = (ch or "").upper()
+    sens = (sens or "").upper()
+    dest = (dest or "").upper()
+
+    base_ch = ch.replace("*", "")
+    is_star = 1 if "*" in ch else 0
+
+    df = rules_df.copy()
+
+    # filtres
+    df = df[
+        (df["sens"] == sens) &
+        (
+            (df["ch_base"] == base_ch) |
+            (df["ch_base"].isin(["", "ALL"]))
+        ) &
+        (df["is_star"] == is_star)
+    ]
+
+    if df.empty:
+        return 0
+
+    # destination contient
+    df = df[
+        df["dest_contains"].apply(
+            lambda x: x in dest if x else True
+        )
+    ]
+
+    if df.empty:
+        return 0
+
+    # priorité à la règle la plus spécifique
+    df["prio"] = df["dest_contains"].str.len()
+    df = df.sort_values("prio", ascending=False)
+
+    return int(df.iloc[0]["minutes_norm"])
+
+# ============================================================
+# ⏱️ CALCUL D’HEURES + CAISSE
+# ============================================================
+
+from database import init_time_rules_table
+init_time_rules_table()
+
+def render_tab_calcul_heures():
+    st.subheader("⏱️ Calcul d’heures")
+
+    from database import (
+        get_time_rules_df,
+        save_time_rules_df,
+        _detect_sens_dest_from_row,
+        _minutes_to_hhmm,
+        split_chauffeurs,
+    )
+
+    tab_calc, tab_rules, tab_caisse = st.tabs([
+        "📊 Heures (60 jours)",
+        "⚙️ Règles (éditables)",
+        "💶 Caisse non rentrée (60j)",
+    ])
+    # ======================================================
+    # 📊 HEURES — PÉRIODE AU CHOIX
+    # ======================================================
+    with tab_calc:
+        st.markdown("### 📊 Heures chauffeurs")
+
+        today = date.today()
+
+        mode = st.radio(
+            "📅 Période",
+            ["Mois complet", "Période personnalisée"],
+            horizontal=True,
+            key="hrs_mode",
+        )
+
+        if mode == "Mois complet":
+            mois = st.selectbox(
+                "Mois",
+                list(range(1, 13)),
+                index=today.month - 1,
+            )
+            annee = st.selectbox(
+                "Année",
+                list(range(2026, today.year + 1)),
+                index=list(range(2026, today.year + 1)).index(today.year),
+            )
+
+            d1 = date(annee, mois, 1)
+            d2 = (
+                date(annee + 1, 1, 1) - timedelta(days=1)
+                if mois == 12
+                else date(annee, mois + 1, 1) - timedelta(days=1)
+            )
+        else:
+            colA, colB = st.columns(2)
+            with colA:
+                d1 = st.date_input("Du", today.replace(day=1))
+            with colB:
+                d2 = st.date_input("Au", today)
+
+        if d1 > d2:
+            st.error("La date de début est après la date de fin.")
+            return
+        df_hours = get_planning(
+            start_date=d1,
+            end_date=d2,
+            source="full",
+            max_rows=20000,
+        )
+
+        if df_hours is None or df_hours.empty:
+            st.info("Aucune navette sur cette période.")
+            return
+
+        df_hours = df_hours.copy()
+
+        if "IS_INDISPO" in df_hours.columns:
+            df_hours = df_hours[
+                df_hours["IS_INDISPO"]
+                .fillna(0)
+                .astype(int)
+                .eq(0)
+            ]
+
+        # Chauffeurs
+        df_hours["CH_LIST"] = (
+            df_hours["CH"]
+            .fillna("")
+            .astype(str)
+            .str.upper()
+            .apply(split_chauffeurs)
+        )
+
+        # Sens / destination
+        df_hours[["SENS", "DEST"]] = df_hours.apply(
+            lambda r: pd.Series(
+                _detect_sens_dest_from_row(r.to_dict())
+            ),
+            axis=1,
+        )
+
+        rules_norm = _rules_prepare(get_time_rules_df())
+
+        totals = {}
+        rows_not_matched = []
+
+        for _, r in df_hours.iterrows():
+            minutes = _match_rule_minutes(
+                rules_norm,
+                r["CH"],
+                r["SENS"],
+                r["DEST"],
+            )
+
+            if minutes <= 0:
+                rows_not_matched.append({
+                    "Date": r["DATE"],
+                    "CH": r["CH"],
+                    "Sens": r["SENS"],
+                    "Destination": r["DEST"],
+                })
+                continue
+
+            for ch in r["CH_LIST"]:
+                totals[ch] = totals.get(ch, 0) + minutes
+        if totals:
+            df_tot = pd.DataFrame([
+                {
+                    "Chauffeur": ch,
+                    "Heures": _minutes_to_hhmm(mins),
+                }
+                for ch, mins in sorted(totals.items())
+            ])
+
+            st.markdown("#### ✅ Heures calculées")
+            st.dataframe(df_tot, use_container_width=True, hide_index=True)
+
+        if rows_not_matched:
+            st.markdown("#### ⚠️ Navettes non calculées (ajouter des règles)")
+            st.dataframe(
+                pd.DataFrame(rows_not_matched),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+
+
+
+    # ======================================================
+    # 💶 CAISSE NON RENTRÉE — COULEURS EXCEL (OPTIMISÉ)
+    # ======================================================
+    with tab_caisse:
+        st.markdown("### 💶 Caisse non rentrée (60 jours)")
+
+        today = date.today()
+        d1 = today - timedelta(days=60)
+        if d1 < date(2026, 1, 1):
+            d1 = date(2026, 1, 1)
+
+        df_cash = get_planning(
+            start_date=d1,
+            end_date=today,
+            source="full",
+            max_rows=15000,
+        )
+
+        if df_cash is None or df_cash.empty:
+            st.info("Aucune donnée caisse.")
+            return
+
+        # ==================================================
+        # ⚡ COULEURS EXCEL — UNE SEULE FOIS
+        # ==================================================
+        try:
+            df_cash = add_excel_color_flags_from_dropbox(
+                df_cash,
+                sheet_name="Feuil1",
+            )
+        except Exception:
+            pass
+
+        # ==================================================
+        # ⚡ FILTRAGE RAPIDE (SANS iterrows)
+        # ==================================================
+        df_cash = df_cash.copy()
+
+        # Exclure indispos
+        df_cash = df_cash[
+            ~df_cash.apply(
+                lambda r: is_indispo_row(r, df_cash.columns),
+                axis=1,
+            )
+        ]
+
+        if df_cash.empty:
+            st.info("Aucune ligne valide.")
+            return
+
+        # Paiement caisse uniquement
+        df_cash = df_cash[
+            df_cash["PAIEMENT"]
+            .fillna("")
+            .astype(str)
+            .str.lower()
+            .eq("caisse")
+        ]
+
+        if df_cash.empty:
+            st.success("✅ Aucune caisse à rentrer")
+            return
+
+        # Montant > 0
+        df_cash["Caisse"] = (
+            df_cash.get(
+                "Caisse",
+                pd.Series(0, index=df_cash.index),
+            )
+            .pipe(pd.to_numeric, errors="coerce")
+            .fillna(0)
+        )
+
+        df_cash = df_cash[df_cash["Caisse"] > 0]
+
+        if df_cash.empty:
+            st.success("✅ Aucune caisse à rentrer")
+            return
+
+        # ❌ NON RENTRÉ = PAS VERT (CORRECTION SÛRE)
+        df_cash["IS_GREEN"] = (
+            df_cash.get(
+                "IS_GREEN",
+                pd.Series(0, index=df_cash.index),
+            )
+            .fillna(0)
+            .astype(int)
+        )
+
+        df_cash = df_cash[df_cash["IS_GREEN"] == 0]
+
+        if df_cash.empty:
+            st.success("✅ Aucune caisse à rentrer")
+            return
+
+
+        # ==================================================
+        # 📊 AFFICHAGE + TOTAL
+        # ==================================================
+        df_out = df_cash[[
+            "DATE",
+            "CH",
+            "NOM",
+            "Caisse",
+        ]].copy()
+
+        df_out.rename(
+            columns={
+                "NOM": "Client",
+                "Caisse": "Montant €",
+            },
+            inplace=True,
+        )
+
+        total_due = float(df_out["Montant €"].sum())
+
+        st.dataframe(
+            df_out,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.metric(
+            "💶 Total à rentrer",
+            f"{total_due:.2f} €",
+        )
+
+
 
 
 # ==========================================================================
