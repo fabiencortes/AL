@@ -64,6 +64,7 @@ from database import (
     ensure_planning_row_key_column,
     ensure_planning_row_key_index,
     get_planning_table_columns,
+    get_chauffeurs_phones,
 )
 # ============================================================
 #   SESSION STATE
@@ -2077,7 +2078,7 @@ def build_client_sms(row: pd.Series, tel_chauffeur: str) -> str:
     # NOM client (si dispo)
     nom_client = str(row.get("NOM", "") or "").strip()
     if nom_client:
-        bonjour = f"Bonjour {nom_client}, c'est Airports-Lines."
+        bonjour = f"Bonjour Mr / Mme {nom_client}, c'est Airports-Lines."
     else:
         bonjour = "Bonjour, c'est Airports-Lines."
 
@@ -2112,7 +2113,7 @@ def build_client_sms_from_driver(row: pd.Series, ch_code: str, tel_chauffeur: st
     # Nom du client
     nom_client = str(row.get("NOM", "") or "").strip()
     if nom_client:
-        bonjour = f"Bonjour {nom_client}, c'est votre chauffeur {ch_code} pour Airports-Lines."
+        bonjour = f"Bonjour Mr / Mme {nom_client}, c'est votre chauffeur {ch_code} pour Airports-Lines."
     else:
         bonjour = f"Bonjour, c'est votre chauffeur {ch_code} pour Airports-Lines."
 
@@ -4972,8 +4973,22 @@ def render_tab_chauffeur_driver():
             actions.append(f"[🗺 Google Maps]({build_google_maps_link(adr)})")
 
         if tel:
-            msg = build_client_sms_from_driver(row, ch_selected, tel)
-            actions.append(f"[💬 WhatsApp]({build_whatsapp_link(tel, msg)})")
+            # =========================
+            # 📞 GSM CHAUFFEUR(S) – Feuil2
+            # =========================
+            ch_raw = row.get("CH", "")
+            phones = get_chauffeurs_phones(ch_raw)
+            tel_chauffeur = " / ".join(phones) if phones else "—"
+
+            msg = build_client_sms_from_driver(
+                row,
+                ch_selected,
+                tel_chauffeur,
+            )
+            actions.append(
+                f"[💬 WhatsApp]({build_whatsapp_link(tel, msg)})"
+            )
+
 
         if actions:
             bloc.append(" | ".join(actions))
@@ -5467,7 +5482,6 @@ def render_tab_excel_sync():
 def render_tab_admin_transferts():
     st.subheader("📦 Tous les transferts — vue admin")
 
-    # Sous-onglets Admin transferts
     tab_transferts, tab_excel, tab_heures = st.tabs([
         "📋 Transferts / SMS",
         "🟡 À reporter dans Excel",
@@ -5537,7 +5551,6 @@ def render_tab_admin_transferts():
                 key="admin_end_date",
             )
 
-        # ✅ ADMIN = HISTORIQUE COMPLET (60 derniers jours par défaut)
         df = get_planning(
             start_date=start_date,
             end_date=end_date,
@@ -5545,10 +5558,9 @@ def render_tab_admin_transferts():
             type_filter=None,
             search="",
             max_rows=5000,
-            source="full",   # ⬅️ IMPORTANT
+            source="full",
         )
 
-        # 🔧 NORMALISATION DATE (ADMIN TRANSFERTS)
         if not df.empty and "DATE" in df.columns:
             df["DATE"] = pd.to_datetime(
                 df["DATE"],
@@ -5556,7 +5568,6 @@ def render_tab_admin_transferts():
                 errors="coerce"
             ).dt.date
 
-        # ✅ Appliquer les overrides + flags Excel
         try:
             df = apply_actions_overrides(df)
         except Exception:
@@ -5566,170 +5577,58 @@ def render_tab_admin_transferts():
             st.warning("Aucun transfert pour cette période.")
             return
 
-
-        # 🔽 Filtres avancés
+        # 🔽 Filtres
         col3, col4, col5 = st.columns(3)
         with col3:
-            bdc_prefix = st.text_input(
-                "Filtrer par Num BDC (préfixe, ex : JC → JCS, JCH…)",
-                "",
-                key="admin_bdc_prefix",
-            )
+            bdc_prefix = st.text_input("Filtrer par Num BDC", "", key="admin_bdc_prefix")
         with col4:
-            paiement_filter = st.text_input(
-                "Filtrer par mode de paiement (contient, ex : CASH, VISA…)",
-                "",
-                key="admin_paiement_filter",
-            )
+            paiement_filter = st.text_input("Filtrer par paiement", "", key="admin_paiement_filter")
         with col5:
-            ch_filter = st.text_input(
-                "Filtrer par chauffeur (CH, ex : GG, FA, NP…)",
-                "",
-                key="admin_ch_filter",
-            )
+            ch_filter = st.text_input("Filtrer par chauffeur", "", key="admin_ch_filter")
 
         if bdc_prefix.strip() and "Num BDC" in df.columns:
-            p = bdc_prefix.strip().upper()
-            df = df[df["Num BDC"].astype(str).str.upper().str.startswith(p)]
+            df = df[df["Num BDC"].astype(str).str.upper().str.startswith(bdc_prefix.upper())]
 
         if paiement_filter.strip() and "PAIEMENT" in df.columns:
-            p = paiement_filter.strip().upper()
-            df = df[df["PAIEMENT"].astype(str).str.upper().str.contains(p)]
+            df = df[df["PAIEMENT"].astype(str).str.upper().str.contains(paiement_filter.upper())]
 
         if ch_filter.strip() and "CH" in df.columns:
-            p = ch_filter.strip().upper()
-            df = df[df["CH"].astype(str).str.upper() == p]
+            df = df[df["CH"].astype(str).str.upper() == ch_filter.upper()]
 
         if df.empty:
-            st.warning("Aucun transfert après application des filtres.")
+            st.warning("Aucun transfert après filtres.")
             return
 
-        # 🔃 Tri
         sort_mode = st.radio(
             "Tri",
             ["DATE + HEURE", "CH + DATE + HEURE"],
             horizontal=True,
-            key="admin_sort_mode",
         )
 
         sort_cols = []
-        if sort_mode == "CH + DATE + HEURE" and "CH" in df.columns:
+        if sort_mode == "CH + DATE + HEURE":
             sort_cols.append("CH")
-        if "DATE" in df.columns:
-            sort_cols.append("DATE")
-        if "HEURE" in df.columns:
-            sort_cols.append("HEURE")
+        sort_cols += ["DATE", "HEURE"]
 
-        if sort_cols:
-            df = df.sort_values(sort_cols)
+        df = df.sort_values(sort_cols)
 
-        # ✅ Badges + Excel
         if "Badges" not in df.columns:
             df["Badges"] = df.apply(navette_badges, axis=1)
 
-        if "_needs_excel_update" in df.columns:
-            df["⚠️ Excel"] = df["_needs_excel_update"].apply(
-                lambda x: "🟡 À reporter" if int(x or 0) == 1 else ""
-            )
-        else:
-            df["⚠️ Excel"] = ""
-
-        # 📊 Compteurs visuels
-        c1, c2, c3, c4 = st.columns(4)
-
-        with c1:
-            st.metric(
-                "🟡 Groupées",
-                int(
-                    (
-                        df.get("IS_GROUPAGE", 0)
-                          .fillna(0)
-                          .astype(int) == 1
-                    ).sum()
-                )
-            )
-
-        with c2:
-            st.metric(
-                "🟡 Partagées",
-                int(
-                    (
-                        df.get("IS_PARTAGE", 0)
-                          .fillna(0)
-                          .astype(int) == 1
-                    ).sum()
-                )
-            )
-
-        with c3:
-            st.metric(
-                "⭐ Attente",
-                int(
-                    (
-                        df.get("IS_ATTENTE", 0)
-                          .fillna(0)
-                          .astype(int) == 1
-                    ).sum()
-                )
-            )
-
-        with c4:
-            st.metric(
-                "🟡 À reporter Excel",
-                int(
-                    (
-                        df.get("_needs_excel_update", 0)
-                          .fillna(0)
-                          .astype(int) == 1
-                    ).sum()
-                )
-            )
-
-
-        # 🧹 Affichage propre
         df_display = df.copy()
-
-        hide_cols = {"id", "row_key", "_CH_ORIG", "_needs_excel_update"}
-
-        front = []
-        for c in ["⚠️ Excel", "Badges", "DATE", "HEURE", "CH", "NOM", "Num BDC", "PAIEMENT"]:
-            if c in df_display.columns:
-                front.append(c)
-
-        others = [c for c in df_display.columns if c not in front and c not in hide_cols]
-        df_display = df_display[front + others]
-
-        st.markdown(f"#### {len(df_display)} transfert(s) sur la période sélectionnée")
         st.dataframe(df_display, use_container_width=True, height=500)
-
-        # ======================================================
-        #   SMS / WHATSAPP CLIENTS
-        # ======================================================
-        st.markdown("---")
-        st.markdown("### 📱 Messages clients (WhatsApp / SMS)")
-
-        col_sms1, col_sms2 = st.columns(2)
-
-        with col_sms1:
-            if st.button("📅 Préparer SMS/WhatsApp pour demain", key="sms_clients_demain"):
-                target = today + timedelta(days=1)
-                show_client_messages_for_period(df, target, nb_days=1)
-
-        with col_sms2:
-            if st.button("📅 Préparer SMS/WhatsApp pour les 3 prochains jours", key="sms_clients_3j"):
-                target = today + timedelta(days=1)
-                show_client_messages_for_period(df, target, nb_days=3)
 
     # ======================================================
     # ⏱️ ONGLET CALCUL D’HEURES
     # ======================================================
     with tab_heures:
         render_tab_calcul_heures()
-
-
 # ============================================================
-# ⏱️ CALCUL D’HEURES
+# ⏱️ CALCUL D’HEURES + CAISSE
 # ============================================================
+
+from database import init_time_rules_table
+init_time_rules_table()
 
 def render_tab_calcul_heures():
     st.subheader("⏱️ Calcul d’heures")
@@ -5737,112 +5636,138 @@ def render_tab_calcul_heures():
     from database import (
         get_time_rules_df,
         save_time_rules_df,
-        get_rule_minutes,
         _detect_sens_dest_from_row,
         _minutes_to_hhmm,
+        split_chauffeurs,
+        add_excel_color_flags,
     )
 
-    tab_calc, tab_rules = st.tabs(["📊 Calcul", "⚙️ Règles"])
+    tab_calc, tab_rules, tab_caisse = st.tabs([
+        "📊 Heures (60 jours)",
+        "⚙️ Règles (éditables)",
+        "💶 Caisse non rentrée (60j)",
+    ])
 
-    # ⚙️ RÈGLES
+    # ======================================================
+    # ⚙️ RÈGLES (inchangé)
+    # ======================================================
     with tab_rules:
         st.markdown("### ⚙️ Règles de calcul")
-        st.caption("Chauffeur, Sens, Destination, Heures")
+        df_rules = get_time_rules_df() or pd.DataFrame()
+        edited = st.data_editor(df_rules, use_container_width=True, num_rows="dynamic")
+        if st.button("💾 Enregistrer règles"):
+            save_time_rules_df(edited)
+            st.success("Règles enregistrées")
+            st.rerun()
 
-        df_rules = get_time_rules_df()
-        if df_rules.empty:
-            df_rules = pd.DataFrame(columns=["id", "ch", "sens", "dest", "heures"])
+    rules_norm = get_time_rules_df()
 
-        df_rules = df_rules.loc[:, ~df_rules.columns.duplicated()]
-
-        edited = st.data_editor(
-            df_rules,
-            use_container_width=True,
-            num_rows="dynamic",
-            key="time_rules_editor",
-        )
-
-        if st.button("💾 Enregistrer les règles"):
-            try:
-                if "id" in edited.columns:
-                    edited = edited.drop(columns=["id"], errors="ignore")
-                save_time_rules_df(edited)
-                st.success("Règles enregistrées ✅")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Erreur sauvegarde règles : {e}")
-
-    # 📊 CALCUL
+    # ======================================================
+    # 📊 HEURES — BASE SAINE 60 JOURS
+    # ======================================================
     with tab_calc:
-        col1, col2, col3 = st.columns(3)
+        st.markdown("### 📊 Heures chauffeurs (60 derniers jours)")
 
         today = date.today()
-        with col1:
-            d1 = st.date_input("Date début", value=today, key="hrs_d1")
-        with col2:
-            d2 = st.date_input("Date fin", value=today, key="hrs_d2")
-        with col3:
-            ch_filter = st.selectbox("Chauffeur", ["Tous", "NP", "NP*"], key="hrs_ch")
+        d1 = today - timedelta(days=60)
+        if d1 < date(2026, 1, 1):
+            d1 = date(2026, 1, 1)
 
         df = get_planning(
             start_date=d1,
-            end_date=d2,
-            chauffeur=None if ch_filter == "Tous" else ch_filter,
-            type_filter=None,
-            search="",
-            max_rows=5000,
+            end_date=today,
+            source="full",
+            max_rows=15000,
         )
 
         if df.empty:
-            st.info("Aucune navette sur cette période.")
+            st.info("Aucune navette.")
             return
 
-        rows = []
-        total_minutes = 0
-        to_check = 0
+        totals = {}
 
         for _, r in df.iterrows():
-            if is_indispo_row(r, df.columns.tolist()):
+
+            if is_indispo_row(r, df.columns):
                 continue
 
-            ch = str(r.get("CH", "") or "").strip()
-            if ch_filter != "Tous" and ch != ch_filter:
+            ch_raw = str(r.get("CH", "")).upper().strip()
+            chauffeurs = split_chauffeurs(ch_raw)
+
+            # ⏱️ BASE SIMPLE : 1 navette = 60 minutes
+            minutes = 60
+
+            for ch in chauffeurs:
+                totals[ch] = totals.get(ch, 0) + minutes
+
+        rows = [{
+            "Chauffeur": ch,
+            "Heures": _minutes_to_hhmm(mins),
+        } for ch, mins in sorted(totals.items())]
+
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    # ======================================================
+    # 💶 CAISSE NON RENTRÉE — COULEURS EXCEL
+    # ======================================================
+    with tab_caisse:
+        st.markdown("### 💶 Caisse non rentrée (60 jours)")
+
+        today = date.today()
+        d1 = today - timedelta(days=60)
+        if d1 < date(2026, 1, 1):
+            d1 = date(2026, 1, 1)
+
+        df_cash = get_planning(
+            start_date=d1,
+            end_date=today,
+            source="full",
+            max_rows=15000,
+        )
+
+        if df_cash.empty:
+            st.info("Aucune donnée caisse.")
+            return
+
+        # 🔑 IMPORTANT : couleurs Excel
+        try:
+            df_cash = add_excel_color_flags(df_cash)
+
+        except Exception:
+            pass
+
+        rows = []
+        total_due = 0.0
+
+        for _, r in df_cash.iterrows():
+
+            if is_indispo_row(r, df_cash.columns):
                 continue
 
-            dv = r.get("DATE")
-            if isinstance(dv, (datetime, date)):
-                date_txt = dv.strftime("%d/%m/%Y")
-            else:
-                dtmp = pd.to_datetime(dv, dayfirst=True, errors="coerce")
-                date_txt = dtmp.strftime("%d/%m/%Y") if not pd.isna(dtmp) else ""
+            if str(r.get("PAIEMENT", "")).lower() != "caisse":
+                continue
 
-            sens, dest = _detect_sens_dest_from_row(r.to_dict())
-            minutes = get_rule_minutes(ch, sens, dest)
+            montant = float(r.get("Caisse", 0) or 0)
+            if montant <= 0:
+                continue
 
-            note = ""
-            if minutes <= 0:
-                note = "⚠️ Heure estimée à vérifier"
-                to_check += 1
-            else:
-                total_minutes += minutes
+            if int(r.get("IS_GREEN", 0)) == 1:
+                continue
 
             rows.append({
-                "Date": date_txt,
-                "CH": ch,
-                "Sens": sens,
-                "Dest": dest,
-                "Heures": _minutes_to_hhmm(minutes) if minutes else "",
-                "Note": note,
+                "Date": r.get("DATE"),
+                "CH": r.get("CH"),
+                "Client": r.get("NOM"),
+                "Montant €": f"{montant:.2f}",
             })
 
-        out = pd.DataFrame(rows)
-        st.dataframe(out, use_container_width=True, hide_index=True)
+            total_due += montant
 
-        st.markdown("---")
-        st.metric("Total heures", _minutes_to_hhmm(total_minutes))
-        st.metric("Lignes à vérifier", to_check)
-
-
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+            st.metric("💶 Total à rentrer", f"{total_due:.2f} €")
+        else:
+            st.success("✅ Aucune caisse à rentrer")
 
 
 

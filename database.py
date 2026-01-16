@@ -1947,3 +1947,80 @@ def rebuild_planning_db_from_dropbox_full():
         conn.commit()
 
     return inserted
+def get_chauffeur_phone(ch_code: str) -> str:
+    """
+    Retourne le GSM du chauffeur depuis la table chauffeurs (Feuil2)
+    """
+    if not ch_code:
+        return ""
+
+    with get_connection() as conn:
+        try:
+            df = pd.read_sql_query(
+                """
+                SELECT *
+                FROM chauffeurs
+                WHERE UPPER(INITIALE) = ?
+                LIMIT 1
+                """,
+                conn,
+                params=(ch_code.upper(),),
+            )
+        except Exception:
+            return ""
+
+    if df.empty:
+        return ""
+
+    # 🔁 variantes possibles du nom de colonne GSM
+    for col in ["GSM", "TEL", "TELEPHONE", "PHONE", "NUMERO"]:
+        if col in df.columns:
+            val = str(df.iloc[0][col]).strip()
+            if val and val.lower() != "nan":
+                return val
+
+    return ""
+def get_chauffeurs_phones(ch_raw: str) -> list[str]:
+    """
+    Retourne la liste des numéros GSM des chauffeurs concernés
+    (FA, FA*, FADO, NPFA, etc.)
+    """
+    from database import split_chauffeurs
+
+    phones = []
+
+    # 🔹 1) découper FA / DO / NP / ...
+    chauffeurs = split_chauffeurs(ch_raw)
+
+    if not chauffeurs:
+        return phones
+
+    with get_connection() as conn:
+        df = pd.read_sql_query("SELECT * FROM chauffeurs", conn)
+
+    if df.empty:
+        return phones
+
+    for ch in chauffeurs:
+        df_ch = df[
+            df["INITIALE"]
+            .astype(str)
+            .str.upper()
+            .str.strip()
+            == ch.upper()
+        ]
+
+        if df_ch.empty:
+            continue
+
+        # variantes possibles colonne GSM
+        for col in ["GSM", "TEL", "TELEPHONE", "PHONE", "NUMERO"]:
+            if col in df_ch.columns:
+                val = str(df_ch.iloc[0][col]).strip()
+                if val and val.lower() != "nan":
+                    phones.append(val)
+                break
+
+    return phones
+
+
