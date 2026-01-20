@@ -58,6 +58,7 @@ from database import (
     get_meta,
     set_meta,
     rebuild_planning_db_from_two_excel_files,
+    ensure_planning_confirmation_and_caisse_columns,
 )
 from database import (
     split_chauffeurs,
@@ -718,6 +719,32 @@ def rebuild_planning_views():
 
 
 
+def _is_excel_cell_green(color_flag):
+    """
+    Retourne True si la cellule Excel est verte.
+    color_flag est ce que tu stockes déjà via add_excel_color_flags_from_dropbox.
+    """
+    if not color_flag:
+        return False
+
+    color = str(color_flag).lower()
+
+    return any(
+        key in color
+        for key in ("green", "vert", "#00", "lime")
+    )
+def format_chauffeur_colored(ch, confirmed):
+    """
+    Retourne le chauffeur avec couleur + icône selon confirmation.
+    confirmed : 0 / 1 / None
+    """
+    ch = str(ch or "").strip().upper()
+
+    if confirmed == 1:
+        return f"🟢 {ch}"
+    elif confirmed == 0:
+        return f"🟠 {ch}"
+    return ch
 
 def sync_planning_from_today():
     """
@@ -743,6 +770,50 @@ def sync_planning_from_today():
     # ======================================================
     df_excel = add_excel_color_flags_from_dropbox(df_excel, "Feuil1")
     ensure_planning_color_columns()
+    # ===================================================
+    #   LOGIQUE MÉTIER : CONFIRMATION & CAISSE (EXCEL)
+    # ===================================================
+
+    now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Valeurs par défaut sûres
+    df_excel["CONFIRMED"] = 0
+    df_excel["CONFIRMED_AT"] = None
+    df_excel["CAISSE_PAYEE"] = 0
+
+    # --- CONFIRMATION NAVETTE (par navette)
+    if "CH_COLOR" in df_excel.columns:
+        df_excel["CONFIRMED"] = df_excel["CH_COLOR"].apply(
+            lambda c: 1 if _is_excel_cell_green(c) else 0
+        )
+
+        df_excel["CONFIRMED_AT"] = df_excel["CONFIRMED"].apply(
+            lambda v: now_iso if v == 1 else None
+        )
+
+    # --- PAIEMENT CAISSE
+    if "CAISSE_COLOR" in df_excel.columns:
+        def _calc_caisse_payee(row):
+            paiement = str(row.get("PAIEMENT", "")).lower().strip()
+            montant = row.get("Caisse")
+
+            if paiement != "caisse":
+                return 0
+
+            try:
+                montant = float(montant)
+            except Exception:
+                return 0
+
+            if montant <= 0:
+                return 0
+
+            return 1 if _is_excel_cell_green(row.get("CAISSE_COLOR")) else 0
+
+        df_excel["CAISSE_PAYEE"] = df_excel.apply(
+            _calc_caisse_payee,
+            axis=1,
+        )
 
     # ======================================================
     # 3️⃣ NORMALISATION ABSOLUE DES DONNÉES
@@ -2281,63 +2352,126 @@ def render_top_bar():
 #   STYLE PLANNING — TOUTES LES COULEURS (FINAL SAFE)
 # ============================================================
 
-def style_groupage_partage(df: pd.DataFrame):
+def style_groupage_partage(styler):
+    df = styler.data
 
     def style_row(row):
         styles = [""] * len(row)
 
-        def _flag(val) -> bool:
-            """
-            Sécurise les flags (None / NaN / str / int)
-            """
+        def _flag(val):
             try:
                 return int(val or 0) == 1
             except Exception:
                 return False
 
-        # -------------------------
-        # 🔴 INDISPONIBILITÉ
-        # -------------------------
         if is_indispo_row(row, df.columns.tolist()):
             return ["background-color: #f8d7da"] * len(row)
 
-        # -------------------------
-        # 🟡 GROUPAGE (ligne entière)
-        # -------------------------
         if _flag(row.get("IS_GROUPAGE")):
             return ["background-color: #fff3cd"] * len(row)
 
-        # -------------------------
-        # 🟡 PARTAGE (heure seule)
-        # -------------------------
         if _flag(row.get("IS_PARTAGE")) and "HEURE" in df.columns:
-            idx = df.columns.get_loc("HEURE")
-            styles[idx] = "background-color: #fff3cd"
+            styles[df.columns.get_loc("HEURE")] = "background-color: #fff3cd"
 
-        # -------------------------
-        # 🟢 GO / 🔵 GL (colonne GO)
-        # -------------------------
         if "GO" in df.columns:
-            go_val = str(row.get("GO", "") or "").upper().strip()
-            idx_go = df.columns.get_loc("GO")
+            idx = df.columns.get_loc("GO")
+            go = str(row.get("GO", "")).upper().strip()
+            if go == "GO":
+                styles[idx] += "background-color:#d1e7dd;font-weight:bold"
+            elif go == "GL":
+                styles[idx] += "background-color:#cfe2ff;font-weight:bold"
 
-            if go_val == "GO":
-                styles[idx_go] += "; background-color: #d1e7dd; font-weight: bold"
-            elif go_val == "GL":
-                styles[idx_go] += "; background-color: #cfe2ff; font-weight: bold"
-
-        # -------------------------
-        # ⭐ ATTENTE (chauffeur *)
-        # -------------------------
         if _flag(row.get("IS_ATTENTE")) and "CH" in df.columns:
-            idx = df.columns.get_loc("CH")
-            styles[idx] += "; font-weight: bold"
+            styles[df.columns.get_loc("CH")] += "font-weight:bold"
 
         return styles
 
-    return df.style.apply(style_row, axis=1)
+    return styler.apply(style_row, axis=1)
 
 
+
+def style_chauffeur_confirmation(styler):
+    df = styler.data
+
+    if "CH" not in df.columns:
+        return styler
+
+    def _style_ch(val, confirmed):
+        if confirmed == 0:
+            return "background-color: #fff3cd; font-weight: bold"  # 🟠 à confirmer
+        elif confirmed == 1:
+            return "background-color: #d1e7dd; font-weight: bold"  # 🟢 confirmé
+        else:
+            return ""  # ⚪ normal = OK
+
+    def apply_col(col):
+        if col.name != "CH":
+            return [""] * len(col)
+
+        return [
+            _style_ch(col.iloc[i], df.iloc[i].get("CONFIRMED"))
+            for i in range(len(col))
+        ]
+
+    return styler.apply(apply_col, axis=0)
+
+
+def style_caisse_payee(styler):
+    df = styler.data
+
+    if "Caisse" not in df.columns or "PAIEMENT" not in df.columns:
+        return styler
+
+    def style_row(row):
+        styles = [""] * len(row)
+        idx = df.columns.get_loc("Caisse")
+
+        if str(row.get("PAIEMENT", "")).lower() == "caisse":
+            if int(row.get("CAISSE_PAYEE", 0) or 0) == 1:
+                styles[idx] = "background-color:#d1e7dd;font-weight:bold"
+            else:
+                styles[idx] = "background-color:#f8d7da;font-weight:bold"
+
+        return styles
+
+    return styler.apply(style_row, axis=1)
+
+
+
+def format_chauffeur_ui(ch, confirmed):
+    """
+    Retourne le chauffeur avec couleur + icône.
+    """
+    ch = str(ch or "").strip().upper()
+
+    if confirmed == 1:
+        return f"🟢 <b>{ch}</b>"
+    return f"🟠 <b>{ch}</b>"
+
+
+def format_caisse_ui(paiement, montant, caisse_payee):
+    """
+    Retourne l'affichage paiement caisse avec couleur.
+    """
+    try:
+        montant = float(montant)
+    except Exception:
+        montant = None
+
+    paiement = str(paiement or "").lower().strip()
+
+    if paiement == "caisse" and montant:
+        if caisse_payee == 1:
+            return (
+                "<span style='color:#2e7d32;font-weight:700;'>"
+                f"💶 {montant:.2f} € (PAYÉ)</span>"
+            )
+        return (
+            "<span style='color:#d32f2f;font-weight:700;'>"
+            f"💶 {montant:.2f} € (NON PAYÉ)</span>"
+        )
+
+    return ""
 
 
 
@@ -2629,6 +2763,10 @@ def render_tab_planning():
             "Tri",
             ["Date + heure", "Chauffeur + date + heure", "Aucun"],
         )
+    show_only_unconfirmed = st.checkbox(
+        "🟠 Afficher uniquement les navettes non confirmées",
+        value=False,
+    )
 
     # ----------------- Lecture DB -----------------
     df = get_planning(
@@ -2644,6 +2782,8 @@ def render_tab_planning():
     if df.empty:
         st.warning("Aucune navette pour ces paramètres.")
         return
+    if show_only_unconfirmed and "CONFIRMED" in df.columns:
+        df = df[df["CONFIRMED"] == 0].copy()
 
     # ----------------- Tri -----------------
     sort_cols = []
@@ -2666,6 +2806,10 @@ def render_tab_planning():
         nb_go_gl = df["GO"].astype(str).str.upper().isin(["GO", "GL"]).sum()
         colm2.metric("🎯 GO / GL", int(nb_go_gl))
 
+    if "CONFIRMED" in df.columns:
+        nb_unconfirmed = int((df["CONFIRMED"] == 0).sum())
+        colm2.metric("🟠 À confirmer", nb_unconfirmed)
+
     # ----------------- Légende couleurs -----------------
     with st.expander("ℹ️ Légende des couleurs", expanded=False):
         st.markdown("""
@@ -2673,6 +2817,7 @@ def render_tab_planning():
         🟡 **Heure jaune uniquement** : navette **partagée**  
         ⭐ **Chauffeur avec \\*** : aller + attente + reprise client  
         """)
+
     # ----------------- Préparation affichage -----------------
     df_display = df.copy()
 
@@ -2689,26 +2834,28 @@ def render_tab_planning():
         df_display = df_display[cols]
 
     # ----------------- Style AVANT suppression des flags -----------------
-    try:
-        styled = style_groupage_partage(df_display)
-    except Exception:
-        styled = df_display
+    styled = df_display.style
+    styled = style_groupage_partage(styled)
+    styled = style_chauffeur_confirmation(styled)
+    styled = style_caisse_payee(styled)
 
     # ----------------- Masquer colonnes techniques APRÈS style -----------------
-    try:
-        # pandas récents
-        styled = styled.hide(
-            columns=[c for c in ["IS_GROUPAGE", "IS_PARTAGE", "IS_ATTENTE"] if c in df_display.columns]
-        )
-    except TypeError:
-        # pandas plus anciens
-        styled = styled.hide(
-            subset=[c for c in ["IS_GROUPAGE", "IS_PARTAGE", "IS_ATTENTE"] if c in df_display.columns],
-            axis="columns"
-        )
+    from pandas.io.formats.style import Styler
 
-    # ----------------- Affichage tableau -----------------
+    cols_to_hide = [
+        c for c in ["IS_GROUPAGE", "IS_PARTAGE", "IS_ATTENTE", "CONFIRMED", "CAISSE_PAYEE"]
+        if c in df_display.columns
+    ]
+
+    if isinstance(styled, Styler) and cols_to_hide:
+        try:
+            styled = styled.hide(columns=cols_to_hide)
+        except Exception:
+            styled = styled.hide(subset=cols_to_hide, axis="columns")
+
+    # ----------------- Affichage tableau (UNE SEULE FOIS) -----------------
     st.dataframe(styled, use_container_width=True, height=520)
+
 
 
 
@@ -3654,256 +3801,175 @@ def build_chauffeur_day_message(df_ch: pd.DataFrame, ch_selected: str, day_label
 
     return "\n".join(lines).strip()
 
-
-
 # ============================================================
 #   ONGLET 🚖 VUE CHAUFFEUR (PC + GSM)
+#   -> DEVENU : ENVOI PLANNING BUREAU (OPTIMISÉ)
 # ============================================================
 
 def render_tab_vue_chauffeur(forced_ch=None):
     from streamlit_autorefresh import st_autorefresh
+    import pandas as pd
+    from datetime import date, datetime, timedelta
 
-    # 🔁 Rafraîchissement automatique (relance la vue)
-    AUTO_REFRESH_MINUTES = 5
+    # 🔁 Rafraîchissement léger (UI seulement)
     st_autorefresh(
-        interval=AUTO_REFRESH_MINUTES * 60 * 1000,
+        interval=5 * 60 * 1000,
         key="auto_refresh_vue_chauffeur",
     )
 
-    # 🔍 Auto-sync si le fichier Dropbox a changé
-    last_dbx_mtime = get_dropbox_file_last_modified()
-    last_known = st.session_state.get("last_dropbox_mtime")
+    st.subheader("📢 Bureau — Envoi planning chauffeurs")
 
-    if last_dbx_mtime and last_dbx_mtime != last_known:
-        with st.spinner("🔁 Planning mis à jour — actualisation automatique…"):
-            sync_planning_from_today()
-        st.session_state["last_dropbox_mtime"] = last_dbx_mtime
-
-    st.subheader("🚖 Vue Chauffeur (texte compact)")
-
-
-    # ===================================================
-    # 🔄 FLAG RELOAD APRÈS CONFIRMATION (SANS RERUN ICI)
-    # ===================================================
-    force_reload = bool(st.session_state.get("force_reload_planning"))
-
-
-
-    chs = get_chauffeurs_for_ui()
-
-    # ============================
-    #   CHOIX DU CHAUFFEUR
-    # ============================
-    if forced_ch:
-        ch_selected = forced_ch
-        st.markdown(f"Chauffeur connecté : **{ch_selected}**")
-    else:
-        ch_selected = st.selectbox(
-            "Choisir un chauffeur (CH) (laisser vide pour tous les chauffeurs)",
-            [""] + chs,
-            key="vue_chauffeur_ch",
+    # =======================================================
+    #   Accès réservé au bureau
+    # =======================================================
+    if st.session_state.get("role") != "admin":
+        st.info(
+            "Cette page sert uniquement au **bureau** pour envoyer le planning aux chauffeurs."
         )
+        return
 
     today = date.today()
 
-    # ============================
-    #   MODE TOUS LES CHAUFFEURS
-    # ============================
-    mode_all = False
+    # =======================================================
+    #   HELPERS PERF (CACHE)
+    # =======================================================
 
-    if not ch_selected and not forced_ch:
-        if st.session_state.get("role") == "admin":
-            mode_all = True
-            st.info("Mode tous les chauffeurs")
-        else:
-            st.info("Sélectionne un chauffeur")
-            return
-
-    # ============================
-    #   CHARGEMENT DU PLANNING
-    # ============================
-    if mode_all:
-        # ----------------------------
-        # ADMIN : TOUS LES CHAUFFEURS
-        # ----------------------------
-        df_ch = get_planning(
-            start_date=today,
-            end_date=today + timedelta(days=6),
-            chauffeur=None,
-            type_filter=None,
-            search="",
-            max_rows=5000,
-            source="7j",
-        )
-
-        tel_ch = None
-        mail_ch = None
-        last_ack = None
-
-    else:
-        # ----------------------------
-        # MODE CHAUFFEUR UNIQUE
-        # ----------------------------
-        tel_ch, mail_ch = get_chauffeur_contact(ch_selected)
-        last_ack = get_chauffeur_last_ack(ch_selected)
-
-        # ===================================================
-        # 🔄 CHARGEMENT DU PLANNING (LOGIQUE MÉTIER CORRECTE)
-        # ===================================================
-        df_all = get_planning(
-            start_date=today,
-            end_date=today + timedelta(days=6),
-            chauffeur=None,          # ⚠️ PAS de filtre DB
-            type_filter=None,
-            search="",
-            max_rows=5000,
-            source="7j",
-            force_reload=force_reload,
-        )
-
-        if df_all is None or df_all.empty:
-            st.warning("Aucune navette.")
-            return
-
-        ch_sel = str(ch_selected).strip().upper()
-
-        # 🔥 Filtrage métier :
-        # Une navette appartient au chauffeur SI ch_sel ∈ split_chauffeurs(CH)
-        df_ch = df_all[
-            df_all["CH"]
+    @st.cache_data(ttl=300)
+    def get_real_chauffeurs_fast():
+        """Liste des chauffeurs réels (FA, DO, NP...) sans planning"""
+        with get_connection() as conn:
+            df = pd.read_sql_query(
+                "SELECT DISTINCT INITIALE FROM chauffeurs",
+                conn,
+            )
+        return (
+            df["INITIALE"]
+            .dropna()
             .astype(str)
-            .apply(lambda x: ch_sel in split_chauffeurs(x))
-        ].copy()
-
-        if df_ch.empty:
-            st.warning("Aucune navette.")
-            return
-        # ===================================================
-        # 🧹 NETTOYAGE DU FLAG DE RELOAD (POINT 3)
-        # ===================================================
-        if force_reload:
-            st.session_state.pop("force_reload_planning", None)
-
-
-
-    # =======================================================
-    #   📢 ENVOI DU PLANNING (ADMIN)
-    # =======================================================
-    if st.session_state.get("role") == "admin":
-        st.markdown("---")
-        st.markdown("### 📢 Envoi du planning")
-
-        ensure_send_log_table()
-
-        # ---------------------------
-        # Choix période
-        # ---------------------------
-        periode = st.radio(
-            "📅 Quelle période envoyer ?",
-            ["Aujourd’hui", "Demain + 2 jours"],
-            horizontal=True,
-            key="send_planning_periode",
+            .str.strip()
+            .str.upper()
+            .unique()
+            .tolist()
         )
 
-        if periode == "Aujourd’hui":
-            d_start = today
-            d_end = today
-            periode_label = "du jour"
+    @st.cache_data(ttl=120)
+    def load_planning_for_period(start, end):
+        """Planning chargé UNE seule fois"""
+        return get_planning(
+            start_date=start,
+            end_date=end,
+            max_rows=5000,
+            source="7j",
+        )
+
+    @st.cache_data(ttl=300)
+    def get_ack_map_safe(chauffeurs):
+        """
+        Récupère la dernière confirmation par chauffeur
+        en utilisant la fonction existante get_chauffeur_last_ack,
+        sans dépendre du schéma de la base de données.
+        """
+        ack_map = {}
+
+        for ch in chauffeurs:
+            try:
+                ack_map[ch] = get_chauffeur_last_ack(ch)
+            except Exception:
+                ack_map[ch] = None
+
+        return ack_map
+
+    # =======================================================
+    #   📢 ENVOI DU PLANNING
+    # =======================================================
+    st.markdown("---")
+    st.markdown("### 📢 Envoi du planning")
+
+    ensure_send_log_table()
+
+    # ---------------------------
+    # Choix période
+    # ---------------------------
+    periode = st.radio(
+        "📅 Quelle période envoyer ?",
+        ["Aujourd’hui", "Demain + 2 jours"],
+        horizontal=True,
+    )
+
+    if periode == "Aujourd’hui":
+        d_start = today
+        d_end = today
+        periode_label = "du jour"
+    else:
+        d_start = today + timedelta(days=1)
+        d_end = today + timedelta(days=3)
+        periode_label = "de demain à J+3"
+
+    # ---------------------------
+    # Chauffeurs (ULTRA RAPIDE)
+    # ---------------------------
+    real_chauffeurs = sorted(get_real_chauffeurs_fast())
+
+    ch_choice = st.radio(
+        "🚖 Destinataire",
+        ["Tous les chauffeurs", "Un chauffeur"],
+        horizontal=True,
+    )
+
+    if ch_choice == "Un chauffeur":
+        multi_mode = st.checkbox("☑️ Sélection multiple de chauffeurs")
+
+        if multi_mode:
+            chauffeurs = st.multiselect(
+                "Sélectionner les chauffeurs",
+                real_chauffeurs,
+            )
         else:
-            d_start = today + timedelta(days=1)
-            d_end = today + timedelta(days=3)
-            periode_label = "de demain à J+3"
-
-        # ---------------------------
-        # Choix destinataire
-        # ---------------------------
-        ch_choice = st.radio(
-            "🚖 Destinataire",
-            ["Tous les chauffeurs", "Un chauffeur"],
-            horizontal=True,
-            key="send_planning_target",
-        )
-
-        if ch_choice == "Un chauffeur":
-            ch_target = st.selectbox(
+            ch_one = st.selectbox(
                 "Sélectionner le chauffeur",
-                sorted(df_ch["CH"].dropna().unique().tolist()),
-                key="send_planning_one_ch",
+                real_chauffeurs,
             )
+            chauffeurs = [ch_one] if ch_one else []
+    else:
+        chauffeurs = real_chauffeurs
 
-            base = ch_target.strip().upper()
-            chauffeurs = [
-                ch for ch in
-                df_ch["CH"].dropna().astype(str).str.upper().unique()
-                if base in ch
-            ]
-        else:
-            chauffeurs = sorted(
-                df_ch["CH"].dropna().astype(str).str.upper().unique()
-            )
+    chauffeurs = [c for c in chauffeurs if c]
 
-        col_mail, col_wa = st.columns(2)
+    col_mail, col_wa = st.columns(2)
 
-        # =========
-        # 📧 MAIL AUTO
-        # =========
-        with col_mail:
-            if st.button("📧 Envoyer le planning", use_container_width=True):
-
+    # ===================================================
+    # 📧 MAIL
+    # ===================================================
+    with col_mail:
+        if st.button("📧 Envoyer le planning", use_container_width=True):
+            if not chauffeurs:
+                st.warning("Aucun chauffeur à notifier.")
+            else:
                 errors = []
                 sent_once = set()
 
-                if not chauffeurs:
-                    st.warning("Aucun chauffeur à notifier.")
-                else:
-                    for ch_raw in chauffeurs:
+                for ch in chauffeurs:
+                    if ch in sent_once:
+                        continue
+                    sent_once.add(ch)
 
-                        # 🔥 DÉCOMPOSITION MÉTIER COMPLÈTE
-                        # Exemples :
-                        # FA*DO      -> [FA, DO]
-                        # FADONP     -> [FA, DO, NP]
-                        # FADO*NP*   -> [FA, DO, NP]
-                        ch_list = split_chauffeurs(ch_raw)
+                    try:
+                        _, mail = get_chauffeur_contact(ch)
+                        if not mail:
+                            raise ValueError("Email manquant")
 
-                        for ch in ch_list:
+                        send_planning_to_chauffeurs(
+                            chauffeurs=[ch],
+                            from_date=d_start,
+                            to_date=d_end,
+                            message_type="planning",
+                        )
 
-                            # 🛑 Anti-doublon global
-                            if not ch or ch in sent_once:
-                                continue
+                        log_send(ch, "MAIL", periode_label, "OK", "Envoyé")
 
-                            sent_once.add(ch)
-
-                            try:
-                                tel, mail = get_chauffeur_contact(ch)
-
-                                if not mail:
-                                    raise ValueError("Email manquant")
-
-                                send_planning_to_chauffeurs(
-                                    chauffeurs=[ch],
-                                    from_date=d_start,
-                                    to_date=d_end,
-                                    message_type="planning",
-                                )
-
-                                log_send(
-                                    ch,
-                                    "MAIL",
-                                    periode_label,
-                                    "OK",
-                                    "Envoyé",
-                                )
-
-                            except Exception as e:
-                                msg = str(e)
-                                log_send(
-                                    ch,
-                                    "MAIL",
-                                    periode_label,
-                                    "ERREUR",
-                                    msg,
-                                )
-                                errors.append((ch, msg))
+                    except Exception as e:
+                        log_send(ch, "MAIL", periode_label, "ERREUR", str(e))
+                        errors.append((ch, str(e)))
 
                 if errors:
                     st.error("❌ Certains envois ont échoué")
@@ -3912,534 +3978,180 @@ def render_tab_vue_chauffeur(forced_ch=None):
                 else:
                     st.success(f"✅ Planning {periode_label} envoyé")
 
+    # ===================================================
+    # 💬 WHATSAPP
+    # ===================================================
+    with col_wa:
+        if st.button("💬 Envoyer par WhatsApp", use_container_width=True):
+            if not chauffeurs:
+                st.warning("Aucun chauffeur à notifier.")
+            else:
+                df_all = load_planning_for_period(d_start, d_end)
+                wa_links = []
 
+                for ch in chauffeurs:
+                    tel, _ = get_chauffeur_contact(ch)
+                    if not tel:
+                        continue
 
-        # =========
-        # 💬 WHATSAPP
-        # =========
-        with col_wa:
-            if st.button("💬 Envoyer par WhatsApp", use_container_width=True):
+                    df_ch = df_all[
+                        df_all["CH"]
+                        .astype(str)
+                        .apply(lambda x: match_ch_for_mail(x, ch))
+                    ]
 
-                if not chauffeurs:
-                    st.warning("Aucun chauffeur à notifier.")
-                else:
-                    wa_links = []
+                    if df_ch.empty:
+                        continue
 
-                    df_all = get_planning(
-                        start_date=d_start,
-                        end_date=d_end,
-                        max_rows=5000,
-                        source="7j",
+                    wa_text = build_planning_mail_body(
+                        df_ch=df_ch,
+                        ch=ch,
+                        from_date=d_start,
+                        to_date=d_end,
                     )
 
-                    for ch in chauffeurs:
-                        ch = str(ch).strip().upper()
-                        if not ch:
-                            continue
+                    wa_links.append({
+                        "ch": ch,
+                        "tel": tel,
+                        "url": build_whatsapp_link(tel, wa_text),
+                    })
 
-                        tel, _ = get_chauffeur_contact(ch)
-                        if not tel:
-                            continue
-
-                        # 🔥 FILTRAGE MÉTIER CORRECT (COMME MAIL & VUE)
-                        df_ch_wa = df_all[
-                            df_all["CH"]
-                            .astype(str)
-                            .apply(lambda x: match_ch_for_mail(x, ch))
-                        ]
-
-                        if df_ch_wa.empty:
-                            continue
-
-                        wa_text = build_planning_mail_body(
-                            df_ch=df_ch_wa,
-                            ch=ch,
-                            from_date=d_start,
-                            to_date=d_end,
+                if not wa_links:
+                    st.warning("Aucun numéro WhatsApp disponible.")
+                else:
+                    st.markdown("### 💬 Envoi WhatsApp")
+                    for item in wa_links:
+                        st.markdown(
+                            f"- **{item['ch']}** ({item['tel']}) → "
+                            f"[📲 Ouvrir WhatsApp]({item['url']})"
                         )
 
-                        wa_url = build_whatsapp_link(tel, wa_text)
+    # ===================================================
+    # 📊 HISTORIQUE DES ENVOIS
+    # ===================================================
+    st.markdown("---")
+    st.markdown("### 📊 Historique des envois")
 
-                        wa_links.append({
-                            "ch": ch,
-                            "tel": tel,
-                            "url": wa_url,
-                        })
-
-                    if not wa_links:
-                        st.warning("Aucun numéro WhatsApp disponible.")
-                    else:
-                        st.markdown("### 💬 Envoi WhatsApp")
-                        st.caption(
-                            "Clique sur un lien pour ouvrir WhatsApp avec le message prêt à envoyer."
-                        )
-
-                        for item in wa_links:
-                            st.markdown(
-                                f"- **{item['ch']}** ({item['tel']}) → "
-                                f"[📲 Ouvrir WhatsApp]({item['url']})"
-                            )
-
-
-        # ===================================================
-        #   📊 HISTORIQUE DES ENVOIS
-        # ===================================================
-        st.markdown("---")
-        st.markdown("### 📊 Historique des envois")
-
-        with st.expander("🧹 Gestion de l’historique"):
-            st.warning("Cette action supprime définitivement l’historique.")
-            if st.button("🗑️ Vider l’historique des envois"):
-                with get_connection() as conn:
-                    conn.execute("DELETE FROM send_log")
-                    conn.commit()
-                st.success("✅ Historique supprimé.")
-                st.rerun()
-
-        with get_connection() as conn:
-            df_log = pd.read_sql_query(
-                """
-                SELECT ts, chauffeur, canal, periode, statut, message
-                FROM send_log
-                ORDER BY ts DESC
-                LIMIT 100
-                """,
-                conn,
-            )
-
-        st.dataframe(df_log, use_container_width=True)
-
-
-
-
-
-
-    # =======================================================
-    #   📊 STATUT CONFIRMATION PAR CHAUFFEUR (ADMIN)
-    # =======================================================
-    if mode_all and st.session_state.get("role") == "admin":
-        st.markdown("---")
-        st.markdown("### 📊 Statut des chauffeurs")
-
-        chauffeurs = sorted(df_ch["CH"].dropna().unique().tolist())
-
-        status_rows = []
-
-        for ch in chauffeurs:
-            last_ack = get_chauffeur_last_ack(ch)
-
-            status_rows.append({
-                "Chauffeur": ch,
-                "Statut": "🟢 Confirmé" if last_ack else "🔴 Non confirmé",
-                "Dernière confirmation": (
-                    last_ack.strftime("%d/%m/%Y %H:%M")
-                    if last_ack else "—"
-                ),
-            })
-
-        st.dataframe(
-            pd.DataFrame(status_rows),
-            use_container_width=True,
-            hide_index=True,
+    with get_connection() as conn:
+        df_log = pd.read_sql_query(
+            """
+            SELECT ts, chauffeur, canal, periode, statut, message
+            FROM send_log
+            ORDER BY ts DESC
+            LIMIT 100
+            """,
+            conn,
         )
 
-        # ===================================================
-        #   ⏰ RAPPEL AUX CHAUFFEURS NON CONFIRMÉS
-        # ===================================================
-        if st.button("⏰ Rappel aux chauffeurs non confirmés"):
+    st.dataframe(df_log, use_container_width=True)
+    # ===================================================
+    # 🚦 STATUT DES CHAUFFEURS (BASE EXCEL / NAVETTES)
+    # ===================================================
+    st.markdown("---")
+    st.markdown("### 🚦 Statut des chauffeurs")
 
-            chauffeurs = sorted(
-                df_ch["CH"].dropna().unique().tolist()
-            )
+    # Dernier envoi par chauffeur (send_log)
+    with get_connection() as conn:
+        df_last_send = pd.read_sql_query(
+            """
+            SELECT chauffeur, MAX(ts) AS last_sent
+            FROM send_log
+            WHERE statut = 'OK'
+            GROUP BY chauffeur
+            """,
+            conn,
+        )
 
-            non_confirmes = [
-                ch for ch in chauffeurs
-                if not get_chauffeur_last_ack(ch)
+    last_send_map = {
+        str(r["chauffeur"]).strip().upper(): r["last_sent"]
+        for _, r in df_last_send.iterrows()
+        if r["chauffeur"]
+    }
+
+    # Planning source (Excel / DB)
+    df_status_src = load_planning_for_period(d_start, d_end)
+
+    rows = []
+    chauffeurs_a_relancer = []
+
+    for ch in real_chauffeurs:
+        ch_u = str(ch).strip().upper()
+        last_sent = last_send_map.get(ch_u)
+
+        # Navettes du chauffeur (gestion FA*DO, FADO, etc.)
+        if not df_status_src.empty and "CH" in df_status_src.columns:
+            df_ch = df_status_src[
+                df_status_src["CH"]
+                .astype(str)
+                .apply(lambda x: match_ch_for_mail(x, ch_u))
             ]
+        else:
+            df_ch = pd.DataFrame()
 
-            if not non_confirmes:
-                st.success("✅ Tous les chauffeurs ont confirmé leur planning.")
+        # -----------------------------
+        # Détermination du statut
+        # -----------------------------
+        if df_ch.empty:
+            if last_sent:
+                statut = "🕒 Envoyé / non confirmé"
             else:
+                statut = "❌ Jamais envoyé"
+            last_confirm_txt = "—"
+
+        elif "CONFIRMED" in df_ch.columns and (df_ch["CONFIRMED"] == 0).any():
+            statut = "🟠 À confirmer"
+            last_confirm_txt = "Voir navettes"
+            chauffeurs_a_relancer.append(ch_u)
+
+        else:
+            statut = "🟢 Confirmé"
+            last_confirm_txt = "Voir navettes"
+
+        rows.append({
+            "Chauffeur": ch_u,
+            "Statut": statut,
+            "📅 Dernier envoi": str(last_sent) if last_sent else "—",
+            "✅ Dernière confirmation": last_confirm_txt,
+        })
+
+    st.dataframe(
+        pd.DataFrame(rows),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # ===================================================
+    # ⏰ RAPPEL AUX CHAUFFEURS NON CONFIRMÉS (BASE EXCEL)
+    # ===================================================
+    st.markdown("---")
+    st.markdown("### ⏰ Rappel aux chauffeurs non confirmés")
+
+    if not chauffeurs_a_relancer:
+        st.success("✅ Tous les chauffeurs ont confirmé leur planning.")
+    else:
+        st.info(
+            f"🚖 {len(chauffeurs_a_relancer)} chauffeur(s) à relancer : "
+            + ", ".join(chauffeurs_a_relancer)
+        )
+
+        if st.button("📣 Envoyer un rappel aux chauffeurs concernés"):
+            try:
                 send_planning_to_chauffeurs(
-                    chauffeurs=non_confirmes,
+                    chauffeurs=chauffeurs_a_relancer,
                     from_date=today,
                     to_date=None,
                     message_type="modification",
                 )
 
                 st.success(
-                    f"⏰ Rappel envoyé à {len(non_confirmes)} chauffeur(s) non confirmé(s)."
+                    f"⏰ Rappel envoyé à {len(chauffeurs_a_relancer)} chauffeur(s)."
                 )
                 st.rerun()
 
+            except Exception as e:
+                st.error(f"❌ Erreur lors de l’envoi des rappels : {e}")
 
 
-    # =======================================================
-    #   CHOIX DE LA PÉRIODE (CLAIR POUR LE CHAUFFEUR)
-    # =======================================================
-    scope = st.radio(
-        "📅 Quelles navettes veux-tu voir ?",
-        ["Navettes du jour", "Navettes à partir de demain"],
-        index=0,
-        horizontal=True,
-        key="vue_chauffeur_scope",
-    )
-
-    if scope == "Navettes du jour":
-        sel_date = today
-        scope_label = sel_date.strftime("%d/%m/%Y")
-
-        df_ch = get_chauffeur_planning(
-            ch_selected,
-            from_date=sel_date,
-            to_date=sel_date,
-        )
-
-    else:
-        sel_date = today + timedelta(days=1)
-        scope_label = f"à partir du {sel_date.strftime('%d/%m/%Y')}"
-
-        df_ch = get_chauffeur_planning(
-            ch_selected,
-            from_date=sel_date,
-            to_date=None,
-        )
-
-    if df_ch.empty:
-        st.warning(f"Aucune navette {scope_label}.")
-        return
-
-    df_ch = _sort_df_by_date_heure(df_ch)
-    render_chauffeur_stats(df_ch)
-
-    # =======================================================
-    #   CONFIRMATION GLOBALE DU CHAUFFEUR
-    #   (envoi de TOUT ce qui a été encodé)
-    # =======================================================
-    st.markdown("---")
-    st.markdown("### ✅ Envoyer ma confirmation au bureau")
-
-    missing = []
-    recap_lines = []
-
-    for _, row in df_ch.iterrows():
-        nav_id = row.get("id")
-
-        trajet = st.session_state.get(f"trajet_nav_{nav_id}", "").strip()
-        probleme = st.session_state.get(f"prob_nav_{nav_id}", "").strip()
-
-        if not trajet:
-            missing.append(nav_id)
-
-        recap_lines.append(
-            f"Navette ID {nav_id}\n"
-            f"Chauffeur : {ch_selected}\n"
-            f"Trajet : {trajet or '❌ NON RENSEIGNÉ'}\n"
-            f"Problème : {probleme or '—'}\n"
-            "-----------------------------"
-        )
-
-    if missing:
-        st.error(
-            f"❌ {len(missing)} navette(s) sans trajet renseigné. "
-            "Merci de compléter toutes les lignes avant l’envoi."
-        )
-
-    if st.button(
-        "📤 Envoyer ma confirmation et mes remarques",
-        disabled=bool(missing),
-        key=f"confirm_all_{ch_selected}",
-    ):
-        try:
-            send_mail_admin(
-                subject=f"[CONFIRMATION CHAUFFEUR] {ch_selected}",
-                body=(
-                    f"Confirmation du chauffeur {ch_selected}\n\n"
-                    + "\n".join(recap_lines)
-                ),
-            )
-
-            # Marquer comme confirmé
-            set_chauffeur_last_ack(ch_selected)
-
-            st.success("✅ Confirmation envoyée au bureau. Merci 👍")
-            st.rerun()
-
-        except Exception as e:
-            st.error(f"Erreur lors de l’envoi : {e}")
-
-
-    # =======================================================
-    #   DÉTAIL DES NAVETTES (TEXTE COMPACT)
-    # =======================================================
-    if df_ch is None or df_ch.empty:
-        st.info("Aucune navette pour cette période.")
-
-    else:
-        st.markdown("---")
-        st.markdown("### 📋 Détail des navettes (texte compact)")
-        st.caption(
-            "Les lignes marquées 🆕 sont celles modifiées depuis ta dernière confirmation."
-        )
-
-        cols = df_ch.columns.tolist()
-
-        for _, row in df_ch.iterrows():
-
-            # ===================================================
-            # INITIALISATION (OBLIGATOIRE)
-            # ===================================================
-            bloc_lines = []
-
-            nav_id = row.get("id")
-            is_new = bool(row.get("IS_NEW", False))
-            heure_txt = normalize_time_string(row.get("HEURE", "")) or "??:??"
-
-            # ===================================================
-            # Groupage / Partage / Attente
-            # ===================================================
-            is_groupage = int(row.get("IS_GROUPAGE", 0) or 0) == 1
-            is_partage = int(row.get("IS_PARTAGE", 0) or 0) == 1
-            is_attente = int(row.get("IS_ATTENTE", 0) or 0) == 1
-
-            prefix = ""
-            if is_groupage:
-                prefix = "🟡 [GROUPÉE] "
-            elif is_partage:
-                prefix = "🟡 [PARTAGÉE] "
-            if is_attente:
-                prefix += "⭐ "
-
-            # ===================================================
-            # Date
-            # ===================================================
-            date_val = row.get("DATE", "")
-            if isinstance(date_val, (datetime, date)):
-                date_obj = date_val
-            else:
-                date_obj = pd.to_datetime(
-                    date_val, dayfirst=True, errors="coerce"
-                )
-
-            date_txt = (
-                date_obj.strftime("%d/%m/%Y")
-                if not pd.isna(date_obj)
-                else ""
-            )
-
-            # ===================================================
-            # Indisponibilité
-            # ===================================================
-            if is_indispo_row(row, cols):
-                end_indispo = (
-                    normalize_time_string(row.get("²²²²", "")) or "??:??"
-                )
-                bloc_lines.append(
-                    f"📆 {date_txt} | ⏱ {heure_txt} → {end_indispo} | 🚫 Indisponible"
-                )
-                bloc_lines.append(
-                    f"👨‍✈️ {row.get('CH', ch_selected)}"
-                )
-                st.markdown("<br>".join(bloc_lines), unsafe_allow_html=True)
-                st.markdown("---")
-                continue
-
-            # ===================================================
-            # HEADER
-            # ===================================================
-            header = ""
-            if is_new:
-                header += "🆕 "
-            header += prefix
-            header += f"📆 {date_txt} | ⏱ {heure_txt}"
-            bloc_lines.append(header)
-
-            # ===================================================
-            # Chauffeur
-            # ===================================================
-            bloc_lines.append(
-                f"👨‍✈️ {row.get('CH', ch_selected)}"
-            )
-
-            # ===================================================
-            # Sens / Destination (DE / VERS + BRU / CRL / etc.)
-            # ===================================================
-            sens_txt = format_sens_ar(row.get("Unnamed: 8"))
-
-            dest_raw = ""
-            for cand in ["DESIGNATION", "DESTINATION", "DE/VERS"]:
-                if cand in cols and row.get(cand):
-                    dest_raw = str(row.get(cand)).strip()
-                    if dest_raw:
-                        break
-
-            dest = resolve_client_alias(dest_raw)
-
-            if sens_txt and dest:
-                bloc_lines.append(f"➡ {sens_txt} ({dest})")
-            elif sens_txt:
-                bloc_lines.append(f"➡ {sens_txt}")
-            elif dest:
-                bloc_lines.append(f"➡ {dest}")
-
-            # ===================================================
-            # Client
-            # ===================================================
-            nom = str(row.get("NOM", "") or "").strip()
-            if nom:
-                bloc_lines.append(f"🧑 {nom}")
-
-            # ===================================================
-            # BDC
-            # ===================================================
-            for cand in ["NUM BDC", "Num BDC", "NUM_BDC", "BDC"]:
-                if cand in cols and row.get(cand):
-                    bloc_lines.append(
-                        f"🧾 BDC : {str(row.get(cand)).strip()}"
-                    )
-                    break
-
-            # ===================================================
-            # Véhicule
-            # ===================================================
-            immat = str(row.get("IMMAT", "") or "").strip()
-            if immat:
-                bloc_lines.append(f"🚘 Plaque : {immat}")
-
-            siege_bebe = extract_positive_int(row.get("SIEGE", row.get("SIÈGE")))
-            if siege_bebe:
-                bloc_lines.append(f"🍼 Siège bébé : {siege_bebe}")
-
-            reh_n = extract_positive_int(row.get("REH"))
-            if reh_n:
-                bloc_lines.append(f"🪑 Rehausseur : {reh_n}")
-
-            # ===================================================
-            # Adresse / Téléphone
-            # ===================================================
-            adr_full = build_full_address_from_row(row)
-            if adr_full:
-                bloc_lines.append(f"📍 {adr_full}")
-
-            client_phone = get_client_phone_from_row(row)
-            tel_clean = clean_phone(client_phone) if client_phone else ""
-
-            if client_phone:
-                bloc_lines.append(
-                    f"📞 Client : [{client_phone}](tel:{tel_clean})"
-                )
-
-            # ===================================================
-            # Paiement / PAX
-            # ===================================================
-            pay_lines = []
-
-            if row.get("PAX"):
-                pay_lines.append(f"👥 {row.get('PAX')} pax")
-
-            paiement = str(row.get("PAIEMENT", "") or "").lower().strip()
-            caisse = row.get("Caisse")
-
-            if paiement == "facture":
-                pay_lines.append("🧾 **FACTURE**")
-            elif paiement == "caisse" and caisse:
-                pay_lines.append(
-                    "<span style='color:#d32f2f;font-weight:800;'>"
-                    f"💶 {caisse} € (CASH)</span>"
-                )
-            elif paiement == "bancontact" and caisse:
-                pay_lines.append(
-                    "<span style='color:#1976d2;font-weight:800;'>"
-                    f"💳 {caisse} € (BANCONTACT)</span>"
-                )
-
-            if pay_lines:
-                bloc_lines.append(" | ".join(pay_lines))
-
-            # ===================================================
-            # GO
-            # ===================================================
-            go_val = str(row.get("GO", "") or "").strip()
-            if go_val:
-                bloc_lines.append(f"🟢 {go_val}")
-
-            # ===================================================
-            # Confirmation
-            # ===================================================
-            if is_navette_confirmed(row):
-                bloc_lines.append("✅ **Navette confirmée**")
-            else:
-                bloc_lines.append("🕒 **À confirmer**")
-
-            # ===================================================
-            # ✈️ Vol – statut (UNIQUEMENT AUJOURD'HUI)
-            # ===================================================
-            vol = extract_vol_val(row, cols)
-            if (
-                vol
-                and isinstance(date_obj, (datetime, date))
-                and date_obj == today
-            ):
-                bloc_lines.append(f"✈️ Vol {vol}")
-
-                status, delay_min, *_ = get_flight_status_cached(vol)
-                badge = flight_badge(status, delay_min)
-
-                if badge:
-                    bloc_lines.append(f"📡 {badge}")
-
-                if (
-                    delay_min is not None
-                    and delay_min >= FLIGHT_ALERT_DELAY_MIN
-                ):
-                    bloc_lines.append(
-                        f"🚨 **ATTENTION : retard {delay_min} min**"
-                    )
-
-            # ===================================================
-            # AFFICHAGE FINAL
-            # ===================================================
-            st.markdown(
-                "<br>".join(bloc_lines),
-                unsafe_allow_html=True,
-            )
-            # ===================================================
-            # Saisie chauffeur
-            # ===================================================
-            trajet_key = f"trajet_nav_{nav_id}"
-            prob_key = f"prob_nav_{nav_id}"
-
-            st.session_state.setdefault(trajet_key, "")
-            st.session_state.setdefault(prob_key, "")
-
-            st.text_input(
-                "Trajet compris (ex : Liège → Zaventem)",
-                key=trajet_key,
-            )
-
-            with st.expander("🚨 Signaler un problème (optionnel)"):
-                st.text_area(
-                    "Décris le problème pour cette navette",
-                    key=prob_key,
-                    placeholder=(
-                        "Ex : heure impossible, adresse incorrecte, "
-                        "client injoignable…"
-                    ),
-                )
-
-        st.markdown("---")
-        st.markdown("### 📄 Mon planning")
-
-        if st.button("📄 Télécharger mon planning en PDF"):
-            pdf_buffer = export_chauffeur_planning_pdf(
-                df_ch, ch_selected
-            )
-            st.download_button(
-                label="⬇️ Télécharger le PDF",
-                data=pdf_buffer,
-                file_name=f"planning_{ch_selected}.pdf",
-                mime="application/pdf",
-            )
 
 def export_chauffeur_planning_pdf(df_ch: pd.DataFrame, ch: str):
     buffer = io.BytesIO()

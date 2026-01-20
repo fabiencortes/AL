@@ -145,8 +145,6 @@ def _load_planning_df() -> pd.DataFrame:
         df["PARTAGE"] = "0"
 
     return df
-
-
 # =========================
 #   LECTURE PLANNING
 # =========================
@@ -173,7 +171,7 @@ def get_planning(
         table = "planning_7j"
 
     # =========================
-    # Lecture DB (ORDER BY robuste)
+    # Lecture DB
     # =========================
     try:
         with get_connection() as conn:
@@ -198,13 +196,18 @@ def get_planning(
     # Conversion DATE propre
     # =========================
     if "DATE" in df.columns:
-        df["DATE"] = pd.to_datetime(df["DATE"], dayfirst=True, errors="coerce").dt.date
+        df["DATE"] = pd.to_datetime(
+            df["DATE"],
+            dayfirst=True,
+            errors="coerce"
+        ).dt.date
 
     # =========================
     # Filtre date
     # =========================
     if start_date or end_date:
         if "DATE" in df.columns:
+
             def _keep_date(d):
                 if pd.isna(d) or not isinstance(d, date):
                     return False
@@ -258,9 +261,10 @@ def get_planning(
         df = df[df.apply(_row_match, axis=1)].copy()
 
     # =========================
-    # Tri final DATE + HEURE (garanti)
+    # Tri final DATE + HEURE
     # =========================
     if "HEURE" in df.columns:
+
         def _heure_sort_tuple(h):
             h2 = _normalize_heure_str(h)
             if not h2 or ":" not in h2:
@@ -280,12 +284,16 @@ def get_planning(
         sort_cols.append("DATE")
     sort_cols.append("_HSORT")
 
-    df = df.sort_values(sort_cols).drop(columns=["_HSORT"], errors="ignore")
+    df = (
+        df.sort_values(sort_cols)
+        .drop(columns=["_HSORT"], errors="ignore")
+    )
 
     if max_rows and len(df) > max_rows:
         df = df.head(max_rows)
 
     return df
+
 
 
 def get_planning_columns() -> List[str]:
@@ -682,6 +690,34 @@ def ensure_planning_row_key_index():
         )
         conn.commit()
 
+def ensure_planning_confirmation_and_caisse_columns():
+    """
+    S'assure que les colonnes métier suivantes existent dans la table planning :
+    - CONFIRMED       : 0 / 1
+    - CONFIRMED_AT    : datetime (TEXT SQLite)
+    - CAISSE_PAYEE    : 0 / 1
+    """
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(planning)")
+        existing_cols = {row[1] for row in cur.fetchall()}
+
+        if "CONFIRMED" not in existing_cols:
+            conn.execute(
+                'ALTER TABLE planning ADD COLUMN "CONFIRMED" INTEGER DEFAULT 0'
+            )
+
+        if "CONFIRMED_AT" not in existing_cols:
+            conn.execute(
+                'ALTER TABLE planning ADD COLUMN "CONFIRMED_AT" TEXT'
+            )
+
+        if "CAISSE_PAYEE" not in existing_cols:
+            conn.execute(
+                'ALTER TABLE planning ADD COLUMN "CAISSE_PAYEE" INTEGER DEFAULT 0'
+            )
+
+        conn.commit()
 
 def rebuild_planning_db_from_two_excel_files(file_1, file_2) -> int:
     """
