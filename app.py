@@ -117,6 +117,8 @@ USERS = {
     "gd": {"password": "gd", "role": "driver", "chauffeur_code": "GD"},
     "om": {"password": "om", "role": "driver", "chauffeur_code": "OM"},
     "ad": {"password": "ad", "role": "driver", "chauffeur_code": "AD"},
+    "au": {"password": "au", "role": "driver", "chauffeur_code": "AU"},
+    "ge": {"password": "ge", "role": "driver", "chauffeur_code": "GE"},
 }
 
 # Fallback si Feuil2 ne contient rien
@@ -5970,5 +5972,6 @@ def main():
 
 
 if __name__ == "__main__":
+
 
     main()
