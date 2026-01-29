@@ -3,7 +3,7 @@
 #   BLOC 1/7 : IMPORTS, CONFIG, HELPERS, SESSION
 # ============================================================
 DEBUG_SAFE_MODE = True
-AUTO_SYNC_ENABLED = False  # 🔒 Désactivé : synchro uniquement manuelle
+AUTO_SYNC_ENABLED = True  # 🔒 Désactivé : synchro uniquement manuelle
 import os
 import io
 import sqlite3
@@ -73,6 +73,8 @@ from database import (
     ensure_chauffeur_messages_table,
     ensure_admin_reply_read_column,
     ensure_admin_reply_columns,
+    ensure_excel_sync_column,
+    cleanup_orphan_planning_rows,
 )
 from utils import add_excel_color_flags_from_dropbox, log_event, render_logs_ui
 def rebuild_planning_views():
@@ -189,6 +191,7 @@ def init_db_once():
     ensure_admin_reply_read_column()
     ensure_planning_updated_at_column()
     ensure_admin_reply_columns()
+    ensure_excel_sync_column()
     print("▶️ ensure columns OK", flush=True)
 
     # 🔒 VUES SQLITE (UNE SEULE FOIS)
@@ -1207,7 +1210,7 @@ def format_chauffeur_colored(ch, confirmed, row=None):
 
     return f"🟠 {ch}"
 
-def sync_planning_from_today():
+def sync_planning_from_today(excel_sync_ts: str | None = None):
     """
     🔄 Synchronisation SAFE depuis aujourd’hui
     - ZÉRO doublon (row_key + INSERT OR IGNORE)
@@ -1281,13 +1284,33 @@ def sync_planning_from_today():
     def _normalize_excel_date_to_iso(val):
         """
         Retourne 'YYYY-MM-DD' ou None.
-        Gère:
-        - dd/mm/YYYY
+        Gère proprement les cas ambigus (02-01-2026 = 2 janvier 2026).
+        Supporte :
+        - datetime / date
+        - serial Excel (nombre)
+        - dd/mm/YYYY, dd-mm-YYYY, dd/mm/YY, dd-mm-YY
         - YYYY-MM-DD
-        - "samedi 24 janvier 2026" / "vendredi 23 janvier 2026"
+        - "samedi 24 janvier 2026"
         """
         if val is None:
             return None
+
+        # date/datetime direct
+        if isinstance(val, (datetime, date)):
+            try:
+                return val.strftime("%Y-%m-%d")
+            except Exception:
+                pass
+
+        # serial Excel (jours depuis 1899-12-30)
+        try:
+            if isinstance(val, (int, float)) and not pd.isna(val):
+                if 20000 <= float(val) <= 60000:  # plage réaliste
+                    dt = pd.to_datetime(float(val), unit="D", origin="1899-12-30", errors="coerce")
+                    if not pd.isna(dt):
+                        return dt.strftime("%Y-%m-%d")
+        except Exception:
+            pass
 
         s = str(val).strip()
         if not s or s.lower() in ("nan", "none"):
@@ -1304,7 +1327,18 @@ def sync_planning_from_today():
         except Exception:
             pass
 
-        # dd/mm/YYYY
+        # dd/mm/YYYY ou dd-mm-YYYY (priorité jour/mois)
+        for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y", "%d-%m-%y"):
+            try:
+                dt = datetime.strptime(s_low, fmt)
+                # 2 chiffres → supposer 20xx si < 50 sinon 19xx (simple et stable)
+                if fmt.endswith("%y") and dt.year < 100:
+                    dt = dt.replace(year=dt.year + (2000 if dt.year < 50 else 1900))
+                return dt.strftime("%Y-%m-%d")
+            except Exception:
+                pass
+
+        # Dernière chance pandas (dayfirst=True)
         try:
             dt = pd.to_datetime(s_low, dayfirst=True, errors="coerce")
             if not pd.isna(dt):
@@ -1548,6 +1582,10 @@ def sync_planning_from_today():
     # ======================================================
     # 🔟 INSERTION SAFE (PRÉSERVE CONFIRMATION / ACK)
     # ======================================================
+    # --------------------------------------------------
+    # 🔟 INSERTION SAFE (PRÉSERVE CONFIRMATION / ACK)
+    #    ✅ UNE SEULE CONNEXION SQLite (évite database locked)
+    # --------------------------------------------------
     inserts = 0
     planning_cols = get_planning_table_columns()
 
@@ -1564,54 +1602,47 @@ def sync_planning_from_today():
         "Siège": "Siège",
     }
 
-    for _, row in df_excel.iterrows():
-        rk = row.get("row_key")
-        if not rk:
-            continue
+    with get_connection() as conn:
+        cur = conn.cursor()
 
-        data = {}
+        for _, row in df_excel.iterrows():
+            rk = row.get("row_key")
+            if not rk:
+                continue
 
-        # --------------------------------------------------
-        # Colonnes directes Excel -> DB
-        # --------------------------------------------------
-        for col in df_excel.columns:
-            if col in planning_cols and col not in ("id",):
-                val = row.get(col)
-                if val not in (None, "", "nan"):
-                    data[col] = sqlite_safe(val)
+            data: dict = {}
 
-        # --------------------------------------------------
-        # Mapping colonnes Excel -> DB
-        # --------------------------------------------------
-        for excel_col, db_col in EXCEL_TO_DB_COLS.items():
-            if excel_col in df_excel.columns and db_col in planning_cols:
-                val = row.get(excel_col)
-                if val not in (None, "", "nan"):
-                    data[db_col] = sqlite_safe(val)
+            # 🔑 MARQUAGE SYNCHRO EXCEL (si fourni)
+            if excel_sync_ts and "EXCEL_SYNC_TS" in planning_cols:
+                data["EXCEL_SYNC_TS"] = excel_sync_ts
 
-        # --------------------------------------------------
-        # Sécurité congé / indispo
-        # --------------------------------------------------
-        if int(row.get("IS_INDISPO", 0) or 0) == 1:
-            data["CONFIRMED"] = 0
-            data["CONFIRMED_AT"] = None
-            data["ACK_AT"] = None
-            data["ACK_TEXT"] = None
-            data["CAISSE_PAYEE"] = 0
-            data["IS_INDISPO"] = 1
+            # Colonnes directes Excel -> DB
+            for col in df_excel.columns:
+                if col in planning_cols and col not in ("id",):
+                    val = row.get(col)
+                    if val not in (None, "", "nan"):
+                        data[col] = sqlite_safe(val)
 
-        # --------------------------------------------------
-        # 🔒 PRÉSERVER L'ÉTAT MÉTIER EXISTANT (CRITIQUE)
-        # --------------------------------------------------
-        with get_connection() as conn:
-            cur = conn.cursor()
+            # Mapping colonnes Excel -> DB
+            for excel_col, db_col in EXCEL_TO_DB_COLS.items():
+                if excel_col in df_excel.columns and db_col in planning_cols:
+                    val = row.get(excel_col)
+                    if val not in (None, "", "nan"):
+                        data[db_col] = sqlite_safe(val)
+
+            # Sécurité congé / indispo
+            if int(row.get("IS_INDISPO", 0) or 0) == 1:
+                data["CONFIRMED"] = 0
+                data["CONFIRMED_AT"] = None
+                data["ACK_AT"] = None
+                data["ACK_TEXT"] = None
+                data["CAISSE_PAYEE"] = 0
+                data["IS_INDISPO"] = 1
+
+            # 🔒 PRÉSERVER L'ÉTAT MÉTIER EXISTANT (CRITIQUE)
             cur.execute(
                 """
-                SELECT
-                    CONFIRMED,
-                    CONFIRMED_AT,
-                    ACK_AT,
-                    ACK_TEXT
+                SELECT CONFIRMED, CONFIRMED_AT, ACK_AT, ACK_TEXT
                 FROM planning
                 WHERE row_key = ?
                 """,
@@ -1619,30 +1650,38 @@ def sync_planning_from_today():
             )
             prev = cur.fetchone()
 
-        if prev:
-            data["CONFIRMED"] = prev[0]
-            data["CONFIRMED_AT"] = prev[1]
-            data["ACK_AT"] = prev[2]
-            data["ACK_TEXT"] = prev[3]
+            if prev:
+                data["CONFIRMED"] = prev[0]
+                data["CONFIRMED_AT"] = prev[1]
+                data["ACK_AT"] = prev[2]
+                data["ACK_TEXT"] = prev[3]
 
-        # --------------------------------------------------
-        # row_key + updated_at
-        # --------------------------------------------------
-        data["row_key"] = rk
-        data["updated_at"] = now_iso
+            # row_key + updated_at
+            data["row_key"] = rk
+            data["updated_at"] = now_iso
 
-        # --------------------------------------------------
-        # INSERT SAFE (anti-doublon)
-        # --------------------------------------------------
-        try:
-            res = insert_planning_row(data, ignore_conflict=True)
-            if res != -1:
-                inserts += 1
-        except Exception:
-            pass
+            # INSERT OR IGNORE (anti-doublon)
+            cols = [c for c in data.keys() if c in planning_cols]
+            if not cols:
+                continue
 
+            col_sql = ", ".join([f'"{c}"' for c in cols])
+            placeholders = ", ".join(["?"] * len(cols))
+            values = [data[c] for c in cols]
 
-    # ======================================================
+            try:
+                cur.execute(
+                    f"INSERT OR IGNORE INTO planning ({col_sql}) VALUES ({placeholders})",
+                    values,
+                )
+                if cur.rowcount and cur.rowcount > 0:
+                    inserts += 1
+            except Exception:
+                pass
+
+        conn.commit()
+
+# ======================================================
     # 11️⃣ Rebuild vues
     # ======================================================
     rebuild_planning_views()
@@ -2164,13 +2203,6 @@ st.set_page_config(
     page_title="Airports-Lines – Planning chauffeurs",
     layout="wide",
 )
-
-# 🔐 INITIALISATION OBLIGATOIRE DU SESSION STATE
-init_session_state()
-
-if st.session_state.get("logged_in") is not True:
-    login_screen()
-    st.stop()
 
 
 def get_chauffeurs_for_ui() -> List[str]:
@@ -3455,6 +3487,7 @@ def build_chauffeur_day_message(df_ch: pd.DataFrame, ch_selected: str, day_label
         lines.append("")
 
     return "\n".join(lines).strip()
+
 # ============================================================
 #   ONGLET 📅 PLANNING — VUE RAPIDE AVEC COULEURS
 # ============================================================
@@ -3468,7 +3501,13 @@ def render_tab_planning():
 
     today = date.today()
 
-    # ----------------- Raccourcis dates -----------------
+    # ===================================================
+    # 📆 BOUTONS PÉRIODE (SEULE SOURCE DE DATES)
+    # ===================================================
+    if "planning_start" not in st.session_state:
+        st.session_state.planning_start = today
+        st.session_state.planning_end = today
+
     colb1, colb2, colb3, colb4 = st.columns(4)
 
     with colb1:
@@ -3490,43 +3529,50 @@ def render_tab_planning():
             st.session_state.planning_end = dimanche
 
     with colb4:
-        if st.button("📆 Semaine prochaine"):
-            lundi = today - timedelta(days=today.weekday()) + timedelta(days=7)
-            dimanche = lundi + timedelta(days=6)
-            st.session_state.planning_start = lundi
-            st.session_state.planning_end = dimanche
+        if st.button("📆 7 prochains jours"):
+            st.session_state.planning_start = today
+            st.session_state.planning_end = today + timedelta(days=6)
 
-    # ----------------- Sélection période -----------------
-    start_date = st.date_input("Date de début", st.session_state.planning_start)
-    end_date = st.date_input("Date de fin", st.session_state.planning_end)
+    start_date = st.session_state.planning_start
+    end_date = st.session_state.planning_end
 
-    st.session_state.planning_start = start_date
-    st.session_state.planning_end = end_date
+    st.caption(
+        f"📅 Période : **{start_date.strftime('%d/%m/%Y')} → {end_date.strftime('%d/%m/%Y')}**"
+    )
 
-    # ----------------- Filtres -----------------
-    chs = get_chauffeurs_for_ui()
-    ch_value = st.selectbox("Chauffeur", ["(Tous)"] + chs)
-    ch_value = None if ch_value == "(Tous)" else ch_value
+    # ===================================================
+    # 🔍 FILTRES SIMPLES
+    # ===================================================
+    colf1, colf2 = st.columns([2, 1])
 
-    type_choice = st.selectbox("Type", ["Tous", "AL (hors GO/GL)", "GO / GL"])
-    type_filter = None if type_choice == "Tous" else ("AL" if "AL" in type_choice else "GO_GL")
+    with colf1:
+        search = st.text_input("🔍 Recherche (client, vol, lieu…)", "")
 
-    search = st.text_input("Recherche", "")
+    with colf2:
+        chs = get_chauffeurs_for_ui()
+        ch_value = st.selectbox("🚖 Chauffeur", ["(Tous)"] + chs)
+        ch_value = None if ch_value == "(Tous)" else ch_value
 
-    # ----------------- Lecture DB -----------------
+    # ===================================================
+    # 📖 LECTURE DB
+    # ===================================================
     df = get_planning(
         start_date=start_date,
         end_date=end_date,
         chauffeur=ch_value,
-        type_filter=type_filter,
         search=search,
         source="7j",
     )
-    # ----------------- Affichage -----------------
+
+    if df is None or df.empty:
+        st.info("Aucune navette pour cette période.")
+        return
+
+    # ===================================================
+    # 🎨 AFFICHAGE AVEC COULEURS
+    # ===================================================
     df_display = df.drop(columns=["id"], errors="ignore")
-    # =============================
-    # 🎨 Couleur chauffeur (Excel → UI)
-    # =============================
+
     if "CH" in df_display.columns:
         df_display["CH"] = df_display.apply(
             lambda r: format_chauffeur_colored(
@@ -3537,11 +3583,13 @@ def render_tab_planning():
         )
 
     styled = df_display.style
-    styled = style_indispo(styled)              # 🔴 PRIORITÉ
+    styled = style_indispo(styled)              # 🔴 priorité absolue
     styled = style_groupage_partage(styled)
     styled = style_caisse_payee(styled)
 
-    # ----------------- Masquer colonnes techniques APRÈS style -----------------
+    # ---------------------------------------------------
+    # 🧹 MASQUER COLONNES TECHNIQUES
+    # ---------------------------------------------------
     cols_to_hide = [
         "IS_GROUPAGE",
         "IS_PARTAGE",
@@ -3552,20 +3600,16 @@ def render_tab_planning():
         "IS_INDISPO",
     ]
 
-    # ne masquer que les colonnes réellement présentes
     cols_to_hide = [c for c in cols_to_hide if c in df_display.columns]
 
     if cols_to_hide:
         try:
-            # pandas récents
             styled = styled.hide(columns=cols_to_hide)
         except TypeError:
-            # pandas plus anciens
             styled = styled.hide(subset=cols_to_hide, axis="columns")
 
-
-
     st.dataframe(styled, use_container_width=True, height=520)
+
 
 
 
@@ -5704,6 +5748,7 @@ def render_tab_feuil3():
 def render_tab_excel_sync():
 
     from streamlit_autorefresh import st_autorefresh
+    from datetime import datetime
 
     # ===================================================
     # 🔐 SÉCURITÉ — ADMIN UNIQUEMENT
@@ -5712,13 +5757,6 @@ def render_tab_excel_sync():
         st.warning("🔒 Seuls les administrateurs peuvent synchroniser la base.")
         return
 
-    # 🔒 Pas de rafraîchissement automatique ici (évite 'charger charger')
-
-    # 🔒 Plus de vérification auto Dropbox ici (synchro = bouton manuel)
-
-    # ===================================================
-    # 📂 TITRE
-    # ===================================================
     st.subheader("📂 Synchronisation Excel → Base de données")
 
     # ===================================================
@@ -5729,6 +5767,8 @@ def render_tab_excel_sync():
         st.success(f"🟢 Dernière mise à jour : {last_sync}")
     else:
         st.info("🔴 Aucune synchronisation effectuée dans cette session")
+
+    st.markdown("---")
 
     # ===================================================
     # ℹ️ INFO WORKFLOW
@@ -5741,12 +5781,9 @@ def render_tab_excel_sync():
         🔧 **Workflow normal :**
 
         1. Ouvre le fichier **Planning 2026.xlsx** dans **Dropbox**
-        2. Modifie :
-           - *Feuil1* → planning
-           - *Feuil2* → chauffeurs
-           - *Feuil3* → données annexes
+        2. Modifie *Feuil1*, *Feuil2*, *Feuil3*
         3. Enregistre le fichier
-        4. La synchronisation se fait automatiquement
+        4. Clique sur **FORCER MAJ DROPBOX → DB**
         """
     )
 
@@ -5757,22 +5794,16 @@ def render_tab_excel_sync():
     # ===================================================
     st.subheader("🆘 Mode secours — Charger un fichier Excel manuellement")
 
-    st.warning(
-        "À utiliser uniquement en cas de problème avec Dropbox "
-        "(token expiré, réseau indisponible, erreur API…)."
-    )
-
     uploaded_file = st.file_uploader(
         "📤 Charger un fichier Planning Excel (.xlsx)",
         type=["xlsx"],
         accept_multiple_files=False,
-        help="Le fichier doit avoir exactement la même structure que Planning 2026.xlsx",
     )
 
     if uploaded_file:
         st.info(
             f"📄 Fichier chargé : {uploaded_file.name}\n\n"
-            "⚠️ Cette action remplacera les données à partir d’aujourd’hui dans la base."
+            "⚠️ Les navettes fantômes (non confirmées / non payées) seront nettoyées."
         )
 
         confirm_upload = st.checkbox(
@@ -5786,23 +5817,30 @@ def render_tab_excel_sync():
             disabled=not confirm_upload,
         ):
             with st.spinner("🔄 Synchronisation depuis fichier manuel…"):
-                inserted = sync_planning_from_uploaded_file(uploaded_file)
-                log_event(f"Sync fichier manuel exécutée : {inserted} lignes", "SYNC")
+                sync_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                inserted = sync_planning_from_uploaded_file(
+                    uploaded_file,
+                    excel_sync_ts=sync_ts,
+                )
+                cleanup_orphan_planning_rows(sync_ts)
+                log_event(
+                    f"Sync fichier manuel + cleanup exécutés ({inserted} lignes)",
+                    "SYNC",
+                )
 
-            st.session_state["last_sync_time"] = datetime.now().strftime("%d/%m/%Y %H:%M")
+            st.session_state["last_sync_time"] = datetime.now().strftime(
+                "%d/%m/%Y %H:%M"
+            )
 
-            if inserted > 0:
-                st.success(f"✅ DB mise à jour ({inserted} lignes importées)")
-                st.toast("Planning synchronisé depuis fichier manuel 📄", icon="🆘")
-            else:
-                st.warning("Aucune donnée n’a été modifiée.")
+            st.success(f"✅ DB mise à jour ({inserted} lignes)")
+            st.cache_data.clear()
+            st.rerun()
 
     st.markdown("---")
 
     # ===================================================
     # 🔄 SYNCHRO MANUELLE DROPBOX
     # ===================================================
-
     confirm = st.checkbox(
         "Je confirme vouloir forcer la mise à jour de la base depuis Dropbox",
         key="confirm_force_sync_dropbox",
@@ -5819,51 +5857,35 @@ def render_tab_excel_sync():
 
     with col2:
         st.caption(
-            "⚠️ Cette action remplace toutes les navettes "
-            "à partir d’aujourd’hui dans la base."
+            "⚠️ Les navettes supprimées ou déplacées dans Excel seront nettoyées "
+            "si elles ne sont ni confirmées ni payées."
         )
 
     if btn_force:
         with st.spinner("🔄 Synchronisation en cours depuis Dropbox…"):
-            inserted = sync_planning_from_today()
-            log_event(f"Sync Dropbox manuelle exécutée : {inserted} lignes", "SYNC")
+            sync_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            inserted = sync_planning_from_today(excel_sync_ts=sync_ts)
+            cleanup_orphan_planning_rows(sync_ts)
+            log_event(
+                f"Sync Dropbox + cleanup exécutés ({inserted} lignes)",
+                "SYNC",
+            )
 
         st.session_state["last_sync_time"] = datetime.now().strftime(
             "%d/%m/%Y %H:%M"
         )
 
-        if inserted > 0:
-            st.success(
-                f"✅ DB mise à jour depuis aujourd’hui ({inserted} lignes)"
-            )
-            st.toast(
-                "Planning mis à jour depuis Dropbox 🚐",
-                icon="📂",
-            )
-
-            # 🔑 rafraîchissement UI (UNIQUE endroit autorisé)
-            st.cache_data.clear()
-            st.rerun()
-
-        else:
-            st.warning("Aucune donnée n’a été modifiée.")
+        st.success(f"✅ DB mise à jour depuis aujourd’hui ({inserted} lignes)")
+        st.cache_data.clear()
+        st.rerun()
 
     st.markdown("---")
-
 
     # ===================================================
     # 🔥 RECONSTRUCTION COMPLÈTE DB (DANGER)
     # ===================================================
-
     st.markdown("### 🔥 Reconstruction complète de la base (DANGER)")
 
-    st.warning(
-        "⚠️ Cette action SUPPRIME entièrement la base planning actuelle\n"
-        "et la recrée à partir DES DEUX fichiers Excel que tu sélectionnes.\n\n"
-        "👉 Exemple : Planning 2025 + Planning 2026"
-    )
-
-    # 📂 Sélection des deux fichiers Excel
     rebuild_file_1 = st.file_uploader(
         "📂 Sélectionne le PREMIER fichier Excel (ex : Planning 2025)",
         type=["xlsx"],
@@ -5877,8 +5899,7 @@ def render_tab_excel_sync():
     )
 
     confirm_full = st.checkbox(
-        "⚠️ Je confirme vouloir reconstruire TOUTE la base "
-        "à partir des DEUX fichiers sélectionnés",
+        "⚠️ Je confirme vouloir reconstruire TOUTE la base",
         key="confirm_full_rebuild",
     )
 
@@ -5896,30 +5917,9 @@ def render_tab_excel_sync():
             )
 
         st.session_state["last_sync_time"] = datetime.now().strftime("%d/%m/%Y %H:%M")
-
-        if inserted > 0:
-            st.success(f"✅ DB reconstruite بالكامل ({inserted} lignes)")
-            st.toast("Base planning recréée depuis les fichiers sélectionnés", icon="🔥")
-            st.cache_data.clear()
-            st.rerun()
-        else:
-            st.error("❌ Échec de la reconstruction de la DB")
-
-    st.markdown("---")
-
-
-    # ===================================================
-    # ℹ️ INFO FINALE
-    # ===================================================
-
-    st.info(
-        "💡 **Dropbox est la source principale du planning.**\n\n"
-        "- Synchronisation automatique quand Dropbox est disponible\n"
-        "- Synchronisation manuelle possible (futur uniquement)\n"
-        "- Reconstruction complète possible (2025 + 2026)\n"
-        "- Aucun SharePoint / OneDrive\n"
-        "- Base toujours alignée sur un Excel de référence"
-    )
+        st.success(f"✅ DB reconstruite ({inserted} lignes)")
+        st.cache_data.clear()
+        st.rerun()
 
 
 # ============================================================
@@ -6249,7 +6249,29 @@ def render_tab_confirmation_chauffeur():
     # ======================================================
     with tab_confirm:
 
-        df = get_planning(source="7j")
+        # ===================================================
+        # 📅 PÉRIODE À CONFIRMER
+        # ===================================================
+        periode = st.radio(
+            "📅 Navettes à confirmer",
+            ["Aujourd’hui", "À partir de demain"],
+            horizontal=True,
+        )
+
+        today = date.today()
+
+        if periode == "Aujourd’hui":
+            start_date = today
+        else:
+            start_date = today + timedelta(days=1)
+
+        df = get_planning(
+            start_date=start_date,
+            end_date=None,
+            source="7j",
+        )
+
+
 
         if df is None or df.empty:
             st.info("Aucune navette à afficher.")
@@ -7152,6 +7174,9 @@ def main():
     # ======================================
     render_top_bar()
     role = st.session_state.role
+
+    # 🔄 Synchro silencieuse (uniquement si Excel modifié)
+    auto_sync_planning_if_needed()
 
     # ====================== ADMIN ===========================
     if role == "admin":

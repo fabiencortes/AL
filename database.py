@@ -271,18 +271,16 @@ def get_planning(
 
     # =========================
     # Conversion DATE propre
+    # ✅ Priorité à DATE_ISO (évite les inversions 02-01 ↔ 01-02)
     # =========================
-    if "DATE" in df.columns:
-        df["DATE"] = pd.to_datetime(
-            df["DATE"],
-            dayfirst=True,
-            errors="coerce",
-        ).dt.date
-    elif "DATE_ISO" in df.columns:
-        df["DATE"] = pd.to_datetime(
-            df["DATE_ISO"],
-            errors="coerce",
-        ).dt.date
+    if "DATE_ISO" in df.columns and df["DATE_ISO"].notna().any():
+        dt = pd.to_datetime(df["DATE_ISO"], errors="coerce")
+    elif "DATE" in df.columns:
+        dt = pd.to_datetime(df["DATE"], dayfirst=True, errors="coerce")
+    else:
+        dt = pd.to_datetime(pd.Series([None] * len(df)), errors="coerce")
+
+    df["DATE"] = dt.dt.date
 
     # =========================
     # Filtre date
@@ -411,6 +409,29 @@ def get_planning_columns() -> List[str]:
     cols = [r[1] for r in rows]  # r[1] = name
     return cols
 
+# ============================================================
+#   🧹 CLEANUP — NAVETTES FANTÔMES
+# ============================================================
+
+def cleanup_orphan_planning_rows(last_sync_ts: str):
+    """
+    Supprime les navettes absentes d’Excel,
+    uniquement si aucune action humaine n’a eu lieu.
+    """
+    with get_connection() as conn:
+        conn.execute(
+            """
+            DELETE FROM planning
+            WHERE
+                (EXCEL_SYNC_TS IS NULL OR EXCEL_SYNC_TS < ?)
+                AND COALESCE(CONFIRMED, 0) = 0
+                AND COALESCE(IS_PAYE, 0) = 0
+                AND COALESCE(ACK_AT, '') = ''
+                AND DATE >= DATE('now', '-7 days')
+            """,
+            (last_sync_ts,),
+        )
+        conn.commit()
 
 # =========================
 #   CHAUFFEURS
@@ -904,6 +925,21 @@ def ensure_planning_audit_table():
             )
         """)
         conn.commit()
+def ensure_excel_sync_column():
+    with get_connection() as conn:
+        cols = [
+            r[1]
+            for r in conn.execute(
+                "PRAGMA table_info(planning)"
+            ).fetchall()
+        ]
+
+        if "EXCEL_SYNC_TS" not in cols:
+            conn.execute(
+                "ALTER TABLE planning ADD COLUMN EXCEL_SYNC_TS TEXT"
+            )
+            conn.commit()
+
 
 def ensure_planning_row_key_index():
     with get_connection() as conn:
@@ -1094,6 +1130,13 @@ def rebuild_planning_db_from_two_excel_files(file_1, file_2) -> int:
 
     # sécurité finale anti-doublon
     df_all = df_all.drop_duplicates(subset=["row_key"]).copy()
+
+    # ✅ DATE_ISO robuste (pour tri/filtre sans ambiguïté)
+    if "DATE" in df_all.columns:
+        dt = pd.to_datetime(df_all["DATE"], dayfirst=True, errors="coerce")
+        df_all["DATE_ISO"] = dt.dt.strftime("%Y-%m-%d")
+        # normalise aussi DATE en dd/mm/YYYY pour l'affichage
+        df_all["DATE"] = dt.dt.strftime("%d/%m/%Y").fillna(df_all["DATE"].astype(str))
 
     # ======================================================
     # 2️⃣ Purge totale planning
