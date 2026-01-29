@@ -5,6 +5,9 @@ import streamlit as st
 import pandas as pd
 import hashlib
 
+from utils import log_event
+
+
 def sqlite_safe(value):
     """
     Convertit une valeur en type compatible SQLite
@@ -35,15 +38,19 @@ ACTIONS_DB_PATH = "planning_actions.db"
 # =========================
 #   OUTILS INTERNES
 # =========================
-
 def get_connection() -> sqlite3.Connection:
-    """
-    Retourne une connexion SQLite.
-    Utilise row_factory par défaut (dictionnaires faits à la main quand nécessaire).
-    """
-    conn = sqlite3.connect(DB_PATH)
-    return conn
+    """Connexion d'écriture SQLite (sans WAL pour éviter .db-wal/.db-shm)."""
 
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=60,
+        check_same_thread=False,
+    )
+    conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+
+    return conn
 
 def _normalize_date_str(d: Any) -> str:
     """
@@ -76,6 +83,31 @@ def _normalize_date_str(d: Any) -> str:
     except Exception:
         return s
 
+def ensure_admin_reply_columns():
+    with get_connection() as conn:
+        cols = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(planning)"
+            ).fetchall()
+        }
+
+        if "ADMIN_REPLY" not in cols:
+            conn.execute(
+                'ALTER TABLE planning ADD COLUMN "ADMIN_REPLY" TEXT'
+            )
+
+        if "ADMIN_REPLY_AT" not in cols:
+            conn.execute(
+                'ALTER TABLE planning ADD COLUMN "ADMIN_REPLY_AT" TEXT'
+            )
+
+        if "ADMIN_REPLY_READ" not in cols:
+            conn.execute(
+                'ALTER TABLE planning ADD COLUMN "ADMIN_REPLY_READ" INTEGER DEFAULT 0'
+            )
+
+        conn.commit()
 
 def _normalize_heure_str(h: Any) -> str:
     """
@@ -115,6 +147,21 @@ def _normalize_heure_str(h: Any) -> str:
         return s
     return s
 
+def get_read_connection():
+    """Connexion lecture (mêmes PRAGMA que écriture)."""
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=60,
+        check_same_thread=False,
+    )
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE;")
+        conn.execute("PRAGMA busy_timeout=5000;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+    except Exception:
+        pass
+    return conn
 
 # =========================
 #   CHARGEMENT GLOBAL PLANNING
@@ -123,10 +170,6 @@ def _normalize_heure_str(h: Any) -> str:
 def _load_planning_df() -> pd.DataFrame:
     """
     Charge la table 'planning' complète en DataFrame.
-
-    - DATE : convertie en datetime.date si possible
-    - HEURE : laissée en texte
-    - Garantit que les colonnes GROUPAGE / PARTAGE existent (remplies à '0' si absentes)
     """
     with get_connection() as conn:
         try:
@@ -137,19 +180,22 @@ def _load_planning_df() -> pd.DataFrame:
     if df.empty:
         return df
 
-
-    # S'assurer que GROUPAGE / PARTAGE existent toujours (sinon colonnes 0)
+    # Colonnes de compatibilité
     if "GROUPAGE" not in df.columns:
         df["GROUPAGE"] = "0"
     if "PARTAGE" not in df.columns:
         df["PARTAGE"] = "0"
+    if "IS_INDISPO" not in df.columns:
+        df["IS_INDISPO"] = 0
 
     return df
+
+
 # =========================
 #   LECTURE PLANNING
 # =========================
 
-@st.cache_data(ttl=300)
+@st.cache_data
 def get_planning(
     start_date=None,
     end_date=None,
@@ -159,6 +205,13 @@ def get_planning(
     max_rows=2000,
     source="7j",   # "day" | "7j" | "full"
 ) -> pd.DataFrame:
+    """
+    Retourne un DataFrame filtré depuis la DB.
+
+    RÈGLE MÉTIER MAÎTRE :
+        IS_INDISPO = 1  ➜  ligne TOUJOURS visible
+        (congé / indisponibilité, même hors période)
+    """
 
     # =========================
     # Choix de la table
@@ -174,23 +227,47 @@ def get_planning(
     # Lecture DB
     # =========================
     try:
-        with get_connection() as conn:
-            df = pd.read_sql_query(
-                f"""
-                SELECT *
-                FROM {table}
-                ORDER BY DATE, HEURE
-                LIMIT ?
-                """,
-                conn,
-                params=(max_rows,),
-            )
-    except Exception as e:
-        print(f"❌ Erreur lecture {table} :", e)
+        with get_read_connection() as conn:
+            try:
+                df = pd.read_sql_query(
+                    f"""
+                    SELECT *
+                    FROM {table}
+                    ORDER BY DATE_ISO, HEURE
+                    LIMIT ?
+                    """,
+                    conn,
+                    params=(max_rows,),
+                )
+            except Exception:
+                # fallback si DATE_ISO absent
+                df = pd.read_sql_query(
+                    f"""
+                    SELECT *
+                    FROM {table}
+                    ORDER BY DATE, HEURE
+                    LIMIT ?
+                    """,
+                    conn,
+                    params=(max_rows,),
+                )
+    except Exception:
         return pd.DataFrame()
 
-    if df.empty:
-        return df
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df
+
+    # =========================
+    # Colonnes garanties
+    # =========================
+    if "IS_INDISPO" not in df.columns:
+        df["IS_INDISPO"] = 0
+    # =========================
+    # Masquage des navettes remplacées / supprimées d’Excel
+    # (confirmées mais superseded)
+    # =========================
+    if "IS_SUPERSEDED" in df.columns:
+        df = df[df["IS_SUPERSEDED"] != 1].copy()
 
     # =========================
     # Conversion DATE propre
@@ -199,85 +276,114 @@ def get_planning(
         df["DATE"] = pd.to_datetime(
             df["DATE"],
             dayfirst=True,
-            errors="coerce"
+            errors="coerce",
+        ).dt.date
+    elif "DATE_ISO" in df.columns:
+        df["DATE"] = pd.to_datetime(
+            df["DATE_ISO"],
+            errors="coerce",
         ).dt.date
 
     # =========================
     # Filtre date
+    # ⚠️ Les indispos passent TOUJOURS
     # =========================
-    if start_date or end_date:
-        if "DATE" in df.columns:
+    if (start_date or end_date) and "DATE" in df.columns:
 
-            def _keep_date(d):
-                if pd.isna(d) or not isinstance(d, date):
-                    return False
-                if start_date and d < start_date:
-                    return False
-                if end_date and d > end_date:
-                    return False
+        def _keep_date(d, is_indispo):
+            if int(is_indispo or 0) == 1:
                 return True
+            if pd.isna(d):
+                return False
+            if start_date and d < start_date:
+                return False
+            if end_date and d > end_date:
+                return False
+            return True
 
-            df = df[df["DATE"].apply(_keep_date)].copy()
+        df = df[
+            df.apply(
+                lambda r: _keep_date(
+                    r.get("DATE"),
+                    r.get("IS_INDISPO", 0),
+                ),
+                axis=1,
+            )
+        ].copy()
 
     # =========================
     # Filtre chauffeur
+    # (les indispos passent toujours)
     # =========================
     if chauffeur and "CH" in df.columns:
-        ch = chauffeur.strip().upper()
-        ch_series = df["CH"].astype(str).str.strip().str.upper()
+        ch = str(chauffeur).strip().upper()
+        ch_series = df["CH"].fillna("").astype(str).str.strip().str.upper()
 
-        if ch.endswith("*"):
-            df = df[ch_series == ch].copy()
-        else:
-            mask_exact = ch_series == ch
-            starts_with = ch_series.str.startswith(ch)
-            next_char = ch_series.str.slice(len(ch), len(ch) + 1)
-            mask_non_digit_after = (next_char == "") | (~next_char.str.match(r"\d"))
-            mask_prefix = starts_with & mask_non_digit_after
-            df = df[mask_exact | mask_prefix].copy()
+        mask = (
+            ch_series.eq(ch)
+            | ch_series.eq(f"{ch}*")
+            | ch_series.str.contains(ch, regex=False)
+        )
+
+        df = df[mask | (df["IS_INDISPO"] == 1)].copy()
 
     # =========================
     # Filtre type AL / GO_GL
+    # (les indispos passent toujours)
     # =========================
     if "GO" in df.columns and type_filter:
-        go_series = df["GO"].astype(str).str.strip().str.upper()
+        go_series = df["GO"].fillna("").astype(str).str.strip().str.upper()
+
         if type_filter == "AL":
-            df = df[~go_series.isin(["GO", "GL"])].copy()
+            df = df[
+                (~go_series.isin(["GO", "GL"]))
+                | (df["IS_INDISPO"] == 1)
+            ].copy()
+
         elif type_filter == "GO_GL":
-            df = df[go_series.isin(["GO", "GL"])].copy()
+            df = df[
+                (go_series.isin(["GO", "GL"]))
+                | (df["IS_INDISPO"] == 1)
+            ].copy()
 
     # =========================
     # Recherche texte libre
+    # (les indispos passent toujours)
     # =========================
-    if search:
-        s = search.lower()
+    if search and str(search).strip():
+        s = str(search).lower().strip()
 
         def _row_match(row):
-            for col in ["NOM", "ADRESSE", "REMARQUE", "VOL", "NUM_BDC"]:
+            for col in [
+                "NOM", "ADRESSE", "REMARQUE",
+                "VOL", "NUM_BDC", "Num BDC", "DESIGNATION",
+            ]:
                 if col in row and s in str(row[col]).lower():
                     return True
             return False
 
-        df = df[df.apply(_row_match, axis=1)].copy()
+        df = df[
+            df.apply(_row_match, axis=1)
+            | (df["IS_INDISPO"] == 1)
+        ].copy()
 
     # =========================
-    # Tri final DATE + HEURE
+    # Tri DATE + HEURE
     # =========================
+    def _heure_sort(h):
+        h2 = _normalize_heure_str(h)
+        if not h2 or ":" not in h2:
+            return (99, 99)
+        try:
+            hh, mm = h2.split(":")
+            return (int(hh), int(mm))
+        except Exception:
+            return (99, 99)
+
     if "HEURE" in df.columns:
-
-        def _heure_sort_tuple(h):
-            h2 = _normalize_heure_str(h)
-            if not h2 or ":" not in h2:
-                return (99, 99)
-            try:
-                hh, mm = h2.split(":")
-                return (int(hh), int(mm))
-            except Exception:
-                return (99, 99)
-
-        df["_HSORT"] = df["HEURE"].apply(_heure_sort_tuple)
+        df["_HSORT"] = df["HEURE"].apply(_heure_sort)
     else:
-        df["_HSORT"] = (99, 99)
+        df["_HSORT"] = [(99, 99)] * len(df)
 
     sort_cols = []
     if "DATE" in df.columns:
@@ -293,8 +399,6 @@ def get_planning(
         df = df.head(max_rows)
 
     return df
-
-
 
 def get_planning_columns() -> List[str]:
     """
@@ -371,50 +475,107 @@ def get_chauffeurs() -> List[str]:
     # Tri alphabétique insensible à la casse (mais on garde la forme originale)
     all_codes = sorted(all_codes, key=lambda x: x.upper())
     return all_codes
-def split_chauffeurs(ch_raw: str) -> list[str]:
-    """
-    Décompose un code chauffeur du planning en chauffeurs réels.
-    Gère TOUS les cas :
-    FA*DO, NPFA, FADONP, FADO*NP*, FA*DONP, etc.
-    """
+# ============================================================
+#   CACHE GLOBAL — CHAUFFEURS POUR split_chauffeurs
+# ============================================================
 
-    if not ch_raw:
-        return []
+_SPLIT_KNOWN_CHAUFFEURS = None
 
-    raw = str(ch_raw).upper().replace("*", "").strip()
+
+def _load_known_chauffeurs_once():
+    global _SPLIT_KNOWN_CHAUFFEURS
+
+    if _SPLIT_KNOWN_CHAUFFEURS is not None:
+        return _SPLIT_KNOWN_CHAUFFEURS
 
     try:
         with get_connection() as conn:
-            df = pd.read_sql_query("SELECT INITIALE FROM chauffeurs", conn)
-        known = (
+            df = pd.read_sql_query(
+                "SELECT INITIALE FROM chauffeurs",
+                conn
+            )
+
+        _SPLIT_KNOWN_CHAUFFEURS = (
             df["INITIALE"]
+            .dropna()
             .astype(str)
             .str.strip()
             .str.upper()
             .tolist()
         )
+
     except Exception:
-        known = []
+        # fallback sécurité (ne bloque jamais l’app)
+        _SPLIT_KNOWN_CHAUFFEURS = [
+            "FA1", "FA", "DO", "NP", "AD", "GG", "MA", "OM"
+        ]
 
-    if not known:
-        known = ["FA1", "FA", "DO", "NP", "AD", "GG", "MA", "OM"]
+    return _SPLIT_KNOWN_CHAUFFEURS
 
-    known = sorted(set(known), key=len, reverse=True)
+
+# ============================================================
+#   SPLIT CHAUFFEURS — VERSION OPTIMISÉE
+# ============================================================
+
+def split_chauffeurs(ch_raw: str) -> list[str]:
+    """
+    Décompose un code chauffeur du planning en chauffeurs réels.
+    Version sécurisée et performante.
+    """
+
+    if not ch_raw:
+        return []
+
+    # 🔒 NORMALISATION FORTE
+    raw = (
+        str(ch_raw)
+        .upper()
+        .replace("*", "")
+        .replace(" ", "")
+        .replace("/", "")
+        .replace("-", "")
+        .replace("+", "")
+        .replace(",", "")
+        .strip()
+    )
+
+    if not raw:
+        return []
+
+    known = _load_known_chauffeurs_once()
+
+    # ⚡ tri UNE SEULE FOIS
+    if not hasattr(split_chauffeurs, "_known_sorted"):
+        split_chauffeurs._known_sorted = sorted(
+            set(known),
+            key=len,
+            reverse=True
+        )
+
+    known_sorted = split_chauffeurs._known_sorted
 
     found = []
     remaining = raw
 
-    while remaining:
+    # ⛔ garde-fou anti-boucle lente
+    max_iter = len(raw) * 2
+    i = 0
+
+    while remaining and i < max_iter:
+        i += 1
         matched = False
-        for ch in known:
+
+        for ch in known_sorted:
             if remaining.startswith(ch):
                 found.append(ch)
                 remaining = remaining[len(ch):]
                 matched = True
                 break
+
         if not matched:
             remaining = remaining[1:]
 
+    # suppression doublons en conservant l’ordre
     result = []
     seen = set()
     for ch in found:
@@ -425,19 +586,26 @@ def split_chauffeurs(ch_raw: str) -> list[str]:
     return result
 
 
-@st.cache_data(ttl=300)
+
+
+@st.cache_data
 def get_chauffeur_planning(
     chauffeur: str,
     from_date: Optional[date] = None,
     to_date: Optional[date] = None,
 ) -> pd.DataFrame:
-    """Retourne le planning pour un chauffeur donné, en réutilisant
-    exactement la même logique de filtre que get_planning (codes AD*, FADO, etc.)."""
+    """
+    Planning chauffeur — FILTRE STRICT
+    - respecte les codes chauffeurs (FA, FA*, FADO, etc.)
+    - masque les indispos / congés
+    - applique strictement from_date / to_date
+    """
+
     ch = (chauffeur or "").strip()
     if not ch:
         return pd.DataFrame()
 
-    return get_planning(
+    df = get_planning(
         start_date=from_date,
         end_date=to_date,
         chauffeur=ch,
@@ -445,6 +613,16 @@ def get_chauffeur_planning(
         search="",
         max_rows=5000,
     )
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # 🔴 RÈGLE SPÉCIFIQUE VUE CHAUFFEUR
+    if from_date:
+        df = df[
+            (df["DATE"] >= from_date)
+            & (df["IS_INDISPO"] == 0)
+        ].copy()
 
     return df
 
@@ -628,16 +806,34 @@ def insert_planning_row(
 
         return cur.lastrowid
 
+def is_new_ack(prev_ack_at, new_ack_at) -> bool:
+    """
+    Retourne True si une réponse chauffeur vient d’être reçue
+    (ACK_AT passe de vide -> valeur)
+    """
+    return not prev_ack_at and bool(new_ack_at)
 
 
 def update_planning_row(row_id: int, data: Dict[str, Any]) -> None:
     """
     Met à jour une navette existante (par id) avec les colonnes fournies.
+    Déclenche une notification admin si un chauffeur répond.
     """
     if not data:
         return
 
-    # s'assurer que la colonne existe
+    # --------------------------------------------------
+    # 🔍 État AVANT modification (pour détecter ACK)
+    # --------------------------------------------------
+    prev_ack_at = None
+    if "ACK_AT" in data:
+        old_row = get_row_by_id(row_id)
+        if old_row:
+            prev_ack_at = old_row.get("ACK_AT")
+
+    # --------------------------------------------------
+    # Sécurité colonnes
+    # --------------------------------------------------
     ensure_planning_updated_at_column()
 
     if "DATE" in data:
@@ -653,16 +849,29 @@ def update_planning_row(row_id: int, data: Dict[str, Any]) -> None:
         set_parts.append(f'"{col}" = ?')
         values.append(sqlite_safe(val))
 
-    # ⚠️ UNE SEULE FOIS
     values.append(row_id)
-
     set_clause = ", ".join(set_parts)
 
+    # --------------------------------------------------
+    # 🔄 UPDATE DB
+    # --------------------------------------------------
     with get_connection() as conn:
         cur = conn.cursor()
         sql = f"UPDATE planning SET {set_clause} WHERE id = ?"
         cur.execute(sql, values)
         conn.commit()
+
+    # --------------------------------------------------
+    # 🔔 NOTIFICATION ADMIN : nouvelle réponse chauffeur
+    # --------------------------------------------------
+    if "ACK_AT" in data:
+        new_ack_at = data.get("ACK_AT")
+        if is_new_ack(prev_ack_at, new_ack_at):
+            st.session_state["admin_notif"] = {
+                "type": "ACK",
+                "row_id": row_id,
+            }
+
 def get_planning_table_columns() -> set[str]:
     """
     Retourne l'ensemble des colonnes existantes
@@ -682,6 +891,20 @@ def ensure_planning_row_key_column():
         if "row_key" not in cols:
             conn.execute('ALTER TABLE planning ADD COLUMN "row_key" TEXT')
             conn.commit()
+def ensure_planning_audit_table():
+    with get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS planning_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT,
+                user TEXT,
+                action TEXT,
+                row_key TEXT,
+                details TEXT
+            )
+        """)
+        conn.commit()
+
 def ensure_planning_row_key_index():
     with get_connection() as conn:
         conn.execute(
@@ -692,10 +915,7 @@ def ensure_planning_row_key_index():
 
 def ensure_planning_confirmation_and_caisse_columns():
     """
-    S'assure que les colonnes métier suivantes existent dans la table planning :
-    - CONFIRMED       : 0 / 1
-    - CONFIRMED_AT    : datetime (TEXT SQLite)
-    - CAISSE_PAYEE    : 0 / 1
+    Colonnes métier stables (NE JAMAIS recalculer depuis Excel)
     """
     with get_connection() as conn:
         cur = conn.cursor()
@@ -715,6 +935,83 @@ def ensure_planning_confirmation_and_caisse_columns():
         if "CAISSE_PAYEE" not in existing_cols:
             conn.execute(
                 'ALTER TABLE planning ADD COLUMN "CAISSE_PAYEE" INTEGER DEFAULT 0'
+            )
+
+        if "ACK_AT" not in existing_cols:
+            conn.execute(
+                'ALTER TABLE planning ADD COLUMN "ACK_AT" TEXT'
+            )
+
+        if "ACK_TEXT" not in existing_cols:
+            conn.execute(
+                'ALTER TABLE planning ADD COLUMN "ACK_TEXT" TEXT'
+            )
+
+        conn.commit()
+
+def set_caisse_payee_for_ids(ids: list[int], payee: int = 1):
+    if not ids:
+        return 0
+
+    with get_connection() as conn:
+        cur = conn.cursor()
+        placeholders = ",".join("?" for _ in ids)
+        cur.execute(
+            f'UPDATE planning SET "CAISSE_PAYEE" = ? WHERE id IN ({placeholders})',
+            [int(payee)] + [int(x) for x in ids],
+        )
+        conn.commit()
+        return cur.rowcount
+
+
+def set_caisse_payee_for_chauffeur(ch: str, from_date: str, to_date: str, payee: int = 1):
+    """
+    from_date / to_date au format YYYY-MM-DD (DATE_ISO)
+    """
+    ch = str(ch or "").strip()
+    if not ch:
+        return 0
+
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE planning
+            SET "CAISSE_PAYEE" = ?
+            WHERE DATE_ISO >= ?
+              AND DATE_ISO <= ?
+              AND UPPER(TRIM(COALESCE(CH,''))) = UPPER(TRIM(?))
+              AND LOWER(TRIM(COALESCE(PAIEMENT,''))) = 'caisse'
+              AND CAST(COALESCE(Caisse, 0) AS REAL) > 0
+            """,
+            (int(payee), from_date, to_date, ch),
+        )
+        conn.commit()
+        return cur.rowcount
+
+def ensure_caisse_columns():
+    """
+    Ajoute les colonnes liées à la caisse si elles n'existent pas encore.
+    Migration sûre (SQLite).
+    """
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(planning)")
+        cols = {row[1] for row in cur.fetchall()}
+
+        if "CAISSE_PAYEE" not in cols:
+            conn.execute(
+                'ALTER TABLE planning ADD COLUMN "CAISSE_PAYEE" INTEGER DEFAULT 0'
+            )
+
+        if "CAISSE_PAYEE_AT" not in cols:
+            conn.execute(
+                'ALTER TABLE planning ADD COLUMN "CAISSE_PAYEE_AT" TEXT'
+            )
+
+        if "CAISSE_COMMENT" not in cols:
+            conn.execute(
+                'ALTER TABLE planning ADD COLUMN "CAISSE_COMMENT" TEXT'
             )
 
         conn.commit()
@@ -1582,24 +1879,6 @@ def delete_planning_from_date(min_date: str):
         )
         conn.commit()
 
-def ensure_indexes():
-    """
-    Crée les index SQL essentiels pour les performances
-    """
-    with get_connection() as conn:
-        cur = conn.cursor()
-
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_planning_date ON planning (DATE)"
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_planning_ch ON planning (CH)"
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_planning_date_ch ON planning (DATE, CH)"
-        )
-
-        conn.commit()
 
 def ensure_indexes():
     with get_connection() as conn:
@@ -1622,6 +1901,62 @@ def init_time_rules_table():
                 minutes INTEGER NOT NULL     -- durée en minutes
             )
         """)
+        conn.commit()
+def init_time_adjustments_table():
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS time_adjustments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chauffeur TEXT NOT NULL,
+                date_from TEXT,     -- YYYY-MM-DD ou NULL
+                date_to   TEXT,     -- YYYY-MM-DD ou NULL
+                minutes INTEGER NOT NULL,
+                reason TEXT,
+                created_at TEXT
+            )
+            """
+        )
+        conn.commit()
+
+
+def get_time_adjustments_df(date_from_iso: str, date_to_iso: str) -> pd.DataFrame:
+    init_time_adjustments_table()
+    with get_connection() as conn:
+        df = pd.read_sql_query(
+            """
+            SELECT id, chauffeur, date_from, date_to, minutes, reason, created_at
+            FROM time_adjustments
+            WHERE
+                (date_from IS NULL OR date_from <= ?)
+                AND
+                (date_to   IS NULL OR date_to   >= ?)
+            ORDER BY chauffeur, created_at DESC
+            """,
+            conn,
+            params=[date_to_iso, date_from_iso],
+        )
+    return df if df is not None else pd.DataFrame()
+
+
+def insert_time_adjustment(chauffeur: str, date_from_iso: str | None, date_to_iso: str | None, minutes: int, reason: str):
+    init_time_adjustments_table()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO time_adjustments (chauffeur, date_from, date_to, minutes, reason, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(chauffeur).strip().upper(),
+                date_from_iso,
+                date_to_iso,
+                int(minutes),
+                reason or "",
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
         conn.commit()
 
 
@@ -1657,57 +1992,144 @@ def _minutes_to_hhmm(minutes: int) -> str:
 
 
 def get_time_rules_df() -> pd.DataFrame:
-    """Retourne les règles en DataFrame (heures affichées en 2h30)."""
+    """
+    Retourne les règles AU FORMAT attendu par app.py :
+    - ch_base (ex: 'NP', 'ALL')
+    - is_star (0/1)
+    - sens ('VERS'/'DE')
+    - dest_contains (ex: 'BRU')
+    - minutes (int)
+    """
     init_time_rules_table()
     with get_connection() as conn:
-        df = pd.read_sql_query('SELECT * FROM time_rules ORDER BY ch, sens, dest', conn)
+        df = pd.read_sql_query(
+            "SELECT id, ch, sens, dest, minutes FROM time_rules ORDER BY ch, sens, dest",
+            conn,
+        )
 
-    if df.empty:
-        return df
+    if df is None or df.empty:
+        return pd.DataFrame()
 
     df = df.copy()
-    df["heures"] = df["minutes"].apply(_minutes_to_hhmm)
-    df.drop(columns=["minutes"], inplace=True, errors="ignore")
+
+    df["ch"] = df["ch"].fillna("").astype(str).str.strip().str.upper()
+    df["sens"] = df["sens"].fillna("").astype(str).str.strip().str.upper()
+    df["dest"] = df["dest"].fillna("").astype(str).str.strip().str.upper()
+    df["minutes"] = pd.to_numeric(df["minutes"], errors="coerce").fillna(0).astype(int)
+
+    # '*' ou 'ALL' = règle globale (tous les chauffeurs)
+    def _to_ch_base(v: str) -> str:
+        if v in ("*", "ALL"):
+            return "ALL"
+        return v.replace("*", "").strip()
+
+    df["ch_base"] = df["ch"].apply(_to_ch_base)
+
+    # is_star = 1 si la règle vise les codes avec *
+    # ex: 'NP*' => star=1, base=NP
+    # ex: '*' => star=0 (global)
+    df["is_star"] = df["ch"].apply(lambda x: 1 if (x not in ("*", "ALL") and "*" in x) else 0).astype(int)
+
+    # format attendu
+    df.rename(columns={"dest": "dest_contains"}, inplace=True)
+
+    # colonnes inutiles pour le moteur
+    df.drop(columns=["ch"], inplace=True, errors="ignore")
+
     return df
 
 
+
 def save_time_rules_df(edited: pd.DataFrame):
-    """Sauvegarde complète des règles depuis un DataFrame édité."""
+    """
+    Sauvegarde complète des règles depuis l'UI.
+
+    Colonnes attendues depuis l'UI :
+    - ch            (ex: *, NP, NP*)
+    - sens          (VERS, DE, *)
+    - dest          (texte exact : BRU, ZAVENTEM, CDG, *)
+    - heures        (ex: 2.5, 2h30, 150)
+
+    Colonnes stockées en DB :
+    - ch
+    - sens
+    - dest_contains
+    - minutes
+    """
     init_time_rules_table()
+
+    # Autoriser table vide
     if edited is None or edited.empty:
-        # autoriser table vide
         with get_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("DELETE FROM time_rules")
+            conn.execute("DELETE FROM time_rules")
             conn.commit()
         return
 
     df = edited.copy()
-    # colonnes attendues
+
+    # Colonnes requises (UI)
     for col in ["ch", "sens", "dest", "heures"]:
         if col not in df.columns:
             raise ValueError(f"Colonne manquante: {col}")
 
-    # normalisation
-    df["ch"] = df["ch"].astype(str).str.strip()
-    df["sens"] = df["sens"].astype(str).str.strip().str.upper()
-    df["dest"] = df["dest"].astype(str).str.strip().str.upper()
-    df["heures"] = df["heures"].astype(str).str.strip()
+    # -----------------------------
+    # Normalisation
+    # -----------------------------
+    df["ch"] = (
+        df["ch"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
 
-    # calcul minutes
+    df["sens"] = (
+        df["sens"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    df["dest_contains"] = (
+        df["dest"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
     df["minutes"] = df["heures"].apply(_hhmm_to_minutes)
 
-    # filtrer lignes invalides
-    df = df[(df["ch"] != "") & (df["sens"].isin(["VERS", "DE"])) & (df["dest"] != "") & (df["minutes"] > 0)].copy()
+    # -----------------------------
+    # Filtrage règles valides
+    # -----------------------------
+    df = df[
+        (df["ch"] != "")
+        & (df["sens"].isin(["VERS", "DE", "*"]))
+        & (df["dest_contains"] != "")
+        & (df["minutes"] > 0)
+    ].copy()
 
+    # -----------------------------
+    # Sauvegarde DB (RESET + INSERT)
+    # -----------------------------
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("DELETE FROM time_rules")
 
         for _, r in df.iterrows():
             cur.execute(
-                "INSERT INTO time_rules (ch, sens, dest, minutes) VALUES (?, ?, ?, ?)",
-                (r["ch"], r["sens"], r["dest"], int(r["minutes"])),
+                """
+                INSERT INTO time_rules (ch, sens, dest_contains, minutes)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    r["ch"],
+                    r["sens"],
+                    r["dest_contains"],
+                    int(r["minutes"]),
+                ),
             )
 
         conn.commit()
@@ -1914,6 +2336,35 @@ def get_meta(key: str):
         row = cur.fetchone()
         return row[0] if row else None
 
+def insert_planning_row_from_mail(
+    DATE,
+    HEURE,
+    DESIGNATION="",
+    ADRESSE="",
+    NOM="",
+    PAX=1,
+    VOL="",
+    REMARQUES="",
+    SOURCE="MAIL",
+):
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO planning
+            (DATE, HEURE, DESIGNATION, ADRESSE, NOM, PAX, VOL, SOURCE)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                DATE,
+                HEURE,
+                DESIGNATION,
+                ADRESSE,
+                NOM,
+                PAX,
+                VOL,
+                SOURCE,
+            ),
+        )
 
 def set_meta(key: str, value: str):
     with get_connection() as conn:
@@ -1922,6 +2373,33 @@ def set_meta(key: str, value: str):
             (key, value),
         )
         conn.commit()
+def update_chauffeur_planning(row_key: str, new_ch: str, user: str = ""):
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE planning
+            SET CH = ?,
+                CH_MANUAL = 1,
+                CH_MANUAL_USER = ?,
+                CH_MANUAL_AT = CURRENT_TIMESTAMP
+            WHERE row_key = ?
+            """,
+            (new_ch, user, row_key),
+        )
+
+def update_chauffeur_by_row_key(row_key: str, new_ch: str):
+    """
+    Met à jour le chauffeur d'une ligne planning
+    """
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE planning
+            SET CH = ?
+            WHERE row_key = ?
+            """,
+            (new_ch, row_key),
+        )
 
 def rebuild_planning_db_from_dropbox_full():
     """
@@ -2059,4 +2537,58 @@ def get_chauffeurs_phones(ch_raw: str) -> list[str]:
 
     return phones
 
+def ensure_chauffeur_messages_table():
+    with get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS chauffeur_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT,
+                chauffeur TEXT,
+                canal TEXT,
+                contenu TEXT,
+                traite INTEGER DEFAULT 0
+            )
+        """)
+        conn.commit()
+def ensure_admin_reply_read_column():
+    with get_connection() as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(planning)")]
+        if "ADMIN_REPLY_READ" not in cols:
+            conn.execute(
+                'ALTER TABLE planning ADD COLUMN "ADMIN_REPLY_READ" INTEGER DEFAULT 0'
+            )
+        conn.commit()
 
+def ensure_superseded_column():
+    with get_connection() as conn:
+        cur = conn.execute("PRAGMA table_info(planning)")
+        cols = {r[1] for r in cur.fetchall()}
+        if "IS_SUPERSEDED" not in cols:
+            conn.execute(
+                'ALTER TABLE planning ADD COLUMN "IS_SUPERSEDED" INTEGER DEFAULT 0'
+            )
+            conn.commit()
+
+def ensure_connected_users_table():
+    with get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS connected_users (
+                username TEXT PRIMARY KEY,
+                role TEXT,
+                chauffeur_code TEXT,
+                last_seen TEXT
+            )
+        """)
+        conn.commit()
+
+
+def ensure_admin_reply_read_column():
+    with get_connection() as conn:
+        cur = conn.execute("PRAGMA table_info(planning)")
+        cols = {row[1] for row in cur.fetchall()}
+
+        if "ADMIN_REPLY_READ" not in cols:
+            conn.execute(
+                'ALTER TABLE planning ADD COLUMN "ADMIN_REPLY_READ" INTEGER DEFAULT 0'
+            )
+            conn.commit()
