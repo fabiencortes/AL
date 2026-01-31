@@ -1556,9 +1556,9 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
         conn.commit()
 
     # ======================================================
-    # 9️⃣ BIS — MARQUER LES NAVETTES CONFIRMÉES
-    #        SUPPRIMÉES / MODIFIÉES DANS EXCEL
-    #        (elles ne seront plus visibles au planning)
+    # 9️⃣ BIS — MARQUER LES NAVETTES "PROTÉGÉES"
+    #        absentes d’Excel (modifiées/supprimées)
+    #        ➜ on les masque (IS_SUPERSEDED=1) au lieu de delete
     # ======================================================
 
     excel_keys = set(row_keys)
@@ -1566,17 +1566,26 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
     with get_connection() as conn:
         if excel_keys:
             placeholders = ",".join("?" for _ in excel_keys)
+
             conn.execute(
                 f"""
                 UPDATE planning
-                SET IS_SUPERSEDED = 1
-                WHERE IFNULL(CONFIRMED, 0) = 1
-                  AND DATE_ISO >= ?
+                SET IS_SUPERSEDED = 1,
+                    updated_at = ?
+                WHERE DATE_ISO >= ?
                   AND row_key NOT IN ({placeholders})
+                  AND (
+                        IFNULL(CONFIRMED, 0) = 1
+                     OR IFNULL(ACK_AT, '') <> ''
+                     OR IFNULL(CAISSE_PAYEE, 0) = 1
+                     OR IFNULL(IS_PAYE, 0) = 1
+                  )
                 """,
-                [today_iso, *excel_keys],
+                [now_iso, today_iso, *excel_keys],
             )
+
         conn.commit()
+
 
 
     # ======================================================
@@ -1638,6 +1647,7 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
                 data["ACK_TEXT"] = None
                 data["CAISSE_PAYEE"] = 0
                 data["IS_INDISPO"] = 1
+                data["IS_SUPERSEDED"] = 0
 
             # 🔒 PRÉSERVER L'ÉTAT MÉTIER EXISTANT (CRITIQUE)
             cur.execute(
@@ -3755,47 +3765,54 @@ def render_tab_quick_day_mobile():
                     key=f"qd_newch_{row_id}",
                 )
 
-            # 💾 Sauvegarde DB + journal
+            # 💾 Sauvegarde DB + audit
             with colB:
                 if new_ch != ch_current:
                     if st.button("💾 Appliquer", key=f"qd_save_{row_id}"):
 
-                        from database import (
-                            update_chauffeur_planning,
-                            log_ch_change,
-                            make_row_key_from_row,
-                        )
-
-                        row_key = make_row_key_from_row(row.to_dict())
+                        now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         user = (
                             st.session_state.get("username")
                             or st.session_state.get("user")
                             or ""
                         )
 
-                        # 1️⃣ UPDATE DB planning
-                        update_chauffeur_planning(
-                            row_key=row_key,
-                            new_ch=new_ch,
-                            user=user,
+                        # 1️⃣ UPDATE DB
+                        update_planning_row(
+                            row_id,
+                            {
+                                "CH": new_ch,
+                                "CH_MANUAL": 1,
+                                "updated_at": now_iso,
+                            },
                         )
 
-                        # 2️⃣ Journal actions
-                        log_ch_change(
-                            row_key=row_key,
-                            old_ch=ch_current,
-                            new_ch=new_ch,
-                            user=user,
-                        )
+                        # 2️⃣ AUDIT
+                        with get_connection() as conn:
+                            conn.execute(
+                                """
+                                INSERT INTO planning_audit
+                                (ts, user, action, row_key, details)
+                                VALUES (?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    now_iso,
+                                    user,
+                                    "CH_MANUAL_CHANGE",
+                                    row.get("row_key"),
+                                    f"{ch_current} → {new_ch}",
+                                ),
+                            )
+                            conn.commit()
 
                         st.success(
                             "✅ Chauffeur modifié\n"
-                            "🛠️ Badge manuel actif\n"
+                            "🛠️ Override manuel actif\n"
                             "📄 À reporter dans Excel"
                         )
 
                         st.cache_data.clear()
-                        st.session_state["tab_refresh"]["planning"] = time.time()
+                        st.rerun()
                 else:
                     st.caption("")
 
@@ -6252,26 +6269,24 @@ def render_tab_confirmation_chauffeur():
         # ===================================================
         # 📅 PÉRIODE À CONFIRMER
         # ===================================================
+        if "confirm_periode" not in st.session_state:
+            st.session_state.confirm_periode = "Aujourd’hui"
+
         periode = st.radio(
             "📅 Navettes à confirmer",
             ["Aujourd’hui", "À partir de demain"],
             horizontal=True,
+            key="confirm_periode",
         )
 
         today = date.today()
-
-        if periode == "Aujourd’hui":
-            start_date = today
-        else:
-            start_date = today + timedelta(days=1)
+        start_date = today if periode == "Aujourd’hui" else today + timedelta(days=1)
 
         df = get_planning(
             start_date=start_date,
             end_date=None,
             source="7j",
         )
-
-
 
         if df is None or df.empty:
             st.info("Aucune navette à afficher.")
@@ -6288,7 +6303,7 @@ def render_tab_confirmation_chauffeur():
             return
 
         # --------------------------------------------------
-        # Normalisation chauffeur (FONCTION EXISTANTE)
+        # Normalisation chauffeur
         # --------------------------------------------------
         df["CH_ROOT"] = df["CH"].apply(normalize_ch_code)
 
@@ -6314,7 +6329,7 @@ def render_tab_confirmation_chauffeur():
             title = f"{badge} Chauffeur {ch_root} — {len(df_ch)} navette(s)"
 
             with st.expander(title, expanded=has_reply):
-                # Trier les navettes du chauffeur
+
                 df_ch = df_ch.sort_values(
                     by=["DATE_ISO", "HEURE"],
                     ascending=[True, True],
@@ -6325,8 +6340,8 @@ def render_tab_confirmation_chauffeur():
                     # ===================================================
                     # 📋 CONTEXTE NAVETTE (ADMIN)
                     # ===================================================
-                    date_txt = row.get("DATE")
-                    heure_txt = row.get("HEURE")
+                    date_txt = row.get("DATE", "—")
+                    heure_txt = row.get("HEURE", "—")
                     client = row.get("NOM", "—")
                     chauffeur = row.get("CH", "—")
 
@@ -6335,13 +6350,17 @@ def render_tab_confirmation_chauffeur():
                         row.get("DESIGNATION", row.get("DESTINATION", "—"))
                     )
 
+                    # 📍 Adresse complète (CRITIQUE)
+                    adresse_complete = build_full_address_from_row(row)
+
                     st.markdown(
                         f"""
                         ### 📅 {date_txt} ⏰ {heure_txt}
                         👤 **Client :** {client}  
                         👨‍✈️ **Chauffeur :** {chauffeur}  
                         ➡️ **Sens :** {sens}  
-                        📍 **Trajet :** {trajet}
+                        📍 **Adresse :** {adresse_complete or "—"}  
+                        🧭 **Destination :** {trajet}
                         """
                     )
 
@@ -6370,13 +6389,14 @@ def render_tab_confirmation_chauffeur():
                         key=admin_reply_key,
                         height=120,
                     )
+
                     # -----------------------------
-                    # 💬 Envoyer message au chauffeur (SANS confirmer)
+                    # 💬 Envoyer message (sans confirmer)
                     # -----------------------------
                     if st.button(
                         "💬 Envoyer un message au chauffeur",
                         key=f"msg_{row['id']}",
-                        width="stretch",
+                        use_container_width=True,
                     ):
                         if not admin_reply.strip():
                             st.warning("Le message est vide.")
@@ -6388,11 +6408,10 @@ def render_tab_confirmation_chauffeur():
                                 {
                                     "ADMIN_REPLY": admin_reply.strip(),
                                     "ADMIN_REPLY_AT": now_iso,
-                                    "ADMIN_REPLY_READ": 0,   # 🔔 notif chauffeur
+                                    "ADMIN_REPLY_READ": 0,
                                 },
                             )
 
-                            # 🧾 Audit (optionnel mais conseillé)
                             with get_connection() as conn:
                                 conn.execute(
                                     """
@@ -6411,7 +6430,6 @@ def render_tab_confirmation_chauffeur():
                                 conn.commit()
 
                             st.toast("📨 Message envoyé au chauffeur", icon="💬")
-
 
                     # -----------------------------
                     # Actions admin
@@ -6437,7 +6455,6 @@ def render_tab_confirmation_chauffeur():
                                 },
                             )
 
-                            # 🧾 Audit
                             with get_connection() as conn:
                                 conn.execute(
                                     """
@@ -6456,7 +6473,7 @@ def render_tab_confirmation_chauffeur():
                                 conn.commit()
 
                             st.toast("🟢 Navette confirmée et chauffeur informé", icon="✅")
-                            st.session_state["tab_refresh"]["planning"] = time.time()
+                            st.rerun()
 
                     with col_ko:
                         if st.button(
@@ -6477,7 +6494,6 @@ def render_tab_confirmation_chauffeur():
                             st.toast("⏳ Navette laissée en attente", icon="⏳")
 
                     st.divider()
-
 
     # ======================================================
     # 🧾 SOUS-ONGLET : HISTORIQUE
@@ -6515,10 +6531,10 @@ def render_tab_confirmation_chauffeur():
 
     # ======================================================
     # 📩 SOUS-ONGLET : MESSAGES CHAUFFEURS
-    # (à compléter plus tard si tu veux)
     # ======================================================
     with tab_messages:
         st.info("📩 Vue messages chauffeurs — à venir")
+
 
 def _match_rule_minutes(rules_norm, ch, sens, dest):
     """
