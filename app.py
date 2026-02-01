@@ -1214,6 +1214,8 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
     """
     🔄 Synchronisation SAFE depuis aujourd’hui
     - ZÉRO doublon (row_key + INSERT OR IGNORE)
+    - MAIS si Excel modifie une navette (date/heure/chauffeur/destination...) :
+        ➜ l’ancienne version est supprimée/masquée
     - Congés / indispos détectés par HEURE -> HEURE_FIN
     - Dates Excel FR ("samedi 24 janvier 2026") supportées
     - Compatible DB existante
@@ -1231,7 +1233,6 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
     # ======================================================
     excel_dt = get_dropbox_file_last_modified()
     if not excel_dt:
-        # impossible de vérifier → on laisse passer
         pass
     else:
         last_excel_dt = get_meta("excel_last_modified")
@@ -1239,11 +1240,9 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
             try:
                 last_excel_dt = datetime.fromisoformat(last_excel_dt)
                 if excel_dt <= last_excel_dt:
-                    # ✅ Excel inchangé → on STOPPE ici
                     return 0
             except Exception:
                 pass
-
 
     # ======================================================
     # 0️⃣ SÉCURITÉ DB : colonnes nécessaires
@@ -1257,6 +1256,10 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
             conn.execute('ALTER TABLE planning ADD COLUMN "DATE_ISO" TEXT')
         if "updated_at" not in cols:
             conn.execute('ALTER TABLE planning ADD COLUMN "updated_at" TEXT')
+        if "IS_SUPERSEDED" not in cols:
+            conn.execute('ALTER TABLE planning ADD COLUMN "IS_SUPERSEDED" INTEGER DEFAULT 0')
+        if "EXCEL_UID" not in cols:
+            conn.execute('ALTER TABLE planning ADD COLUMN "EXCEL_UID" TEXT')
 
         conn.commit()
 
@@ -1282,30 +1285,18 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
         return 0
 
     def _normalize_excel_date_to_iso(val):
-        """
-        Retourne 'YYYY-MM-DD' ou None.
-        Gère proprement les cas ambigus (02-01-2026 = 2 janvier 2026).
-        Supporte :
-        - datetime / date
-        - serial Excel (nombre)
-        - dd/mm/YYYY, dd-mm-YYYY, dd/mm/YY, dd-mm-YY
-        - YYYY-MM-DD
-        - "samedi 24 janvier 2026"
-        """
         if val is None:
             return None
 
-        # date/datetime direct
         if isinstance(val, (datetime, date)):
             try:
                 return val.strftime("%Y-%m-%d")
             except Exception:
                 pass
 
-        # serial Excel (jours depuis 1899-12-30)
         try:
             if isinstance(val, (int, float)) and not pd.isna(val):
-                if 20000 <= float(val) <= 60000:  # plage réaliste
+                if 20000 <= float(val) <= 60000:
                     dt = pd.to_datetime(float(val), unit="D", origin="1899-12-30", errors="coerce")
                     if not pd.isna(dt):
                         return dt.strftime("%Y-%m-%d")
@@ -1318,7 +1309,6 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
 
         s_low = s.lower().strip()
 
-        # ISO direct
         try:
             if len(s_low) == 10 and s_low[4] == "-" and s_low[7] == "-":
                 dt = pd.to_datetime(s_low, format="%Y-%m-%d", errors="coerce")
@@ -1327,18 +1317,15 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
         except Exception:
             pass
 
-        # dd/mm/YYYY ou dd-mm-YYYY (priorité jour/mois)
         for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y", "%d-%m-%y"):
             try:
                 dt = datetime.strptime(s_low, fmt)
-                # 2 chiffres → supposer 20xx si < 50 sinon 19xx (simple et stable)
                 if fmt.endswith("%y") and dt.year < 100:
                     dt = dt.replace(year=dt.year + (2000 if dt.year < 50 else 1900))
                 return dt.strftime("%Y-%m-%d")
             except Exception:
                 pass
 
-        # Dernière chance pandas (dayfirst=True)
         try:
             dt = pd.to_datetime(s_low, dayfirst=True, errors="coerce")
             if not pd.isna(dt):
@@ -1346,7 +1333,6 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
         except Exception:
             pass
 
-        # "samedi 24 janvier 2026" -> enlever le jour de semaine
         s2 = re.sub(r"^(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)\s+", "", s_low).strip()
 
         months = {
@@ -1367,15 +1353,11 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
         return None
 
     df_excel["DATE_ISO"] = df_excel["DATE"].apply(_normalize_excel_date_to_iso)
-
-    # on supprime les lignes sans DATE exploitable (sinon elles ne pourront jamais être dans planning_7j)
     df_excel = df_excel[df_excel["DATE_ISO"].notna()].copy()
-
-    # DATE affichage dd/mm/YYYY (cohérent avec ton app)
     df_excel["DATE"] = pd.to_datetime(df_excel["DATE_ISO"], errors="coerce").dt.strftime("%d/%m/%Y")
 
     # ======================================================
-    # 4️⃣ Normalisation HEURE + HEURE_FIN (ou colonne ²²²²)
+    # 4️⃣ Normalisation HEURE + HEURE_FIN
     # ======================================================
     df_excel["HEURE"] = (
         df_excel.get("HEURE", "")
@@ -1383,7 +1365,6 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
         .fillna("")
     )
 
-    # Détecter la colonne "heure fin" (chez toi souvent "²²²²")
     heure_fin_col = None
     for cand in ["HEURE_FIN", "HEURE FIN", "HEURE2", "HEURE 2", "²²²²"]:
         if cand in df_excel.columns:
@@ -1399,14 +1380,11 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
     else:
         df_excel["_HEURE_FIN"] = ""
 
-    # Nettoyage chauffeur
     if "CH" in df_excel.columns:
         df_excel["CH"] = df_excel["CH"].astype(str).str.strip()
 
     # ======================================================
-    # 5️⃣ Détection CONGÉ / INDISPO demandée
-    # - 00:00 -> 00:00 = congé
-    # - heure -> heure (différentes) = indispo
+    # 5️⃣ Détection CONGÉ / INDISPO
     # ======================================================
     h1 = df_excel["HEURE"].fillna("").astype(str)
     h2 = df_excel["_HEURE_FIN"].fillna("").astype(str)
@@ -1417,7 +1395,7 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
     df_excel["IS_INDISPO"] = (is_conge | is_indispo_plage).astype(int)
 
     # ======================================================
-    # 6️⃣ CONFIRMATION / CAISSE depuis Excel (inchangé)
+    # 6️⃣ CONFIRMATION / CAISSE depuis Excel
     # ======================================================
     if "CONFIRMED" not in df_excel.columns:
         df_excel["CONFIRMED"] = 0
@@ -1452,66 +1430,85 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
         df_excel["CAISSE_PAYEE"] = df_excel.apply(_calc_caisse_payee, axis=1)
 
     # ======================================================
-    # 7️⃣ Filtre “depuis aujourd’hui” (performance)
-    # 👉 IMPORTANT : on garde FUTUR car planning_7j = futur
+    # 7️⃣ Filtre “depuis aujourd’hui”
     # ======================================================
     df_excel = df_excel[df_excel["DATE_ISO"] >= today_iso].copy()
-
     if df_excel.empty:
         st.info("Aucune donnée à synchroniser.")
         return 0
 
     # ======================================================
-    # 8️⃣ row_key UNIQUE
+    # 7️⃣ BIS — EXCEL_UID : clé stable (indépendante date/heure/ch)
+    # ➜ permet de supprimer l’ancienne version même si row_key change
     # ======================================================
-    # ======================================================
-    # 8️⃣ row_key UNIQUE (CORRECTION CONGÉS / INDISPOS)
-    # ======================================================
+    def _norm_txt(v):
+        return str(v or "").strip().lower()
 
+    def _make_excel_uid(row):
+        # Priorité aux champs "uniques" si présents
+        num_bdc = _norm_txt(row.get("Num BDC") or row.get("NUM BDC") or row.get("BDC"))
+        vol = _norm_txt(row.get("N° Vol") or row.get("N°Vol") or row.get("N Vol") or row.get("VOL"))
+        nom = _norm_txt(row.get("NOM"))
+        adresse = _norm_txt(row.get("ADRESSE"))
+        cp = _norm_txt(row.get("CP"))
+        loc = _norm_txt(row.get("Localité") or row.get("LOCALITE"))
+        designation = _norm_txt(row.get("DESIGNATION") or row.get("DESTINATION"))
+        sens = _norm_txt(row.get("Unnamed: 8"))
+
+        # Si Num BDC existe => c’est souvent le meilleur identifiant
+        if num_bdc:
+            return f"BDC|{num_bdc}|{nom}"
+
+        # Sinon, si vol existe (souvent unique aussi)
+        if vol:
+            return f"VOL|{vol}|{nom}"
+
+        # Fallback robuste : identité client + adresse + destination + sens
+        return "|".join(
+            [
+                "FALLBACK",
+                nom,
+                adresse,
+                cp,
+                loc,
+                designation,
+                sens,
+            ]
+        )
+
+    df_excel["EXCEL_UID"] = df_excel.apply(_make_excel_uid, axis=1)
+
+    # ======================================================
+    # 8️⃣ row_key UNIQUE (congés/indispos)
+    # ======================================================
     def _make_row_key_safe(row):
-        """
-        row_key garanti UNIQUE :
-        - navette normale → logique existante
-        - congé / indispo → DATE + CH + HEURE + HEURE_FIN
-        """
-        # clé standard
         base = make_row_key_from_row(row.to_dict())
 
-        # 🔴 Cas congé / indispo
         if int(row.get("IS_INDISPO", 0) or 0) == 1:
             ch = str(row.get("CH", "") or "").strip().upper()
             date_iso = str(row.get("DATE_ISO", "") or "")
-            h1 = str(row.get("HEURE", "") or "")
-            h2 = str(row.get("_HEURE_FIN", "") or "")
-
-            return f"INDISPO|{date_iso}|{ch}|{h1}|{h2}"
+            hh1 = str(row.get("HEURE", "") or "")
+            hh2 = str(row.get("_HEURE_FIN", "") or "")
+            return f"INDISPO|{date_iso}|{ch}|{hh1}|{hh2}"
 
         return base
 
-
-    df_excel["row_key"] = df_excel.apply(
-        _make_row_key_safe,
-        axis=1,
-    )
-
-    df_excel = df_excel.drop_duplicates(
-        subset=["row_key"]
-    ).copy()
-
+    df_excel["row_key"] = df_excel.apply(_make_row_key_safe, axis=1)
+    df_excel = df_excel.drop_duplicates(subset=["row_key"]).copy()
 
     # ======================================================
     # 9️⃣ SUPPRESSION DB (NETTOYAGE AVANT RÉÉCRITURE — SAFE)
-    # - indispos futures : on supprime (elles seront réécrites)
-    # - navettes futures NON CONFIRMÉES et SANS ACK seulement
-    # - row_key Excel : sécurité anti-doublon (hors lignes protégées)
+    # Objectif :
+    # - supprimer indispos futures
+    # - supprimer anciennes versions des navettes Excel (même si date/heure/ch changent)
+    # - ne PAS toucher aux navettes protégées (CONFIRMED/ACK/PAIEMENTS) -> elles seront superseded si absentes
     # ======================================================
-
     row_keys = df_excel["row_key"].dropna().astype(str).tolist()
+    excel_uids = df_excel["EXCEL_UID"].dropna().astype(str).unique().tolist()
 
     with get_connection() as conn:
 
-        # 🔴 1) SUPPRESSION DES INDISPOS FUTURES
-        # (elles seront toujours réinjectées depuis Excel)
+        # 🔴 1) SUPPRESSION DES INDISPOS FUTURES (réinjectées)
         conn.execute(
             """
             DELETE FROM planning
@@ -1521,23 +1518,26 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
             (today_iso,),
         )
 
-        # 🟢 2) SUPPRESSION DES NAVETTES FUTURES
-        # ⚠️ UNIQUEMENT celles :
-        # - NON confirmées
-        # - SANS réponse chauffeur
-        conn.execute(
-            """
-            DELETE FROM planning
-            WHERE DATE_ISO >= ?
-              AND IFNULL(IS_INDISPO, 0) = 0
-              AND IFNULL(CONFIRMED, 0) = 0
-              AND ACK_AT IS NULL
-            """,
-            (today_iso,),
-        )
+        # 🔴 2) SUPPRESSION DES ANCIENNES VERSIONS (via EXCEL_UID)
+        # => ça supprime l’ancienne même si la date/heure/ch a changé
+        if excel_uids:
+            CHUNK = 200
+            for i in range(0, len(excel_uids), CHUNK):
+                chunk = excel_uids[i:i + CHUNK]
+                placeholders = ",".join("?" for _ in chunk)
+                conn.execute(
+                    f"""
+                    DELETE FROM planning
+                    WHERE DATE_ISO >= ?
+                      AND IFNULL(IS_INDISPO, 0) = 0
+                      AND IFNULL(CONFIRMED, 0) = 0
+                      AND ACK_AT IS NULL
+                      AND IFNULL(EXCEL_UID, '') IN ({placeholders})
+                    """,
+                    [today_iso, *chunk],
+                )
 
-        # 🧹 3) SÉCURITÉ ANTI-DOUBLON PAR row_key
-        # ⚠️ ON NE TOUCHE PAS aux lignes CONFIRMÉES ou avec ACK
+        # 🧹 3) SÉCURITÉ ANTI-DOUBLON PAR row_key (hors lignes protégées)
         if row_keys:
             CHUNK = 400
             for i in range(0, len(row_keys), CHUNK):
@@ -1556,17 +1556,13 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
         conn.commit()
 
     # ======================================================
-    # 9️⃣ BIS — MARQUER LES NAVETTES "PROTÉGÉES"
-    #        absentes d’Excel (modifiées/supprimées)
-    #        ➜ on les masque (IS_SUPERSEDED=1) au lieu de delete
+    # 9️⃣ BIS — MARQUER LES NAVETTES PROTÉGÉES absentes d’Excel
     # ======================================================
-
     excel_keys = set(row_keys)
 
     with get_connection() as conn:
         if excel_keys:
             placeholders = ",".join("?" for _ in excel_keys)
-
             conn.execute(
                 f"""
                 UPDATE planning
@@ -1583,18 +1579,12 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
                 """,
                 [now_iso, today_iso, *excel_keys],
             )
-
         conn.commit()
 
-
-
     # ======================================================
-    # 🔟 INSERTION SAFE (PRÉSERVE CONFIRMATION / ACK)
+    # 🔟 INSERTION SAFE (PRÉSERVE CONFIRMATION / ACK si même row_key)
+    # ✅ UNE SEULE CONNEXION SQLite
     # ======================================================
-    # --------------------------------------------------
-    # 🔟 INSERTION SAFE (PRÉSERVE CONFIRMATION / ACK)
-    #    ✅ UNE SEULE CONNEXION SQLite (évite database locked)
-    # --------------------------------------------------
     inserts = 0
     planning_cols = get_planning_table_columns()
 
@@ -1621,23 +1611,25 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
 
             data: dict = {}
 
-            # 🔑 MARQUAGE SYNCHRO EXCEL (si fourni)
             if excel_sync_ts and "EXCEL_SYNC_TS" in planning_cols:
                 data["EXCEL_SYNC_TS"] = excel_sync_ts
 
-            # Colonnes directes Excel -> DB
             for col in df_excel.columns:
                 if col in planning_cols and col not in ("id",):
                     val = row.get(col)
                     if val not in (None, "", "nan"):
                         data[col] = sqlite_safe(val)
 
-            # Mapping colonnes Excel -> DB
             for excel_col, db_col in EXCEL_TO_DB_COLS.items():
                 if excel_col in df_excel.columns and db_col in planning_cols:
                     val = row.get(excel_col)
                     if val not in (None, "", "nan"):
                         data[db_col] = sqlite_safe(val)
+
+            # ✅ EXCEL_UID + superseded
+            if "EXCEL_UID" in planning_cols:
+                data["EXCEL_UID"] = sqlite_safe(row.get("EXCEL_UID"))
+            data["IS_SUPERSEDED"] = 0
 
             # Sécurité congé / indispo
             if int(row.get("IS_INDISPO", 0) or 0) == 1:
@@ -1649,7 +1641,7 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
                 data["IS_INDISPO"] = 1
                 data["IS_SUPERSEDED"] = 0
 
-            # 🔒 PRÉSERVER L'ÉTAT MÉTIER EXISTANT (CRITIQUE)
+            # Préserver l'état métier si même row_key existe
             cur.execute(
                 """
                 SELECT CONFIRMED, CONFIRMED_AT, ACK_AT, ACK_TEXT
@@ -1659,25 +1651,22 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
                 (rk,),
             )
             prev = cur.fetchone()
-
             if prev:
                 data["CONFIRMED"] = prev[0]
                 data["CONFIRMED_AT"] = prev[1]
                 data["ACK_AT"] = prev[2]
                 data["ACK_TEXT"] = prev[3]
 
-            # row_key + updated_at
             data["row_key"] = rk
             data["updated_at"] = now_iso
 
-            # INSERT OR IGNORE (anti-doublon)
-            cols = [c for c in data.keys() if c in planning_cols]
-            if not cols:
+            cols_ins = [c for c in data.keys() if c in planning_cols]
+            if not cols_ins:
                 continue
 
-            col_sql = ", ".join([f'"{c}"' for c in cols])
-            placeholders = ", ".join(["?"] * len(cols))
-            values = [data[c] for c in cols]
+            col_sql = ", ".join([f'"{c}"' for c in cols_ins])
+            placeholders = ", ".join(["?"] * len(cols_ins))
+            values = [data[c] for c in cols_ins]
 
             try:
                 cur.execute(
@@ -1691,7 +1680,7 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
 
         conn.commit()
 
-# ======================================================
+    # ======================================================
     # 11️⃣ Rebuild vues
     # ======================================================
     rebuild_planning_views()
@@ -1743,18 +1732,21 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
             conn.commit()
 
     # ======================================================
-    # 14️⃣ Cache / UI
+    # 14️⃣ Cache / UI (silencieux + ciblé)
     # ======================================================
     st.session_state["last_sync_time"] = datetime.now().strftime("%H:%M")
-    st.cache_data.clear()
-    # ======================================================
-    # 🧠 Méta : mémoriser la date Excel synchronisée
-    # ======================================================
+
+    # Clear ciblé si possible (évite de tout casser)
+    try:
+        get_planning.clear()
+    except Exception:
+        pass
+
     if excel_dt:
         set_meta("excel_last_modified", excel_dt.isoformat())
 
-
     return inserts
+
 
 
 
