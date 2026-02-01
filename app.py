@@ -1497,88 +1497,19 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
     df_excel = df_excel.drop_duplicates(subset=["row_key"]).copy()
 
     # ======================================================
-    # 9️⃣ SUPPRESSION DB (NETTOYAGE AVANT RÉÉCRITURE — SAFE)
-    # Objectif :
-    # - supprimer indispos futures
-    # - supprimer anciennes versions des navettes Excel (même si date/heure/ch changent)
-    # - ne PAS toucher aux navettes protégées (CONFIRMED/ACK/PAIEMENTS) -> elles seront superseded si absentes
+    # 9️⃣ RESET COMPLET DES NAVETTES FUTURES
+    # 👉 Excel est SOURCE DE VÉRITÉ ABSOLUE
+    # 👉 même les confirmées sont remplacées si modifiées
     # ======================================================
-    row_keys = df_excel["row_key"].dropna().astype(str).tolist()
-    excel_uids = df_excel["EXCEL_UID"].dropna().astype(str).unique().tolist()
 
     with get_connection() as conn:
-
-        # 🔴 1) SUPPRESSION DES INDISPOS FUTURES (réinjectées)
         conn.execute(
             """
             DELETE FROM planning
-            WHERE IFNULL(IS_INDISPO, 0) = 1
-              AND DATE_ISO >= ?
+            WHERE DATE_ISO >= ?
             """,
             (today_iso,),
         )
-
-        # 🔴 2) SUPPRESSION DES ANCIENNES VERSIONS (via EXCEL_UID)
-        # => ça supprime l’ancienne même si la date/heure/ch a changé
-        if excel_uids:
-            CHUNK = 200
-            for i in range(0, len(excel_uids), CHUNK):
-                chunk = excel_uids[i:i + CHUNK]
-                placeholders = ",".join("?" for _ in chunk)
-                conn.execute(
-                    f"""
-                    DELETE FROM planning
-                    WHERE DATE_ISO >= ?
-                      AND IFNULL(IS_INDISPO, 0) = 0
-                      AND IFNULL(CONFIRMED, 0) = 0
-                      AND ACK_AT IS NULL
-                      AND IFNULL(EXCEL_UID, '') IN ({placeholders})
-                    """,
-                    [today_iso, *chunk],
-                )
-
-        # 🧹 3) SÉCURITÉ ANTI-DOUBLON PAR row_key (hors lignes protégées)
-        if row_keys:
-            CHUNK = 400
-            for i in range(0, len(row_keys), CHUNK):
-                chunk = row_keys[i:i + CHUNK]
-                placeholders = ",".join("?" for _ in chunk)
-                conn.execute(
-                    f"""
-                    DELETE FROM planning
-                    WHERE row_key IN ({placeholders})
-                      AND IFNULL(CONFIRMED, 0) = 0
-                      AND ACK_AT IS NULL
-                    """,
-                    chunk,
-                )
-
-        conn.commit()
-
-    # ======================================================
-    # 9️⃣ BIS — MARQUER LES NAVETTES PROTÉGÉES absentes d’Excel
-    # ======================================================
-    excel_keys = set(row_keys)
-
-    with get_connection() as conn:
-        if excel_keys:
-            placeholders = ",".join("?" for _ in excel_keys)
-            conn.execute(
-                f"""
-                UPDATE planning
-                SET IS_SUPERSEDED = 1,
-                    updated_at = ?
-                WHERE DATE_ISO >= ?
-                  AND row_key NOT IN ({placeholders})
-                  AND (
-                        IFNULL(CONFIRMED, 0) = 1
-                     OR IFNULL(ACK_AT, '') <> ''
-                     OR IFNULL(CAISSE_PAYEE, 0) = 1
-                     OR IFNULL(IS_PAYE, 0) = 1
-                  )
-                """,
-                [now_iso, today_iso, *excel_keys],
-            )
         conn.commit()
 
     # ======================================================
