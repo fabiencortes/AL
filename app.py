@@ -2258,7 +2258,7 @@ def send_email_to_chauffeurs_from_row(row, subject: str, body: str):
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 SMTP_USER = "airportslinesbureau@gmail.com"
-SMTP_PASSWORD = "xnib fwba oisn aadk"
+SMTP_PASSWORD = "xayi uusp kgrv xnlt"
 
 ADMIN_NOTIFICATION_EMAIL = "airportslinesbureau@gmail.com"
 FROM_EMAIL = SMTP_USER
