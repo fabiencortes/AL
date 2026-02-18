@@ -4,6 +4,8 @@
 import os as _os
 import sys as _sys
 import time as _time
+import base64
+
 
 try:
     from utils import debug_print, debug_enabled
@@ -42,10 +44,12 @@ from database import mark_navette_confirmed
 from database import ensure_ack_columns
 from pathlib import Path
 
-
+import streamlit.components.v1 as components
 import math
 import smtplib
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
 import pandas as pd
 import requests
 from openpyxl import load_workbook
@@ -56,7 +60,7 @@ try:
     debug_print('📦 DATABASE MODULE:', _database.__file__)
 except Exception:
     pass
-from reportlab.lib.pagesizes import A4
+from reportlab.lib.pagesizes import A4, landscape
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import cm
 
@@ -2772,6 +2776,45 @@ def format_sens_ar(val: str) -> str:
         return "A/R"
     return sens
 
+def build_printable_html_planning(df: pd.DataFrame, ch: str):
+    html_table = df.to_html(index=False)
+
+    return f"""
+    <html>
+    <head>
+        <style>
+            @page {{
+                size: A4 landscape;
+                margin: 10mm;
+            }}
+            body {{
+                font-family: Arial, sans-serif;
+                zoom: 0.85;
+            }}
+            h2 {{
+                margin-bottom: 10px;
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 10px;
+            }}
+            th, td {{
+                border: 1px solid #ccc;
+                padding: 4px;
+                text-align: left;
+            }}
+            th {{
+                background-color: #f0f0f0;
+            }}
+        </style>
+    </head>
+    <body onload="window.print();">
+        <h2>Planning chauffeur — {ch}</h2>
+        {html_table}
+    </body>
+    </html>
+    """
 
 def resolve_client_alias(text: str) -> str:
     """
@@ -2865,6 +2908,27 @@ def is_indispo_row(row, columns):
     return False
 
 
+def print_html_popup(html: str):
+    # Ouvre une nouvelle fenêtre et lance l'impression
+    popup = f"""
+    <script>
+      (function() {{
+        var w = window.open("", "_blank");
+        if (!w) {{
+          alert("Popup bloquée par le navigateur. Autorise les popups puis réessaie.");
+          return;
+        }}
+        w.document.open();
+        w.document.write(`{html.replace("`", "\\`")}`);
+        w.document.close();
+        w.focus();
+        setTimeout(function() {{
+          w.print();
+        }}, 400);
+      }})();
+    </script>
+    """
+    components.html(popup, height=0, width=0)
 
 # ============================================================
 #   HELPERS — PHONE / WHATSAPP / MAIL
@@ -3389,6 +3453,44 @@ def send_email_smtp(to_email: str, subject: str, body: str) -> bool:
     if not to_email:
         return False
 
+def send_email_smtp_with_attachments(
+    to_email: str,
+    subject: str,
+    body: str,
+    attachments: list[tuple[str, bytes, str]] | None = None,
+) -> bool:
+    """Envoie un e-mail via SMTP avec pièces jointes.
+    attachments = [(filename, content_bytes, mime_subtype)] ; ex: ('planning.pdf', pdf_bytes, 'pdf')
+    """
+    if not to_email:
+        return False
+
+    try:
+        msg = MIMEMultipart()
+        msg["Subject"] = subject
+        msg["From"] = FROM_EMAIL
+        msg["To"] = to_email
+
+        msg.attach(MIMEText(body or "", "plain", "utf-8"))
+
+        if attachments:
+            for (filename, content, subtype) in attachments:
+                if content is None:
+                    continue
+                part = MIMEApplication(content, _subtype=(subtype or "octet-stream"))
+                part.add_header("Content-Disposition", "attachment", filename=filename)
+                msg.attach(part)
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+
+        return True
+
+    except Exception as e:
+        st.error(f"Erreur en envoyant le mail à {to_email} : {e}")
+        return False
     try:
         msg = MIMEText(body, "plain", "utf-8")
         msg["Subject"] = subject
@@ -3668,8 +3770,8 @@ def create_chauffeur_pdf(df_ch: pd.DataFrame, ch_selected: str, day_label: str) 
     Génère une feuille PDF claire pour le chauffeur.
     """
     buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
+    c = canvas.Canvas(buffer, pagesize=landscape(A4))
+    width, height = landscape(A4)
     y = height - 2 * cm
 
     c.setFont("Helvetica-Bold", 14)
@@ -5251,50 +5353,32 @@ def render_tab_vue_chauffeur(forced_ch=None):
     import pandas as pd
     from datetime import date, timedelta
 
-    print("🟢 ENTER render_tab_vue_chauffeur", flush=True)
-
     st.subheader("📢 Bureau — Envoi planning chauffeurs")
 
     # =======================================================
     # 🔐 Accès réservé
     # =======================================================
-    print("🟡 check role", flush=True)
     if st.session_state.get("role") != "admin":
-        st.info(
-            "Cette page sert uniquement au **bureau** pour envoyer le planning aux chauffeurs."
-        )
-        print("🔴 exit: not admin", flush=True)
+        st.info("Cette page sert uniquement au **bureau** pour envoyer le planning.")
         return
-    print("🟢 role admin OK", flush=True)
 
     today = date.today()
-    print("🟢 today OK", flush=True)
 
     # =======================================================
-    # 🧱 Initialisation DB (UNE SEULE FOIS)
+    # 🧱 Init DB (1x)
     # =======================================================
     if not st.session_state.get("send_log_init_done"):
-        print("🟡 ensure_send_log_table START", flush=True)
         ensure_send_log_table()
         st.session_state["send_log_init_done"] = True
-        print("🟢 ensure_send_log_table DONE", flush=True)
-    else:
-        print("🟢 send_log already init", flush=True)
 
     # =======================================================
-    # 📢 ENVOI DU PLANNING
+    # 📅 PÉRIODE
     # =======================================================
-    st.markdown("---")
-    st.markdown("### 📢 Envoi du planning")
-
-    # ---------------------------
-    # Choix période
-    # ---------------------------
-    print("🟡 render radio periode", flush=True)
     periode = st.radio(
         "📅 Quelle période envoyer ?",
         ["Aujourd’hui", "Demain + 2 jours"],
         horizontal=True,
+        key="bureau_send_periode",
     )
 
     if periode == "Aujourd’hui":
@@ -5306,169 +5390,265 @@ def render_tab_vue_chauffeur(forced_ch=None):
         d_end = today + timedelta(days=3)
         periode_label = "de demain à J+3"
 
-    print(f"🟢 periode OK : {periode_label}", flush=True)
+    # =======================================================
+    # 🧾 FORMAT D'ENVOI
+    # =======================================================
+    send_format = st.radio(
+        "🧾 Format d'envoi par e-mail",
+        ["Normal (texte)", "PDF (texte + pièce jointe)"],
+        horizontal=True,
+        key="bureau_send_format",
+        help="Normal = identique à avant. PDF = même message + planning en PDF (comme dans la vue Driver).",
+    )
+    want_pdf = str(send_format).startswith("PDF")
 
-    # ===================================================
-    # 🚖 Chauffeurs concernés
-    # ===================================================
-    print("🟡 load_planning_for_period START", flush=True)
-    df_period = load_planning_for_period(d_start, d_end)
-    print(f"🟢 load_planning_for_period DONE rows={len(df_period)}", flush=True)
-
+    # =======================================================
+    # 🚖 CHAUFFEURS SUR LA PÉRIODE (SQL DIRECT -> fiable)
+    # =======================================================
     active_chauffeurs = set()
+    with get_connection() as conn:
+        df_chcol = pd.read_sql_query(
+            """
+            SELECT CH
+            FROM planning
+            WHERE COALESCE(IS_INDISPO,0)=0
+              AND COALESCE(IS_SUPERSEDED,0)=0
+              AND DATE_ISO BETWEEN ? AND ?
+              AND COALESCE(CH,'') <> ''
+            """,
+            conn,
+            params=(d_start.isoformat(), d_end.isoformat()),
+        )
 
-    if not df_period.empty and "CH" in df_period.columns:
-        print("🟡 split chauffeurs", flush=True)
-        for raw in df_period["CH"].dropna().astype(str):
+    if not df_chcol.empty:
+        for raw in df_chcol["CH"].dropna().astype(str):
             for c in split_chauffeurs(raw):
-                active_chauffeurs.add(c)
+                if c:
+                    active_chauffeurs.add(c)
 
-    real_chauffeurs = sorted(active_chauffeurs)
-    print(f"🟢 real_chauffeurs={real_chauffeurs}", flush=True)
+    chauffeurs_planning = sorted(active_chauffeurs)
 
-    print("🟡 render radio destinataire", flush=True)
+    # forced_ch (si tu veux forcer un chauffeur depuis un autre écran)
+    if forced_ch:
+        forced = str(forced_ch).strip().upper()
+        if forced and forced not in chauffeurs_planning:
+            chauffeurs_planning = [forced] + chauffeurs_planning
+
+    if not chauffeurs_planning:
+        st.warning("Aucun chauffeur trouvé sur la période sélectionnée.")
+        return
+
+    # =======================================================
+    # 🎯 DESTINATAIRES
+    # =======================================================
     ch_choice = st.radio(
         "🚖 Destinataire",
         ["Tous les chauffeurs", "Un chauffeur"],
         horizontal=True,
+        key="bureau_send_target",
     )
 
     if ch_choice == "Un chauffeur":
-        print("🟡 mode un chauffeur", flush=True)
-        multi_mode = st.checkbox("☑️ Sélection multiple de chauffeurs")
-
+        multi_mode = st.checkbox("☑️ Sélection multiple de chauffeurs", key="bureau_send_multi")
         if multi_mode:
-            print("🟡 multiselect chauffeurs", flush=True)
-            chauffeurs = st.multiselect(
+            target_chauffeurs = st.multiselect(
                 "Sélectionner les chauffeurs",
-                real_chauffeurs,
+                chauffeurs_planning,
+                key="bureau_send_multiselect",
             )
         else:
-            print("🟡 selectbox chauffeur", flush=True)
-            ch_one = st.selectbox(
+            one = st.selectbox(
                 "Sélectionner le chauffeur",
-                real_chauffeurs,
+                chauffeurs_planning,
+                key="bureau_send_one",
             )
-            chauffeurs = [ch_one] if ch_one else []
+            target_chauffeurs = [one] if one else []
     else:
-        print("🟢 tous les chauffeurs", flush=True)
-        chauffeurs = real_chauffeurs
+        target_chauffeurs = chauffeurs_planning
 
-    chauffeurs = [c for c in chauffeurs if c]
-    print(f"🟢 chauffeurs sélectionnés={chauffeurs}", flush=True)
+    target_chauffeurs = [c for c in target_chauffeurs if c]
+
+    if not target_chauffeurs:
+        st.warning("Aucun chauffeur sélectionné.")
+        return
 
     col_mail, col_wa = st.columns(2)
-    print("🟢 columns mail/wa OK", flush=True)
 
-    # ===================================================
-    # 📧 MAIL
-    # ===================================================
+    # ===========================
+    # 📧 MAIL (TEXTE + PDF optionnel)
+    # ===========================
     with col_mail:
-        print("🟢 render bouton MAIL", flush=True)
-        if st.button("📧 Envoyer le planning", width="stretch"):
-            print("🔴 CLICK bouton MAIL", flush=True)
+        if st.button(
+            "📧 Envoyer le planning",
+            use_container_width=True,
+            key="bureau_send_mail_btn",
+        ):
+            errors = []
+            sent = 0
 
-            if not chauffeurs:
-                st.warning("Aucun chauffeur à notifier.")
-                print("⚠️ aucun chauffeur", flush=True)
-            else:
-                errors = []
-                sent_once = set()
+            # anti-doublon chauffeurs
+            for ch in dict.fromkeys(target_chauffeurs):
 
-                for ch in chauffeurs:
-                    print(f"🟡 traitement chauffeur {ch}", flush=True)
-                    if ch in sent_once:
-                        continue
-                    sent_once.add(ch)
+                try:
+                    # -------------------
+                    # Contact chauffeur
+                    # -------------------
+                    _tel, mail = get_chauffeur_contact(ch)
+                    if not mail:
+                        raise ValueError("Email manquant")
 
-                    try:
-                        print("🟡 get_chauffeur_contact", flush=True)
-                        _, mail = get_chauffeur_contact(ch)
-                        if not mail:
-                            raise ValueError("Email manquant")
+                    # -------------------
+                    # Planning chauffeur (source brute)
+                    # -------------------
+                    df_ch = get_chauffeur_planning(
+                        chauffeur=ch,
+                        from_date=d_start,
+                        to_date=d_end,
+                    )
 
-                        print("🟡 send_planning_to_chauffeurs", flush=True)
-                        send_planning_to_chauffeurs(
-                            chauffeurs=[ch],
-                            from_date=d_start,
-                            to_date=d_end,
-                            message_type="planning",
+                    if df_ch is None or df_ch.empty:
+                        log_send(
+                            ch,
+                            "MAIL",
+                            periode_label,
+                            "OK",
+                            "Aucune navette (pas d'envoi)",
                         )
-
-                        log_send(ch, "MAIL", periode_label, "OK", "Envoyé")
-                        print(f"🟢 MAIL envoyé à {ch}", flush=True)
-
-                    except Exception as e:
-                        log_send(ch, "MAIL", periode_label, "ERREUR", str(e))
-                        errors.append((ch, str(e)))
-                        print(f"❌ erreur MAIL {ch} : {e}", flush=True)
-
-                if errors:
-                    st.error("❌ Certains envois ont échoué")
-                else:
-                    st.success(f"✅ Planning {periode_label} envoyé")
-
-    # ===================================================
-    # 💬 WHATSAPP
-    # ===================================================
-    with col_wa:
-        print("🟢 render bouton WHATSAPP", flush=True)
-        if st.button("💬 Envoyer par WhatsApp", width="stretch"):
-            print("🔴 CLICK bouton WHATSAPP", flush=True)
-
-            if not chauffeurs:
-                st.warning("Aucun chauffeur à notifier.")
-            else:
-                print("🟡 load_planning_for_period WA", flush=True)
-                df_all = load_planning_for_period(d_start, d_end)
-                print(f"🟢 df_all rows={len(df_all)}", flush=True)
-
-                wa_links = []
-
-                for ch in chauffeurs:
-                    print(f"🟡 WA chauffeur {ch}", flush=True)
-                    tel, _ = get_chauffeur_contact(ch)
-                    if not tel:
                         continue
 
-                    df_ch = df_all[
-                        df_all["CH"]
-                        .astype(str)
-                        .apply(lambda x: match_ch_for_mail(x, ch))
-                    ]
-
-                    if df_ch.empty:
-                        continue
-
-                    wa_text = build_planning_mail_body(
+                    # -------------------
+                    # Corps du mail (identique à avant)
+                    # -------------------
+                    body = build_planning_mail_body(
                         df_ch=df_ch,
                         ch=ch,
                         from_date=d_start,
                         to_date=d_end,
                     )
 
-                    wa_links.append({
-                        "ch": ch,
-                        "tel": tel,
-                        "url": build_whatsapp_link(tel, wa_text),
-                    })
+                    subject = f"[PLANNING] {ch} — {periode_label}"
 
-                print(f"🟢 wa_links={len(wa_links)}", flush=True)
+                    # ===================================================
+                    # 📊 CONSTRUIRE LE MÊME TABLEAU QUE LA VUE DRIVER
+                    # ===================================================
+                    planning_cols_driver = [
+                        "DATE","HEURE","CH","²²²²","IMMAT","PAX","Reh","Siège",
+                        "Unnamed: 8","DESIGNATION","H South","Décollage","N° Vol","Origine",
+                        "GO","Num BDC","NOM","ADRESSE","CP","Localité","Tél",
+                        "Type Nav","PAIEMENT","Caisse"
+                    ]
 
-                if not wa_links:
-                    st.warning("Aucun numéro WhatsApp disponible.")
-                else:
-                    st.markdown("### 💬 Envoi WhatsApp")
-                    for item in wa_links:
-                        st.markdown(
-                            f"- **{item['ch']}** ({item['tel']}) → "
-                            f"[📲 Ouvrir WhatsApp]({item['url']})"
+                    df_table = df_ch.copy()
+
+                    # sécurité colonnes
+                    for c in planning_cols_driver:
+                        if c not in df_table.columns:
+                            df_table[c] = ""
+
+                    df_table = df_table[planning_cols_driver]
+
+                    # -------------------
+                    # Envoi mail (PDF ou non)
+                    # -------------------
+                    if want_pdf:
+                        pdf_buf = export_chauffeur_planning_table_pdf(
+                            df_table,
+                            ch,
                         )
 
-    # ===================================================
-    # 📊 HISTORIQUE DES ENVOIS
-    # ===================================================
-    print("🟡 chargement historique send_log", flush=True)
+                        pdf_bytes = (
+                            pdf_buf.getvalue()
+                            if hasattr(pdf_buf, "getvalue")
+                            else bytes(pdf_buf)
+                        )
+
+                        fname = (
+                            f"Planning_{ch}_"
+                            f"{d_start.isoformat()}_"
+                            f"{(d_end or d_start).isoformat()}.pdf"
+                        )
+
+                        ok = send_email_smtp_with_attachments(
+                            to_email=mail,
+                            subject=subject,
+                            body=body,
+                            attachments=[(fname, pdf_bytes, "pdf")],
+                        )
+                    else:
+                        ok = send_email_smtp(
+                            to_email=mail,
+                            subject=subject,
+                            body=body,
+                        )
+
+                    if not ok:
+                        raise RuntimeError("SMTP : envoi échoué")
+
+                    sent += 1
+                    log_send(ch, "MAIL", periode_label, "OK", "Envoyé")
+
+                except Exception as e:
+                    log_send(ch, "MAIL", periode_label, "ERREUR", str(e))
+                    errors.append((ch, str(e)))
+
+            # -------------------
+            # Résultat UI
+            # -------------------
+            if errors:
+                st.error("❌ Certains envois ont échoué.")
+                with st.expander("Voir le détail"):
+                    for ch, err in errors:
+                        st.write(f"- {ch} : {err}")
+            else:
+                st.success(
+                    f"✅ Planning {periode_label} envoyé ({sent} chauffeur(s))."
+                )
+
+
+    # ===========================
+    # 💬 WHATSAPP (LIENS)
+    # ===========================
+    with col_wa:
+        if st.button("💬 Envoyer par WhatsApp", use_container_width=True, key="bureau_send_wa_btn"):
+            wa_links = []
+
+            for ch in dict.fromkeys(target_chauffeurs):
+                tel, _mail = get_chauffeur_contact(ch)
+                if not tel:
+                    continue
+
+                df_ch = get_chauffeur_planning(
+                    chauffeur=ch,
+                    from_date=d_start,
+                    to_date=d_end,
+                )
+
+                if df_ch is None or df_ch.empty:
+                    continue
+
+                wa_text = build_planning_mail_body(
+                    df_ch=df_ch,
+                    ch=ch,
+                    from_date=d_start,
+                    to_date=d_end,
+                )
+
+                wa_links.append({
+                    "ch": ch,
+                    "tel": tel,
+                    "url": build_whatsapp_link(tel, wa_text),
+                })
+
+            if not wa_links:
+                st.warning("Aucun numéro WhatsApp disponible (ou planning vide).")
+            else:
+                st.markdown("### 💬 Envoi WhatsApp")
+                for item in wa_links:
+                    st.markdown(
+                        f"- **{item['ch']}** ({item['tel']}) → "
+                        f"[📲 Ouvrir WhatsApp]({item['url']})"
+                    )
+
     with get_connection() as conn:
         df_log = pd.read_sql_query(
             """
@@ -5479,38 +5659,18 @@ def render_tab_vue_chauffeur(forced_ch=None):
             """,
             conn,
         )
-    print(f"🟢 historique rows={len(df_log)}", flush=True)
 
-    st.dataframe(df_log, width="stretch")
+    st.markdown("---")
+    st.markdown("### 🧾 Historique (100 derniers)")
+    st.dataframe(df_log, use_container_width=True, height=260)
 
-    # ===================================================
-    # 🚦 STATUT DES CHAUFFEURS
-    # ===================================================
-    print("🟡 statut chauffeurs", flush=True)
-    with get_connection() as conn:
-        df_last_send = pd.read_sql_query(
-            """
-            SELECT chauffeur, MAX(ts) AS last_sent
-            FROM send_log
-            WHERE statut = 'OK'
-            GROUP BY chauffeur
-            """,
-            conn,
-        )
-    print(f"🟢 last_send rows={len(df_last_send)}", flush=True)
-
-    print("🟡 load_planning_for_period status", flush=True)
-    df_status_src = load_planning_for_period(d_start, d_end)
-    print(f"🟢 df_status_src rows={len(df_status_src)}", flush=True)
-
-    print("🟢 END render_tab_vue_chauffeur", flush=True)
 
 def export_chauffeur_planning_pdf(df_ch: pd.DataFrame, ch: str):
     buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
+    c = canvas.Canvas(buffer, pagesize=landscape(A4))
+    width, height = landscape(A4)
 
-    margin_x = 2 * cm
+    margin_x = 1.5 * cm
     y = height - 2 * cm
     line_h = 0.55 * cm
 
@@ -5721,11 +5881,128 @@ def export_chauffeur_planning_pdf(df_ch: pd.DataFrame, ch: str):
 
 
 
+
+
+def export_chauffeur_planning_pdf_table(df_ch: pd.DataFrame, ch: str):
+    """PDF en mode TABLEAU (comme une vue planning), A4 paysage, auto-fit."""
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=landscape(A4))
+    width, height = landscape(A4)
+
+    margin = 10  # points
+    x0 = margin
+    y0 = height - margin
+
+    # Titre
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(x0, y0 - 20, f"Planning chauffeur — {ch}")
+    c.setFont("Helvetica", 9)
+
+    # Colonnes à afficher (ordre préféré)
+    preferred = [
+        "DATE", "HEURE", "NOM", "DESIGNATION", "ADRESSE", "PAX", "VOL", "GO", "PAIEMENT", "Caisse"
+    ]
+    cols = [c for c in preferred if c in df_ch.columns]
+    # Ajoute d'autres colonnes utiles si présentes
+    for extra in ["IMMAT", "REMARQUE", "Num BDC", "NUM_BDC", "NUM BDC"]:
+        if extra in df_ch.columns and extra not in cols:
+            cols.append(extra)
+
+    if not cols:
+        cols = df_ch.columns.tolist()[:10]
+
+    # Prépare les données string
+    dfp = df_ch.copy()
+    # Normalise date
+    if "DATE" in dfp.columns:
+        try:
+            dfp["DATE"] = dfp["DATE"].apply(lambda v: v.strftime("%d/%m/%Y") if hasattr(v, "strftime") else str(v))
+        except Exception:
+            pass
+    # Limite longueur cellules
+    def _cell(v):
+        s = "" if v is None else str(v)
+        s = s.replace("\n", " ").strip()
+        return s[:40]
+
+    data = [[_cell(v) for v in row] for row in dfp[cols].values.tolist()]
+
+    # Dimensions tableau
+    top = y0 - 40
+    bottom = margin + 20
+    table_height = top - bottom
+    table_width = width - 2 * margin
+
+    n_rows = len(data) + 1  # header
+    n_cols = len(cols)
+
+    # Taille police auto
+    font_size = 9
+    row_h = max(12, table_height / max(n_rows, 1))
+    if row_h < 10:
+        font_size = 7
+        row_h = 10
+    elif row_h > 16:
+        row_h = 16
+
+    # Largeurs colonnes auto (basées sur longueur)
+    lens = []
+    for j, col in enumerate(cols):
+        mx = len(str(col))
+        for i in range(min(len(data), 80)):
+            mx = max(mx, len(str(data[i][j])))
+        lens.append(mx)
+
+    total = sum(lens) if sum(lens) > 0 else n_cols
+    col_w = [table_width * (l / total) for l in lens]
+
+    # Dessin header
+    y = top
+    c.setFont("Helvetica-Bold", font_size)
+    x = x0
+    for j, col in enumerate(cols):
+        c.rect(x, y - row_h, col_w[j], row_h, stroke=1, fill=0)
+        c.drawString(x + 2, y - row_h + 3, str(col)[:25])
+        x += col_w[j]
+    y -= row_h
+
+    # Lignes
+    c.setFont("Helvetica", font_size)
+    for r in data:
+        if y - row_h < bottom:
+            c.showPage()
+            c.setFont("Helvetica-Bold", 14)
+            c.drawString(x0, height - margin - 20, f"Planning chauffeur — {ch}")
+            c.setFont("Helvetica", 9)
+            y = height - margin - 40
+
+            # Redessine header
+            c.setFont("Helvetica-Bold", font_size)
+            x = x0
+            for j, col in enumerate(cols):
+                c.rect(x, y - row_h, col_w[j], row_h, stroke=1, fill=0)
+                c.drawString(x + 2, y - row_h + 3, str(col)[:25])
+                x += col_w[j]
+            y -= row_h
+            c.setFont("Helvetica", font_size)
+
+        x = x0
+        for j, val in enumerate(r):
+            c.rect(x, y - row_h, col_w[j], row_h, stroke=1, fill=0)
+            c.drawString(x + 2, y - row_h + 3, str(val)[:60])
+            x += col_w[j]
+        y -= row_h
+
+    c.save()
+    buffer.seek(0)
+    return buffer
+
+
 def generate_urgence_mission_pdf_bytes(row: dict) -> bytes:
     """Génère un PDF (A4) pour une mission urgente (1 navette)."""
     buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
+    c = canvas.Canvas(buffer, pagesize=landscape(A4))
+    width, height = landscape(A4)
 
     x = 2 * cm
     y = height - 2 * cm
@@ -6224,22 +6501,32 @@ def render_tab_chauffeur_driver():
             height=520,
         )
 
-        if st.button("📄 Télécharger mon planning (PDF)"):
-            pdf = export_chauffeur_planning_table_pdf(df_table, ch_selected)
-            st.download_button(
-                "⬇️ Télécharger",
-                data=pdf,
-                file_name=f"planning_{ch_selected}.pdf",
-                mime="application/pdf",
-            )
+        col_pdf, col_print = st.columns(2)
+
+        with col_pdf:
+            if st.button("📄 Télécharger mon planning (PDF)", key="driver_planning_pdf"):
+                pdf = export_chauffeur_planning_table_pdf(
+                    df_table,
+                    ch_selected,
+                )
+
+                st.download_button(
+                    "⬇️ Télécharger le PDF",
+                    data=pdf,
+                    file_name=f"planning_{ch_selected}.pdf",
+                    mime="application/pdf",
+                )
+
+        with col_print:
+            if st.button("🖨️ Imprimer mon planning", key="driver_planning_print"):
+                html = build_printable_html_planning(df_table, ch_selected)
+                print_html_popup(html)
+
+                    
 
         return  # ⛔ STOP ICI → la vue détaillée n’est PAS affichée
 
-    # ===================================================
-    # 🧾 VUE DÉTAILLÉE (STRICTEMENT IDENTIQUE)
-    # ===================================================
-    # ⬇️⬇️⬇️ TOUT TON CODE EXISTANT ICI, NON MODIFIÉ ⬇️⬇️⬇️
-    # (bloc for row in df_ch.iterrows(), confirmations, messages, etc.)
+
 
 
     # ===================================================
@@ -9085,3 +9372,41 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+import base64
+
+def build_printable_html(df):
+    html_table = df.to_html(index=False)
+    return f"""
+    <html>
+    <head>
+        <style>
+            @page {{
+                size: A4 landscape;
+                margin: 10mm;
+            }}
+            body {{
+                font-family: Arial, sans-serif;
+                zoom: 0.85;
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 10px;
+            }}
+            th, td {{
+                border: 1px solid #ccc;
+                padding: 4px;
+                text-align: left;
+            }}
+            th {{
+                background-color: #f0f0f0;
+            }}
+        </style>
+    </head>
+    <body onload="window.print();">
+        <h2>Planning chauffeur</h2>
+        {html_table}
+    </body>
+    </html>
+    """
