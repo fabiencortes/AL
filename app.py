@@ -1,15 +1,42 @@
 # ============================================================
+# 🐞 DEBUG GLOBAL (console) — activable via env AL_DEBUG=1
+# ============================================================
+import os as _os
+import sys as _sys
+import time as _time
+
+try:
+    from utils import debug_print, debug_enabled
+except Exception:
+    def debug_enabled(): return True
+    def debug_print(*a, **k):
+        try:
+            print(*a, **k, flush=True)
+        except Exception:
+            pass
+
+debug_print("🚀 APP LOADED:", __file__)
+debug_print("🐍 PYTHON:", _sys.executable)
+debug_print("📁 CWD:", _os.getcwd())
+
+# ============================================================
 #   AIRPORTS LINES – APP.PLANNING – VERSION OPTIMISÉE 2025
 #   BLOC 1/7 : IMPORTS, CONFIG, HELPERS, SESSION
 # ============================================================
 DEBUG_SAFE_MODE = True
-AUTO_SYNC_ENABLED = True  # 🔒 Désactivé : synchro uniquement manuelle
+AUTO_SYNC_ENABLED = False  # 🔒 Synchro uniquement manuelle
 import os
 import io
 import sqlite3
 from datetime import datetime, date, timedelta
 from typing import Dict, Any, List
-from database import init_time_rules_table
+try:
+    from database import init_time_rules_table
+except Exception as _e:
+    debug_print('⚠️ import init_time_rules_table failed:', _e)
+    def init_time_rules_table():
+        return
+
 from database import init_actions_table
 from database import mark_navette_confirmed
 from database import ensure_ack_columns
@@ -24,6 +51,11 @@ import requests
 from openpyxl import load_workbook
 from io import BytesIO
 import streamlit as st
+import database as _database
+try:
+    debug_print('📦 DATABASE MODULE:', _database.__file__)
+except Exception:
+    pass
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import cm
@@ -36,6 +68,7 @@ from database import (
     get_row_by_id,
     insert_planning_row,
     update_planning_row,
+    apply_row_update,
     delete_planning_row,
     get_planning_columns,
     get_connection,
@@ -61,6 +94,10 @@ from database import (
     rebuild_planning_db_from_two_excel_files,
     ensure_planning_confirmation_and_caisse_columns,
     ensure_superseded_column,
+    ensure_urgence_columns,
+    find_time_conflicts,
+    get_urgences,
+    set_urgence_status,
 )
 from database import (
     split_chauffeurs,
@@ -75,8 +112,12 @@ from database import (
     ensure_admin_reply_columns,
     ensure_excel_sync_column,
     cleanup_orphan_planning_rows,
+    ensure_ch_manual_column,
+    list_pending_actions,
+    mark_actions_done,
+    unlock_rows_by_row_keys,
 )
-from utils import add_excel_color_flags_from_dropbox, log_event, render_logs_ui
+from utils import add_excel_color_flags_from_dropbox, log_event, render_logs_ui, format_mail_navette_v2, parse_mail_to_navette_v2, detect_dest_code, suggest_heures_from_rules, parse_mail_to_navette_v2, format_mail_navette_v2, parse_mail_to_navette_v2_cached
 def rebuild_planning_views():
     """
     🔒 Version ULTIME (corrigée)
@@ -192,6 +233,7 @@ def init_db_once():
     ensure_planning_updated_at_column()
     ensure_admin_reply_columns()
     ensure_excel_sync_column()
+    ensure_ch_manual_column()
     print("▶️ ensure columns OK", flush=True)
 
     # 🔒 VUES SQLITE (UNE SEULE FOIS)
@@ -233,7 +275,41 @@ def init_session_state():
             st.session_state[k] = v
 
 
+# ===========================================================
+
 # ============================================================
+#   🔁 SOFT REFRESH / DEBOUNCE (anti-refresh brutal)
+# ============================================================
+def request_soft_refresh(tab_key: str, *, clear_cache: bool = True, mute_autosync_sec: int = 5):
+    """Demande un rafraîchissement contrôlé (1 seul rerun) pour un onglet.
+    - clear_cache : invalide cache_data (pour voir la DB tout de suite)
+    - mute_autosync_sec : évite que l'auto-sync Excel se lance en même temps
+    """
+    try:
+        if clear_cache:
+            st.cache_data.clear()
+    except Exception:
+        pass
+
+    st.session_state.setdefault("tab_refresh", {})
+    st.session_state["tab_refresh"][tab_key] = time.time()
+
+    # 🔇 évite collision UI update vs auto-sync
+    try:
+        st.session_state["_mute_autosync_until"] = time.time() + int(mute_autosync_sec or 0)
+    except Exception:
+        pass
+
+
+def consume_soft_refresh(tab_key: str):
+    """À appeler au début du rendu de l'onglet : déclenche le rerun UNE fois."""
+    ts = st.session_state.get("tab_refresh", {}).get(tab_key, 0) or 0
+    seen_key = f"_tab_refresh_seen_{tab_key}"
+    seen = st.session_state.get(seen_key, 0) or 0
+    if ts and ts > seen:
+        st.session_state[seen_key] = ts
+        st.rerun()
+
 #   CONFIG UTILISATEURS
 #   (admins, restreints, chauffeurs GSM)
 # ============================================================
@@ -318,12 +394,22 @@ def init_all_db_once():
     init_time_rules_table()
     init_actions_table()
 
+    # 🧠 mémoire (mail / prix / alias)
+    try:
+        from database import init_price_memory_table, init_requester_memory_table, init_location_aliases_table
+        init_price_memory_table()
+        init_requester_memory_table()
+        init_location_aliases_table()
+    except Exception:
+        pass
+
     # 🧱 colonnes
     ensure_planning_updated_at_column()
     ensure_km_time_columns()
     ensure_flight_alerts_time_columns()
     ensure_ack_columns()
     ensure_caisse_columns()
+    ensure_urgence_columns()
 
     st.session_state["all_db_init_done"] = True
 
@@ -454,7 +540,7 @@ def load_planning_for_period(start, end):
         start_date=start,
         end_date=end,
         max_rows=5000,
-        source="7j",
+        source="full",
     )
 
 
@@ -492,59 +578,44 @@ if "last_auto_sync" not in st.session_state:
     st.session_state.last_auto_sync = time.time()
 
 
-def auto_sync_planning_if_needed():
-    # 🔒 Désactivé : la synchro est MANUELLE (onglet Excel ↔ DB)
-    if not AUTO_SYNC_ENABLED:
-        return
-    # 🔒 jamais de synchro pour les chauffeurs
-    if st.session_state.get("role") == "driver":
-        return
+from concurrent.futures import ThreadPoolExecutor
+import time
 
-    # ❌ pas avant login
-    if not st.session_state.get("logged_in"):
-        return
+# ============================================================
+#   🔄 BACKGROUND SYNC (Excel Dropbox -> DB) — non bloquant
+# ============================================================
+_SYNC_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 
-    SYNC_INTERVAL = 15 * 60
-    now = time.time()
-
-    if st.session_state.get("sync_running"):
-        return
-
-    if now - st.session_state.get("last_auto_sync", 0) < SYNC_INTERVAL:
-        return
-
-    # 🔍 CHECK RAPIDE : fichier Excel modifié ?
+def _launch_background_excel_sync():
+    """Lance une synchronisation Excel -> DB en arrière-plan (silencieuse).
+    Ne bloque jamais l'UI.
+    """
     try:
-        excel_dt = get_dropbox_file_last_modified()
-        if not excel_dt:
-            return
-
-        last_excel_dt = get_meta("excel_last_modified")
-        if last_excel_dt:
-            last_excel_dt = datetime.fromisoformat(last_excel_dt)
-            if excel_dt <= last_excel_dt:
-                # ✅ fichier inchangé → on sort sans rien faire
-                st.session_state.last_auto_sync = now
-                return
-    except Exception:
-        return
-
-    try:
-        st.session_state.sync_running = True
-
-        # 🔥 synchro réelle UNIQUEMENT si Excel modifié
-        sync_planning_from_today()
-
-        # 🧠 mémorise la date Excel
-        set_meta("excel_last_modified", excel_dt.isoformat())
-
-        st.session_state.last_auto_sync = now
-
+        fut = st.session_state.get("_bg_excel_sync_future")
+        if fut is not None and not fut.done():
+            return  # déjà en cours
     except Exception:
         pass
 
-    finally:
-        st.session_state.sync_running = False
+    def _job():
+        try:
+            # sync_planning_from_today fait déjà le check 'excel_last_modified' via meta.
+            sync_planning_from_today(ui=False)
+        except Exception as e:
+            # silencieux côté UI ; log console uniquement
+            print(f"⚠️ Background Excel sync error: {e}", flush=True)
+
+    try:
+        st.session_state["_bg_excel_sync_future"] = _SYNC_EXECUTOR.submit(_job)
+        st.session_state["_bg_excel_sync_started_at"] = time.time()
+    except Exception as e:
+        print(f"⚠️ Unable to start background sync: {e}", flush=True)
+
+def auto_sync_planning_if_needed():
+    debug_print('⛔ auto_sync_planning_if_needed DISABLED (DEBUG MODE)')
+    return
+
+
 
 import os, json
 from io import BytesIO
@@ -637,6 +708,174 @@ def get_dropbox_file_last_modified() -> datetime | None:
 
     except Exception:
         return None
+from utils import download_dropbox_excel_bytes as _download_dropbox_excel_bytes
+from utils import upload_dropbox_excel_bytes as _upload_dropbox_excel_bytes
+
+
+def download_dropbox_excel_bytes(path: str = "/Goldenlines/Planning 2026.xlsx") -> bytes | None:
+    """Wrapper: télécharge le fichier Excel depuis Dropbox (bytes)."""
+    try:
+        return _download_dropbox_excel_bytes(path)
+    except Exception as e:
+        print(f"⚠️ Dropbox download error: {e}", flush=True)
+        return None
+
+
+def upload_dropbox_excel_bytes(content: bytes, path: str = "/Goldenlines/Planning 2026.xlsx") -> bool:
+    """Wrapper: upload (overwrite) le fichier Excel sur Dropbox."""
+    try:
+        _upload_dropbox_excel_bytes(content, path)
+        return True
+    except Exception as e:
+        print(f"⚠️ Dropbox upload error: {e}", flush=True)
+        return False
+
+
+# ============================================================
+#   📤 EXPORT DB -> EXCEL (Dropbox) — SANS CONFLIT
+# ============================================================
+def export_db_changes_to_excel_dropbox(row_ids: list[int] | None = None) -> bool:
+    """Répercute certaines modifications DB vers l'Excel Dropbox, sans écraser l'existant.
+
+    Stratégie SAFE :
+    - Télécharger la dernière version Excel
+    - Identifier les lignes Feuil1 via row_key (même algo que DB)
+    - Appliquer uniquement :
+        * CAISSE_PAYEE : couleur de la cellule 'Caisse' (vert si payé, rouge si non)
+    - Upload overwrite (fichier complet mis à jour)
+    """
+    try:
+        from openpyxl import load_workbook
+        from openpyxl.styles import PatternFill
+    except Exception:
+        return False
+
+    # 1) Lire DB (lignes concernées)
+    with get_connection() as conn:
+        if row_ids:
+            q = ",".join(["?"] * len(row_ids))
+            rows = conn.execute(f"SELECT * FROM planning WHERE id IN ({q})", [int(x) for x in row_ids]).fetchall()
+            cols = [d[0] for d in conn.execute("SELECT * FROM planning LIMIT 1").description] if rows else []
+        else:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM planning
+                WHERE COALESCE(CAISSE_PAYEE,0) = 1
+                  AND COALESCE(DATE_ISO,'') >= date('now','-60 day')
+                """
+            ).fetchall()
+            cols = [d[0] for d in conn.execute("SELECT * FROM planning LIMIT 1").description] if rows else []
+
+    if not rows or not cols:
+        return False
+
+    db_rows = [dict(zip(cols, r)) for r in rows]
+
+    # 2) Télécharger Excel
+    content = download_dropbox_excel_bytes()
+    if not content:
+        return False
+
+    wb = load_workbook(BytesIO(content))
+    if "Feuil1" not in wb.sheetnames:
+        return False
+
+    ws = wb["Feuil1"]
+
+    # 3) Détecter header row (DATE/HEURE)
+    header_row = None
+    for i in range(1, 15):
+        vals = [str(ws.cell(row=i, column=c).value or "").strip().upper() for c in range(1, 40)]
+        if "DATE" in vals and "HEURE" in vals:
+            header_row = i
+            break
+    if header_row is None:
+        return False
+
+    # mapping col name -> col idx
+    headers = {}
+    for c in range(1, 60):
+        v = ws.cell(row=header_row, column=c).value
+        if v is None:
+            continue
+        name = str(v).strip()
+        if name:
+            headers[name.upper()] = c
+
+    # Colonnes attendues
+    c_date = headers.get("DATE")
+    c_heure = headers.get("HEURE")
+    c_bdc = headers.get("NUM BDC") or headers.get("NUM_BDC") or headers.get("BDC") or headers.get("NUM. BDC")
+    c_nom = headers.get("NOM") or headers.get("CLIENT")
+    c_caisse = headers.get("CAISSE") or headers.get("Caisse".upper()) or headers.get("MONTANT") or headers.get("MONTANT €")
+
+    if not (c_date and c_heure and c_nom):
+        return False
+
+    # 4) Construire index Excel : row_key -> excel_row_index
+    from database import make_row_key_from_row
+
+    excel_index = {}
+    max_row = ws.max_row
+    for r in range(header_row + 1, max_row + 1):
+        date_v = ws.cell(row=r, column=c_date).value
+        heure_v = ws.cell(row=r, column=c_heure).value
+        nom_v = ws.cell(row=r, column=c_nom).value
+        bdc_v = ws.cell(row=r, column=c_bdc).value if c_bdc else None
+
+        # ligne vide
+        if date_v is None and heure_v is None and nom_v is None:
+            continue
+
+        rk = make_row_key_from_row({
+            "DATE": date_v,
+            "HEURE": heure_v,
+            "Num BDC": bdc_v,
+            "NOM": nom_v,
+        })
+        if rk:
+            excel_index[rk] = r
+
+    # 5) Appliquer changements
+    fill_green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    fill_red = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+
+    changed = 0
+    for row in db_rows:
+        rk = row.get("row_key")
+        if not rk:
+            continue
+        xr = excel_index.get(rk)
+        if not xr:
+            continue
+
+        # CAISSE PAYEE -> couleur cellule Caisse
+        try:
+            payee = int(row.get("CAISSE_PAYEE") or 0)
+        except Exception:
+            payee = 0
+
+        if c_caisse:
+            cell = ws.cell(row=xr, column=c_caisse)
+            cell.fill = fill_green if payee == 1 else fill_red
+            changed += 1
+
+    if changed <= 0:
+        return False
+
+    # 6) Upload
+    out = BytesIO()
+    wb.save(out)
+    ok = upload_dropbox_excel_bytes(out.getvalue())
+
+    # 7) Meta (optionnel)
+    try:
+        set_meta("excel_last_exported_at", datetime.now().isoformat())
+    except Exception:
+        pass
+
+    return bool(ok)
 
 # ============================================================
 #   DB — COLONNES FLAGS COULEURS (AUTO)
@@ -691,6 +930,29 @@ def normalize_ch_code(ch_raw: str) -> str:
 
     return code
 
+
+
+def render_excel_modified_indicator():
+    """Affiche un indicateur 'Excel modifié depuis X min' (source Dropbox)."""
+    try:
+        dt = get_dropbox_file_last_modified()
+        if not dt:
+            return
+        # dt peut être timezone-aware; on le convertit en minutes
+        now = datetime.now(dt.tzinfo) if getattr(dt, "tzinfo", None) else datetime.now()
+        delta = now - dt.replace(tzinfo=now.tzinfo) if getattr(dt, "tzinfo", None) else now - dt
+        mins = int(delta.total_seconds() // 60)
+        if mins < 1:
+            txt = "à l’instant"
+        elif mins < 60:
+            txt = f"il y a {mins} min"
+        else:
+            h = mins // 60
+            m = mins % 60
+            txt = f"il y a {h}h{m:02d}"
+        st.caption(f"📄 Excel Dropbox modifié {txt} (source : Planning 2026.xlsx)")
+    except Exception:
+        pass
 
 def render_last_sync_info():
     ts = st.session_state.get("last_auto_sync", 0)
@@ -1210,7 +1472,7 @@ def format_chauffeur_colored(ch, confirmed, row=None):
 
     return f"🟠 {ch}"
 
-def sync_planning_from_today(excel_sync_ts: str | None = None):
+def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = True):
     """
     🔄 Synchronisation SAFE depuis aujourd’hui
     - ZÉRO doublon (row_key + INSERT OR IGNORE)
@@ -1220,6 +1482,33 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
     - Dates Excel FR ("samedi 24 janvier 2026") supportées
     - Compatible DB existante
     """
+    # --------------------------------------------------
+    # 🔒 UI SAFE LOGGING (évite st.* en background thread)
+    # --------------------------------------------------
+    def _ui_warn(msg: str):
+        if ui:
+            st.warning(msg)
+        else:
+            print(f"⚠️ {msg}", flush=True)
+
+    def _ui_error(msg: str):
+        if ui:
+            st.error(msg)
+        else:
+            print(f"❌ {msg}", flush=True)
+
+    def _ui_info(msg: str):
+        if ui:
+            st.info(msg)
+        else:
+            print(f"ℹ️ {msg}", flush=True)
+    # 🆔 Assure ROW_KEY UUID dans Excel (colonne ZX, masquée)
+    try:
+        from utils import ensure_excel_row_key_column
+        ensure_excel_row_key_column(dropbox_path=DROPBOX_FILE_PATH, sheet_name="Feuil1", target_col_letter="ZX")
+    except Exception as e:
+        print(f"⚠️ ensure ROW_KEY Excel failed: {e}", flush=True)
+
 
     from datetime import date, datetime
     import pandas as pd
@@ -1260,6 +1549,13 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
             conn.execute('ALTER TABLE planning ADD COLUMN "IS_SUPERSEDED" INTEGER DEFAULT 0')
         if "EXCEL_UID" not in cols:
             conn.execute('ALTER TABLE planning ADD COLUMN "EXCEL_UID" TEXT')
+        if "IS_BUREAU" not in cols:
+            conn.execute('ALTER TABLE planning ADD COLUMN "IS_BUREAU" INTEGER DEFAULT 0')
+        if "INDISPO_REASON" not in cols:
+            conn.execute('ALTER TABLE planning ADD COLUMN "INDISPO_REASON" TEXT')
+        if "LOCKED_BY_APP" not in cols:
+            conn.execute('ALTER TABLE planning ADD COLUMN "LOCKED_BY_APP" INTEGER DEFAULT 0')
+
 
         conn.commit()
 
@@ -1268,7 +1564,7 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
     # ======================================================
     df_excel = load_planning_from_dropbox("Feuil1")
     if df_excel is None or df_excel.empty:
-        st.warning("Planning Dropbox vide.")
+        _ui_warn("Planning Dropbox vide.")
         return 0
 
     # ======================================================
@@ -1281,7 +1577,7 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
     # 3️⃣ Normalisation DATE Excel (support FR + dd/mm + iso)
     # ======================================================
     if "DATE" not in df_excel.columns:
-        st.error("❌ Colonne DATE absente.")
+        _ui_error("❌ Colonne DATE absente.")
         return 0
 
     def _normalize_excel_date_to_iso(val):
@@ -1382,20 +1678,141 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
 
     if "CH" in df_excel.columns:
         df_excel["CH"] = df_excel["CH"].astype(str).str.strip()
+    # ======================================================
+    # 4️⃣ BIS — INTERPRÉTATION ROBUSTE DE ²²²² (STATUT vs HEURE_FIN)
+    # ======================================================
+    def _norm_txt(v):
+        return str(v or "").strip()
+
+    def _norm_up(v):
+        return str(v or "").strip().upper()
+
+    def _looks_like_time(v) -> str:
+        """
+        Retourne 'HH:MM' si v est une heure valide, sinon ''.
+        Les codes MA / VA / CP / OFF / etc. ne sont JAMAIS des heures.
+        """
+        s = _norm_txt(v)
+        if not s:
+            return ""
+        if s.isalpha():
+            return ""
+        try:
+            return normalize_time_string(s) or ""
+        except Exception:
+            return ""
+
+    # Colonnes
+    col_2222 = "²²²²" if "²²²²" in df_excel.columns else None
+
+    # Colonnes de travail (toujours créées)
+    df_excel["_HEURE_FIN"] = ""
+    df_excel["_STATUT"] = ""
+
+    if col_2222:
+        df_excel["_HEURE_FIN"] = df_excel[col_2222].apply(_looks_like_time).fillna("")
+        df_excel["_STATUT"] = df_excel[col_2222].apply(
+            lambda v: _norm_up(v) if _looks_like_time(v) == "" else ""
+        ).fillna("")
+
+    # Sécuriser HEURE (début)
+    df_excel["HEURE"] = (
+        df_excel.get("HEURE", "")
+        .apply(normalize_time_string)
+        .fillna("")
+    )
 
     # ======================================================
-    # 5️⃣ Détection CONGÉ / INDISPO
+    # 5️⃣ DÉTECTION CONGÉ / INDISPO — LOGIQUE EXCEL RÉELLE
     # ======================================================
     h1 = df_excel["HEURE"].fillna("").astype(str)
     h2 = df_excel["_HEURE_FIN"].fillna("").astype(str)
 
-    is_conge = (h1 == "00:00") & (h2 == "00:00")
-    is_indispo_plage = (h1 != "") & (h2 != "") & (h1 != h2)
+    immat = (
+        df_excel.get("IMMAT", "")
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
 
-    df_excel["IS_INDISPO"] = (is_conge | is_indispo_plage).astype(int)
+    sens = (
+        df_excel.get("Unnamed: 8", "")
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    statut = (
+        df_excel["_STATUT"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    # 1) Congé jour complet : 00:00 → 00:00
+    is_conge_0000 = (h1 == "00:00") & (h2 == "00:00")
+
+    # 2) Congé via IMMAT : chiffre seul OU code (MA / VA / CP / CO)
+    is_conge_immat = (
+        immat.str.fullmatch(r"\d{1,2}", na=False)
+        | immat.isin(["MA", "VA", "CP", "CO"])
+    )
+
+    # 3) Congé / motif via STATUT (²²²² texte)
+    conge_codes = {
+        "MA", "VA", "CP", "CO",
+        "OFF", "RECUP", "CONGE", "VAC",
+        "MAL", "MALADE",
+    }
+    is_conge_code = statut.isin(conge_codes)
+
+    # 4) Indispo plage horaire
+    is_indispo_plage = (
+        (h1 != "") & (h2 != "") & (h1 != h2) & (~is_conge_0000)
+    )
+
+    # 5) Tâche (présence texte mais pas de véhicule)
+    is_task = (sens != "") & (immat == "") & (~is_indispo_plage)
+
+    # 6) Bureau explicite
+    is_bureau = sens.str.contains(
+        r"\bBUREAU\b",
+        case=False,
+        regex=True,
+        na=False,
+    )
+
+    # Décision finale indispo
+    df_excel["IS_INDISPO"] = (
+        is_conge_0000
+        | is_indispo_plage
+        | is_conge_code
+        | (is_conge_immat & (h1 == "00:00"))
+    ).astype(int)
+
+    # Bureau / tâche = jamais indispo
+    df_excel["IS_BUREAU"] = is_bureau.astype(int)
+    df_excel.loc[df_excel["IS_BUREAU"] == 1, "IS_INDISPO"] = 0
+    df_excel.loc[is_task, "IS_INDISPO"] = 0
+
+    # Raison (debug / affichage)
+    df_excel["INDISPO_REASON"] = ""
+    df_excel.loc[is_indispo_plage, "INDISPO_REASON"] = "INDISPO_PLAGE"
+    df_excel.loc[statut == "MA", "INDISPO_REASON"] = "MALADE"
+    df_excel.loc[
+        is_conge_0000 | (is_conge_immat & (h1 == "00:00")),
+        "INDISPO_REASON",
+    ] = "CONGE"
+    df_excel.loc[
+        (is_conge_code) & (statut != "MA"),
+        "INDISPO_REASON",
+    ] = statut
 
     # ======================================================
-    # 6️⃣ CONFIRMATION / CAISSE depuis Excel
+    # 6️⃣ CONFIRMATION / CAISSE DEPUIS EXCEL (INCHANGÉ)
     # ======================================================
     if "CONFIRMED" not in df_excel.columns:
         df_excel["CONFIRMED"] = 0
@@ -1430,40 +1847,34 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
         df_excel["CAISSE_PAYEE"] = df_excel.apply(_calc_caisse_payee, axis=1)
 
     # ======================================================
-    # 7️⃣ Filtre “depuis aujourd’hui”
+    # 7️⃣ FILTRE “DEPUIS AUJOURD’HUI”
     # ======================================================
     df_excel = df_excel[df_excel["DATE_ISO"] >= today_iso].copy()
     if df_excel.empty:
-        st.info("Aucune donnée à synchroniser.")
+        _ui_info("Aucune donnée à synchroniser.")
         return 0
 
     # ======================================================
-    # 7️⃣ BIS — EXCEL_UID : clé stable (indépendante date/heure/ch)
-    # ➜ permet de supprimer l’ancienne version même si row_key change
+    # 7️⃣ BIS — EXCEL_UID (CLÉ STABLE)
     # ======================================================
-    def _norm_txt(v):
+    def _norm_txt_uid(v):
         return str(v or "").strip().lower()
 
     def _make_excel_uid(row):
-        # Priorité aux champs "uniques" si présents
-        num_bdc = _norm_txt(row.get("Num BDC") or row.get("NUM BDC") or row.get("BDC"))
-        vol = _norm_txt(row.get("N° Vol") or row.get("N°Vol") or row.get("N Vol") or row.get("VOL"))
-        nom = _norm_txt(row.get("NOM"))
-        adresse = _norm_txt(row.get("ADRESSE"))
-        cp = _norm_txt(row.get("CP"))
-        loc = _norm_txt(row.get("Localité") or row.get("LOCALITE"))
-        designation = _norm_txt(row.get("DESIGNATION") or row.get("DESTINATION"))
-        sens = _norm_txt(row.get("Unnamed: 8"))
+        num_bdc = _norm_txt_uid(row.get("Num BDC") or row.get("NUM BDC") or row.get("BDC"))
+        vol = _norm_txt_uid(row.get("N° Vol") or row.get("N°Vol") or row.get("N Vol") or row.get("VOL"))
+        nom = _norm_txt_uid(row.get("NOM"))
+        adresse = _norm_txt_uid(row.get("ADRESSE"))
+        cp = _norm_txt_uid(row.get("CP"))
+        loc = _norm_txt_uid(row.get("Localité") or row.get("LOCALITE"))
+        designation = _norm_txt_uid(row.get("DESIGNATION") or row.get("DESTINATION"))
+        sens_uid = _norm_txt_uid(row.get("Unnamed: 8"))
 
-        # Si Num BDC existe => c’est souvent le meilleur identifiant
         if num_bdc:
             return f"BDC|{num_bdc}|{nom}"
-
-        # Sinon, si vol existe (souvent unique aussi)
         if vol:
             return f"VOL|{vol}|{nom}"
 
-        # Fallback robuste : identité client + adresse + destination + sens
         return "|".join(
             [
                 "FALLBACK",
@@ -1472,14 +1883,14 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
                 cp,
                 loc,
                 designation,
-                sens,
+                sens_uid,
             ]
         )
 
     df_excel["EXCEL_UID"] = df_excel.apply(_make_excel_uid, axis=1)
 
     # ======================================================
-    # 8️⃣ row_key UNIQUE (congés/indispos)
+    # 8️⃣ ROW_KEY UNIQUE (ANTI-DÉDUP CONGÉS)
     # ======================================================
     def _make_row_key_safe(row):
         base = make_row_key_from_row(row.to_dict())
@@ -1489,7 +1900,9 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
             date_iso = str(row.get("DATE_ISO", "") or "")
             hh1 = str(row.get("HEURE", "") or "")
             hh2 = str(row.get("_HEURE_FIN", "") or "")
-            return f"INDISPO|{date_iso}|{ch}|{hh1}|{hh2}"
+            imm = str(row.get("IMMAT", "") or "")
+            reason = str(row.get("INDISPO_REASON", "") or "")
+            return f"INDISPO|{date_iso}|{ch}|{hh1}|{hh2}|{imm}|{reason}"
 
         return base
 
@@ -1507,6 +1920,7 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
             """
             DELETE FROM planning
             WHERE DATE_ISO >= ?
+              AND (LOCKED_BY_APP IS NULL OR LOCKED_BY_APP=0)
             """,
             (today_iso,),
         )
@@ -1665,8 +2079,8 @@ def sync_planning_from_today(excel_sync_ts: str | None = None):
     # ======================================================
     # 14️⃣ Cache / UI (silencieux + ciblé)
     # ======================================================
-    st.session_state["last_sync_time"] = datetime.now().strftime("%H:%M")
-
+    if ui:
+        st.session_state["last_sync_time"] = datetime.now().strftime("%H:%M")
     # Clear ciblé si possible (évite de tout casser)
     try:
         get_planning.clear()
@@ -2258,10 +2672,25 @@ def send_email_to_chauffeurs_from_row(row, subject: str, body: str):
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 SMTP_USER = "airportslinesbureau@gmail.com"
-SMTP_PASSWORD = "xayi uusp kgrv xnlt"
-
-ADMIN_NOTIFICATION_EMAIL = "airportslinesbureau@gmail.com"
 FROM_EMAIL = SMTP_USER
+ADMIN_NOTIFICATION_EMAIL = "airportslinesbureau@gmail.com"
+
+
+def get_smtp_password():
+        """
+        Récupère le mot de passe SMTP de façon SAFE :
+        - secrets.toml si présent
+        - sinon variable d’environnement
+        - sinon chaîne vide (ne plante jamais)
+        """
+        try:
+                return st.secrets["SMTP_PASSWORD"]
+        except Exception:
+                return os.environ.get("SMTP_PASSWORD", "")
+
+
+SMTP_PASSWORD = get_smtp_password()
+
 # ============================================================
 #   HELPERS — NORMALISATION DES HEURES
 # ============================================================
@@ -2500,6 +2929,8 @@ def build_mailto_link(to_email: str, subject: str, body: str) -> str:
 def send_mail_admin(subject: str, body: str):
     """Envoie un mail texte simple à l'admin."""
     try:
+        if not SMTP_PASSWORD:
+            raise RuntimeError("SMTP_PASSWORD manquant (définis-le dans les variables d'environnement ou st.secrets)")
         msg = MIMEText(body, "plain", "utf-8")
         msg["Subject"] = subject
         msg["From"] = SMTP_USER
@@ -3422,20 +3853,24 @@ def build_chauffeur_day_message(df_ch: pd.DataFrame, ch_selected: str, day_label
     return "\n".join(lines).strip()
 
 # ============================================================
-#   ONGLET 📅 PLANNING — VUE RAPIDE AVEC COULEURS
+#   ONGLET 📅 PLANNING — VUE RAPIDE AVEC COULEURS (EXCEL-LIKE)
+#   + BADGE STATUT en colonne dédiée
 # ============================================================
 
 def render_tab_planning():
     st.subheader("📅 Planning — vue rapide")
 
-    refresh = silent_tab_refresh("planning_rapide", interval_sec=60)
-    if refresh:
-        st.cache_data.clear()
+    # ===================================================
+    # 🔄 Rafraîchissement manuel UNIQUEMENT
+    # ===================================================
+    consume_soft_refresh("planning")
+    if st.button("🔄 Rafraîchir la vue planning", key="btn_refresh_planning"):
+        request_soft_refresh("planning")
 
     today = date.today()
 
     # ===================================================
-    # 📆 BOUTONS PÉRIODE (SEULE SOURCE DE DATES)
+    # 📆 PÉRIODE (SOURCE UNIQUE)
     # ===================================================
     if "planning_start" not in st.session_state:
         st.session_state.planning_start = today
@@ -3474,7 +3909,7 @@ def render_tab_planning():
     )
 
     # ===================================================
-    # 🔍 FILTRES SIMPLES
+    # 🔍 FILTRES UI
     # ===================================================
     colf1, colf2 = st.columns([2, 1])
 
@@ -3487,42 +3922,167 @@ def render_tab_planning():
         ch_value = None if ch_value == "(Tous)" else ch_value
 
     # ===================================================
-    # 📖 LECTURE DB
+    # 📖 LECTURE DB (période stricte)
     # ===================================================
-    df = get_planning(
-        start_date=start_date,
-        end_date=end_date,
-        chauffeur=ch_value,
-        search=search,
-        source="7j",
-    )
+    with get_connection() as conn:
+        df = pd.read_sql_query(
+            """
+            SELECT *
+            FROM planning
+            WHERE
+                DATE_ISO >= ?
+                AND DATE_ISO <= ?
+                AND COALESCE(IS_SUPERSEDED,0) = 0
+            ORDER BY DATE_ISO, HEURE
+            """,
+            conn,
+            params=(start_date.isoformat(), end_date.isoformat()),
+        )
 
     if df is None or df.empty:
-        st.info("Aucune navette pour cette période.")
+        st.info("Aucune navette ou indisponibilité pour cette période.")
         return
 
     # ===================================================
-    # 🎨 AFFICHAGE AVEC COULEURS
+    # 🧠 NORMALISATION DATE
     # ===================================================
-    df_display = df.drop(columns=["id"], errors="ignore")
+    if "DATE_ISO" in df.columns:
+        df["DATE_OBJ"] = pd.to_datetime(df["DATE_ISO"], errors="coerce").dt.date
+    else:
+        df["DATE_OBJ"] = pd.to_datetime(df.get("DATE"), dayfirst=True, errors="coerce").dt.date
+
+    # ===================================================
+    # 🧹 FILTRE CHAUFFEUR
+    # ===================================================
+    if ch_value and "CH" in df.columns:
+        ch_norm = normalize_ch_code(ch_value)
+        df = df[
+            df["CH"]
+            .fillna("")
+            .astype(str)
+            .str.upper()
+            .str.replace("*", "", regex=False)
+            .str.startswith(ch_norm)
+        ]
+
+    # ===================================================
+    # 🔍 RECHERCHE TEXTE
+    # ===================================================
+    if search:
+        mask = False
+        cols_search = [c for c in ["DESIGNATION", "NOM", "ADRESSE", "N° Vol", "VOL", "Localité", "LOCALITE", "REMARQUE", "Unnamed: 8"] if c in df.columns]
+        for col in cols_search:
+            mask |= (
+                df[col]
+                .fillna("")
+                .astype(str)
+                .str.contains(search, case=False, na=False)
+            )
+        df = df[mask]
+
+    if df.empty:
+        st.info("Aucune donnée après filtres.")
+        return
+
+    # ===================================================
+    # 🚫 BADGE STATUT (colonne dédiée)
+    #   - Bureau ≠ indispo
+    #   - MA en rouge
+    #   - congé en jaune
+    # ===================================================
+    def _fmt_date(d):
+        try:
+            return d.strftime("%d/%m/%Y")
+        except Exception:
+            return ""
+
+    def _hsort(val):
+        s = str(val or "").strip()
+        if "→" in s:
+            s = s.split("→", 1)[0].strip()
+        s = s.replace("h", ":").replace("H", ":")
+        if ":" in s:
+            try:
+                hh, mm = s.split(":")[0:2]
+                return (int(hh), int(mm))
+            except Exception:
+                return (99, 99)
+        return (99, 99)
+
+    def compute_statut(row) -> str:
+        # Bureau jamais indispo
+        sens = str(row.get("Unnamed: 8", "") or "").upper()
+        if "BUREAU" in sens:
+            return ""
+
+        is_ind = int(row.get("IS_INDISPO", 0) or 0) == 1
+        if not is_ind:
+            return ""
+
+        reason = str(row.get("INDISPO_REASON", "") or "").upper().strip()
+
+        # Si la raison n'existe pas (anciennes DB), fallback sur ²²²² / IMMAT / heures
+        if not reason:
+            col2222 = str(row.get("²²²²", "") or "").upper().strip()
+            immat = str(row.get("IMMAT", "") or "").upper().strip()
+            heure = str(row.get("HEURE", "") or "").strip()
+            # MA
+            if col2222 == "MA" or immat == "MA":
+                reason = "MALADE"
+            # congé : immat = chiffre OU heure 00:00
+            elif immat.isdigit() and len(immat) <= 2:
+                reason = "CONGE"
+            elif heure == "00:00":
+                reason = "CONGE"
+            # sinon
+            else:
+                reason = col2222 or "INDISPO"
+
+        if reason == "MALADE" or reason == "MA":
+            return "🟥 MALADIE"
+        if reason in ("CONGE", "VAC", "VACANCES"):
+            return "🏖 CONGÉ"
+        if reason == "INDISPO_PLAGE":
+            return "🟧 INDISPO"
+        if reason:
+            return f"🟨 {reason}"
+        return "🟧 INDISPO"
+
+    # Colonnes calculées
+    df["DATE"] = df["DATE_OBJ"].apply(_fmt_date)
+    df["STATUT"] = df.apply(compute_statut, axis=1)
+
+    # ===================================================
+    # 🔃 TRI (DATE + HEURE)
+    # ===================================================
+    df["_HSORT"] = df["HEURE"].apply(_hsort) if "HEURE" in df.columns else [(99, 99)] * len(df)
+    df = df.sort_values(["DATE_OBJ", "_HSORT"], kind="mergesort").drop(columns=["_HSORT"], errors="ignore")
+
+    # ===================================================
+    # 🎨 PRÉPARATION AFFICHAGE (STATUT à côté de DATE)
+    # ===================================================
+    df_display = df.drop(columns=["DATE_OBJ", "id"], errors="ignore").copy()
+
+    # Re-ordonner colonnes : DATE, STATUT, HEURE, CH, ...
+    preferred = ["DATE", "STATUT", "HEURE", "CH"]
+    cols = list(df_display.columns)
+    new_cols = [c for c in preferred if c in cols] + [c for c in cols if c not in preferred]
+    df_display = df_display[new_cols]
 
     if "CH" in df_display.columns:
         df_display["CH"] = df_display.apply(
-            lambda r: format_chauffeur_colored(
-                r.get("CH"),
-                r.get("CONFIRMED"),
-            ),
+            lambda r: format_chauffeur_colored(r.get("CH"), r.get("CONFIRMED")),
             axis=1,
         )
 
     styled = df_display.style
-    styled = style_indispo(styled)              # 🔴 priorité absolue
+    styled = style_indispo(styled)
     styled = style_groupage_partage(styled)
     styled = style_caisse_payee(styled)
 
-    # ---------------------------------------------------
-    # 🧹 MASQUER COLONNES TECHNIQUES
-    # ---------------------------------------------------
+    # ===================================================
+    # 🧹 MASQUER COLONNES TECHNIQUES (PANDAS SAFE)
+    # ===================================================
     cols_to_hide = [
         "IS_GROUPAGE",
         "IS_PARTAGE",
@@ -3531,8 +4091,14 @@ def render_tab_planning():
         "CAISSE_PAYEE",
         "CH_COLOR",
         "IS_INDISPO",
+        "IS_SUPERSEDED",
+        "DATE_ISO",
+        "INDISPO_REASON",
+        "IS_BUREAU",
+        "LOCKED_BY_APP",
+        "EXCEL_UID",
+        "EXCEL_SYNC_TS",
     ]
-
     cols_to_hide = [c for c in cols_to_hide if c in df_display.columns]
 
     if cols_to_hide:
@@ -3541,35 +4107,177 @@ def render_tab_planning():
         except TypeError:
             styled = styled.hide(subset=cols_to_hide, axis="columns")
 
+    # ===================================================
+    # 📊 AFFICHAGE FINAL
+    # ===================================================
     st.dataframe(styled, use_container_width=True, height=520)
 
 
+def _make_row_key_from_parts(date_iso: str, heure: str, nom: str, adresse: str, vol: str, heure_fin: str = "") -> str:
+    def _s(x):
+        return ("" if x is None else str(x)).strip().lower()
+    h = normalize_time_string(heure) or _s(heure)
+    hf = normalize_time_string(heure_fin) or _s(heure_fin)
+    return f"{_s(date_iso)}|{h}|{_s(nom)}|{_s(adresse)}|{_s(vol)}|{hf}"
 
+def apply_pending_ch_changes_to_dropbox_excel(sheet_name: str = "Feuil1") -> tuple[int, int]:
+    pending = list_pending_actions(limit=2000)
+    pending = [p for p in pending if str(p.get("action_type","")) == "CH_CHANGE"]
+    if not pending:
+        return (0, 0)
 
+    xls_bytes = download_dropbox_excel_bytes()
+    if not xls_bytes:
+        return (len(pending), 0)
+
+    wb = load_workbook(filename=BytesIO(xls_bytes))
+    if sheet_name not in wb.sheetnames:
+        return (len(pending), 0)
+
+    ws = wb[sheet_name]
+
+    headers = {}
+    for col in range(1, ws.max_column + 1):
+        v = ws.cell(row=1, column=col).value
+        if v is not None:
+            headers[str(v).strip()] = col
+
+    if "CH" not in headers or "DATE" not in headers:
+        return (len(pending), 0)
+
+    col_date = headers.get("DATE")
+    col_heure = headers.get("HEURE")
+    col_nom = headers.get("NOM")
+    col_adresse = headers.get("ADRESSE")
+    col_vol = headers.get("VOL")
+    col_hf = headers.get("HEURE_FIN") or headers.get("HEURE FIN") or headers.get("HEURE2") or headers.get("HEURE 2")
+
+    rowkey_to_excelrow = {}
+    for r in range(2, ws.max_row + 1):
+        date_val = ws.cell(row=r, column=col_date).value
+        try:
+            if isinstance(date_val, (datetime, date)):
+                date_iso = date_val.strftime("%Y-%m-%d")
+            else:
+                date_iso = _normalize_excel_date_to_iso(date_val)
+        except Exception:
+            date_iso = None
+        if not date_iso:
+            continue
+
+        heure = ws.cell(row=r, column=col_heure).value if col_heure else ""
+        nom = ws.cell(row=r, column=col_nom).value if col_nom else ""
+        adr = ws.cell(row=r, column=col_adresse).value if col_adresse else ""
+        vol = ws.cell(row=r, column=col_vol).value if col_vol else ""
+        hf = ws.cell(row=r, column=col_hf).value if col_hf else ""
+
+        rk = _make_row_key_from_parts(date_iso, str(heure or ""), str(nom or ""), str(adr or ""), str(vol or ""), str(hf or ""))
+        rowkey_to_excelrow[rk] = r
+
+    applied = 0
+    done_ids = []
+    unlocked_keys = []
+    ch_col = headers["CH"]
+
+    for a in pending:
+        rk = str(a.get("row_key") or "").strip()
+        new_ch = str(a.get("new_value") or "").strip()
+        if not rk or not new_ch:
+            continue
+        excel_row = rowkey_to_excelrow.get(rk)
+        if not excel_row:
+            continue
+        ws.cell(row=excel_row, column=ch_col).value = new_ch
+        applied += 1
+        done_ids.append(int(a["id"]))
+        unlocked_keys.append(rk)
+
+    if applied == 0:
+        return (len(pending), 0)
+
+    out = BytesIO()
+    wb.save(out)
+
+    if not upload_dropbox_excel_bytes(out.getvalue()):
+        return (len(pending), 0)
+
+    mark_actions_done(done_ids)
+    unlock_rows_by_row_keys(unlocked_keys)
+
+    return (len(pending), applied)
 
 def render_tab_quick_day_mobile():
-    """Vue jour admin : toutes les navettes du jour (tous chauffeurs) + changement chauffeur + WhatsApp."""
+    """Vue jour admin : toutes les navettes du jour (tous chauffeurs) + changement chauffeur + WhatsApp + suivi Excel."""
     st.subheader("⚡ Vue jour (mobile) — Tous chauffeurs")
 
-    today = date.today()
-    sel_date = st.date_input(
-        "Jour à afficher :",
-        value=today,
-        key="quick_day_date",
-    )
+    # ===================================================
+    # 🔁 Soft refresh contrôlé (zéro rerun brutal)
+    # ===================================================
+    if consume_soft_refresh("quick_day"):
+        try:
+            get_planning.clear()
+        except Exception:
+            pass
 
-    # 1️⃣ Charger toute la journée
+    sel_date_iso = date.today().strftime("%Y-%m-%d")
+
+    # ===================================================
+    # 📌 Actions en attente vers Excel (CH_CHANGE)
+    # ===================================================
+    pending_map = {}
+    pending_list = []
+    try:
+        from database import list_pending_actions
+        actions = list_pending_actions(limit=800)
+        for (aid, rk, atype, oldv, newv, usr, created_at) in actions:
+            if atype == "CH_CHANGE" and rk:
+                pending_map[str(rk)] = {
+                    "id": aid,
+                    "new_ch": newv,
+                    "old_ch": oldv,
+                    "user": usr,
+                    "created_at": created_at,
+                }
+                pending_list.append((aid, rk, oldv, newv, usr, created_at))
+    except Exception:
+        pending_map = {}
+        pending_list = []
+
+    # ===================================================
+    # 📤 Appliquer toutes les modifs vers Excel (Feuil1)
+    # ===================================================
+    col_top1, col_top2 = st.columns([2, 1])
+    with col_top1:
+        if st.button("📤 Appliquer les changements chauffeur dans l’Excel (Feuil1)", key="qd_apply_all_excel"):
+            with st.spinner("Mise à jour Excel en cours…"):
+                total, applied = apply_pending_ch_changes_to_dropbox_excel("Feuil1")
+
+            if applied > 0:
+                st.success(f"✅ {applied}/{total} changement(s) appliqué(s) dans l’Excel")
+                request_soft_refresh("quick_day")
+            else:
+                st.info("Aucun changement chauffeur à appliquer (ou lignes introuvables dans l’Excel).")
+
+    with col_top2:
+        if pending_map:
+            st.metric("🟡 En attente Excel", len(pending_map))
+        else:
+            st.metric("🟡 En attente Excel", 0)
+
+    # ===================================================
+    # 1️⃣ Charger toute la journée (SAFE)
+    # ===================================================
     df = get_planning(
-        start_date=sel_date,
-        end_date=sel_date,
+        start_date=sel_date_iso,
+        end_date=sel_date_iso,
         chauffeur=None,
         type_filter=None,
         search="",
-        max_rows=300,
+        max_rows=400,
         source="day",
     )
 
-    if df.empty:
+    if df is None or df.empty:
         st.info("Aucune navette pour cette journée.")
         return
 
@@ -3577,12 +4285,26 @@ def render_tab_quick_day_mobile():
     df = df.copy()
     cols = df.columns.tolist()
 
+    # ===================================================
+    # Séparation navettes / indispos (évite vue vide)
+    # ===================================================
+    df_navettes = df[df.get("IS_INDISPO", 0) == 0].copy()
+    df_indispos = df[df.get("IS_INDISPO", 0) == 1].copy()
+
+    if df_navettes.empty and df_indispos.empty:
+        st.info("Aucune navette ni indisponibilité pour cette journée.")
+        return
+
+    # ===================================================
     # 2️⃣ Liste chauffeurs
+    # ===================================================
     chs_ui = get_chauffeurs_for_ui()
     if not chs_ui:
         chs_ui = get_chauffeurs() or CH_CODES
 
-    # 3️⃣ Tri par heure
+    # ===================================================
+    # 3️⃣ Tri par heure (NAVETTES UNIQUEMENT)
+    # ===================================================
     def _key_time(v):
         txt = normalize_time_string(v)
         if not txt:
@@ -3594,24 +4316,53 @@ def render_tab_quick_day_mobile():
                 pass
         return datetime.max.time()
 
-    if "HEURE" in df.columns:
-        df["_sort_time"] = df["HEURE"].apply(_key_time)
-        df = df.sort_values("_sort_time", ascending=True)
+    if "HEURE" in df_navettes.columns:
+        df_navettes["_sort_time"] = df_navettes["HEURE"].apply(_key_time)
+        df_navettes = df_navettes.sort_values("_sort_time", ascending=True)
 
     st.markdown("### 📋 Détail des navettes (texte compact)")
-    st.caption("Vue admin : toutes les navettes du jour.")
+    st.caption("Vue admin : toutes les navettes du jour. Les changements sont appliqués en DB immédiatement.")
 
-    for _, row in df.iterrows():
+    # ===================================================
+    # 🟡 Bandeau global des modifications à reporter (détaillé)
+    # ===================================================
+    if pending_list:
+        with st.expander("🟡 Modifications à reporter dans Excel (Feuil1)", expanded=True):
+            for (aid, rk, oldv, newv, usr, created_at) in pending_list[:200]:
+                st.markdown(f"• **{oldv} → {newv}** — row_key: `{rk}`"
+                            + (f" — {usr}" if usr else "")
+                            + (f" — {created_at}" if created_at else ""))
 
-        # ❌ Ignorer indispos
-        if is_indispo_row(row, cols):
-            continue
+    # ===================================================
+    # 🚫 Indisponibilités (MA, congés, etc.)
+    # ===================================================
+    if not df_indispos.empty:
+        st.markdown("### 🚫 Indisponibilités")
+        for _, row in df_indispos.iterrows():
+            ch = str(row.get("CH", "") or "").strip()
+            h1 = normalize_time_string(row.get("HEURE", "")) or ""
+            h2 = normalize_time_string(row.get("_HEURE_FIN", "")) or ""
+            reason = str(row.get("INDISPO_REASON", "") or "").strip() or "Indisponible"
+
+            line = f"👤 {ch}"
+            if h1 or h2:
+                line += f" | ⏱ {h1} → {h2}"
+            line += f" | 🚫 {reason}"
+            st.markdown(line)
+
+    # ===================================================
+    # 📋 AFFICHAGE DES NAVETTES
+    # ===================================================
+    for _, row in df_navettes.iterrows():
 
         # ID
         try:
             row_id = int(row.get("id"))
         except Exception:
             continue
+
+        # row_key
+        rk = str(row.get("row_key") or "")
 
         # Date
         date_val = row.get("DATE")
@@ -3627,15 +4378,14 @@ def render_tab_quick_day_mobile():
         # Chauffeur
         ch_current = str(row.get("CH", "") or "").strip()
 
-        # 🛠️ BADGE MANUEL
-        manual_badge = ""
-        if int(row.get("CH_MANUAL", 0) or 0) == 1:
-            manual_badge = " 🛠️"
+        # 🛠️ Badge manuel + 🟡 pending excel
+        manual_badge = " 🛠️" if int(row.get("CH_MANUAL", 0) or 0) == 1 else ""
+        pending_badge = " 🟡" if (rk and rk in pending_map) else ""
 
-        # Destination
+        # Destination (route + designation)
         designation = str(row.get("DESIGNATION", "") or "").strip()
         route_txt = str(row.get("Unnamed: 8", "") or "").strip()
-        dest = f"{route_txt} ({designation})" if route_txt and designation else route_txt or designation or "Navette"
+        dest = f"{route_txt} ({designation})" if route_txt and designation else (route_txt or designation or "Navette")
 
         # Client
         nom = str(row.get("NOM", "") or "").strip()
@@ -3651,16 +4401,18 @@ def render_tab_quick_day_mobile():
         paiement = str(row.get("PAIEMENT", "") or "").strip()
         bdc = str(row.get("Num BDC", "") or "").strip()
 
-        # ✈️ Vol
+        # ✈️ Vol + badge
         vol = extract_vol_val(row, cols)
         badge_vol = ""
-
         if vol:
-            status, delay_min, sched_dt, est_dt = get_flight_status_cached(vol)
-            badge_vol = flight_badge(status, delay_min)
+            try:
+                status, delay_min, sched_dt, est_dt = get_flight_status_cached(vol)
+                badge_vol = flight_badge(status, delay_min)
+            except Exception:
+                badge_vol = ""
 
         # Ligne affichée
-        line = f"📆 {date_txt} | ⏱ {heure_txt} | 👤 {ch_current}{manual_badge} → {dest}"
+        line = f"📆 {date_txt} | ⏱ {heure_txt} | 👤 {ch_current}{manual_badge}{pending_badge} → {dest}"
         if nom:
             line += f" | 🙂 {nom}"
         if adr_full:
@@ -3677,7 +4429,7 @@ def render_tab_quick_day_mobile():
         with st.container(border=True):
             st.markdown(line)
 
-            colA, colB, colC = st.columns([2, 1, 1])
+            colA, colB, colC, colD = st.columns([2, 1, 1, 1])
 
             # 🔁 Remplacement chauffeur
             with colA:
@@ -3688,7 +4440,7 @@ def render_tab_quick_day_mobile():
                     key=f"qd_newch_{row_id}",
                 )
 
-            # 💾 Sauvegarde DB + audit
+            # 💾 Sauvegarde DB + action en attente Excel
             with colB:
                 if new_ch != ch_current:
                     if st.button("💾 Appliquer", key=f"qd_save_{row_id}"):
@@ -3700,7 +4452,7 @@ def render_tab_quick_day_mobile():
                             or ""
                         )
 
-                        # 1️⃣ UPDATE DB
+                        # 1) DB : appliquer immédiatement
                         update_planning_row(
                             row_id,
                             {
@@ -3710,32 +4462,61 @@ def render_tab_quick_day_mobile():
                             },
                         )
 
-                        # 2️⃣ AUDIT
-                        with get_connection() as conn:
-                            conn.execute(
-                                """
-                                INSERT INTO planning_audit
-                                (ts, user, action, row_key, details)
-                                VALUES (?, ?, ?, ?, ?)
-                                """,
-                                (
-                                    now_iso,
-                                    user,
-                                    "CH_MANUAL_CHANGE",
-                                    row.get("row_key"),
-                                    f"{ch_current} → {new_ch}",
-                                ),
-                            )
-                            conn.commit()
+                        # 2) Audit
+                        try:
+                            with get_connection() as conn:
+                                conn.execute(
+                                    """
+                                    INSERT INTO planning_audit
+                                    (ts, user, action, row_key, details)
+                                    VALUES (?, ?, ?, ?, ?)
+                                    """,
+                                    (
+                                        now_iso,
+                                        user,
+                                        "CH_MANUAL_CHANGE",
+                                        rk,
+                                        f"{ch_current} → {new_ch}",
+                                    ),
+                                )
+                                conn.commit()
+                        except Exception:
+                            pass
+
+                        # 3) Pending action vers Excel
+                        try:
+                            from database import log_ch_change
+                            log_ch_change(rk, ch_current, new_ch, user=user)
+                        except Exception:
+                            pass
 
                         st.success(
                             "✅ Chauffeur modifié\n"
                             "🛠️ Override manuel actif\n"
-                            "📄 À reporter dans Excel"
+                            "🟡 À reporter dans Excel"
                         )
 
-                        st.cache_data.clear()
-                        st.rerun()
+                        # Refresh contrôlé (pas de rerun brutal)
+                        request_soft_refresh("quick_day")
+                else:
+                    st.caption("")
+
+            # 📤 Excel (par ligne si pending)
+            with colD:
+                if rk and rk in pending_map:
+                    if st.button("📤 Excel", key=f"qd_excel_{row_id}"):
+                        try:
+                            from utils import update_excel_rows_by_row_key
+                            from database import mark_actions_done
+
+                            upd = {rk: {"CH": pending_map[rk].get("new_ch")}}
+                            cnt = update_excel_rows_by_row_key(upd)
+                            mark_actions_done([pending_map[rk].get("id")])
+
+                            st.success(f"✅ Envoyé vers Excel ({cnt})")
+                            request_soft_refresh("quick_day")
+                        except Exception as e:
+                            st.error(f"Erreur Excel : {e}")
                 else:
                     st.caption("")
 
@@ -4177,7 +4958,7 @@ def send_planning_to_chauffeurs(
         type_filter=None,
         search="",
         max_rows=5000,
-        source="7j",
+        source="full",
     )
 
     if df_all is None or df_all.empty:
@@ -4938,239 +5719,528 @@ def export_chauffeur_planning_pdf(df_ch: pd.DataFrame, ch: str):
 #   🚖 ONGLET CHAUFFEUR — MON PLANNING
 # ============================================================
 
+
+
+def generate_urgence_mission_pdf_bytes(row: dict) -> bytes:
+    """Génère un PDF (A4) pour une mission urgente (1 navette)."""
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+
+    x = 2 * cm
+    y = height - 2 * cm
+
+    def line(txt, dy=0.7*cm, bold=False):
+        nonlocal y
+        if bold:
+            c.setFont("Helvetica-Bold", 12)
+        else:
+            c.setFont("Helvetica", 11)
+        c.drawString(x, y, txt)
+        y -= dy
+
+    line("AIRPORTS LINES — MISSION URGENTE", bold=True, dy=1.0*cm)
+    line(f"Date : {row.get('DATE','')}")
+    line(f"Heure : {row.get('HEURE','')}")
+    line(f"Chauffeur : {row.get('CH','')}")
+    line(f"PAX : {row.get('PAX','')}")
+    line(f"Vol : {row.get('VOL','')}")
+    line(f"Destination : {row.get('DESIGNATION','')}")
+    line(f"Adresse pick-up : {row.get('ADRESSE','')}")
+    line(f"Client : {row.get('NOM','')}")
+    line(f"Tél : {row.get('Tél', row.get('TEL',''))}")
+    line(f"Paiement : {row.get('PAIEMENT','')}")
+    line(f"BDC : {row.get('Num BDC', row.get('BDC',''))}")
+    line(f"Remarque : {row.get('REMARQUE','')}", dy=1.2*cm)
+
+    c.setFont("Helvetica", 9)
+    c.drawString(x, 1.5*cm, f"Généré le {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+
+    c.showPage()
+    c.save()
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def format_urgence_message(row: dict) -> str:
+    date_txt = row.get("DATE") or row.get("DATE_ISO") or ""
+    heure_txt = row.get("HEURE") or ""
+    dest = row.get("DESIGNATION") or ""
+    nom = row.get("NOM") or ""
+    adr = row.get("ADRESSE") or ""
+    pax = row.get("PAX") or ""
+    vol = row.get("VOL") or row.get("N° Vol") or ""
+    bdc = row.get("Num BDC") or row.get("BDC") or ""
+    return (
+        "🚨 URGENCE — Nouvelle mission\n"
+        f"📅 {date_txt} à {heure_txt}\n"
+        f"➡️ {dest}\n"
+        + (f"👤 Client : {nom}\n" if nom else "")
+        + (f"📍 Adresse : {adr}\n" if adr else "")
+        + (f"🧳 PAX : {pax}\n" if pax else "")
+        + (f"✈️ Vol : {vol}\n" if vol else "")
+        + (f"🧾 BDC : {bdc}\n" if bdc else "")
+        + "Merci de confirmer immédiatement ✅"
+    )
+
+
+def notify_chauffeur_urgence(row: dict) -> dict:
+    """Notifie le(s) chauffeur(s) (mail + WhatsApp link) et log en DB."""
+    ch_code = (row.get("CH") or "").strip()
+    if not ch_code:
+        return {"ok": False, "error": "CH vide"}
+
+    msg = format_urgence_message(row)
+
+    # Email
+    emails_sent, emails_missing = send_email_to_chauffeurs_from_row(
+        row=row,
+        subject="🚨 URGENCE — Nouvelle mission",
+        body=msg,
+    )
+
+    # WhatsApp links
+    wa_links = []
+    for ch in split_chauffeurs(ch_code):
+        tel, _ = get_chauffeur_contact(ch)
+        if tel:
+            wa_links.append((ch, build_whatsapp_link(tel, msg)))
+
+    # Log interne chauffeur_messages
+    try:
+        for ch in split_chauffeurs(ch_code):
+            receive_chauffeur_planning(chauffeur=ch, texte=msg, canal="URGENCE")
+    except Exception:
+        pass
+
+    # DB meta
+    try:
+        set_urgence_status(
+            int(row.get("id")),
+            status="EN_COURS",
+            notified_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            channel="MAIL+WA",
+        )
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "emails_sent": emails_sent,
+        "emails_missing": emails_missing,
+        "wa_links": wa_links,
+        "message": msg,
+    }
+
+
+
+def render_tab_urgences_admin():
+    st.subheader("🚨 Urgences")
+
+    # 🔁 Rerun contrôlé (anti-refresh brutal)
+    consume_soft_refresh("urgences_admin")
+
+    colA, colB, colC = st.columns([1, 1, 2])
+    with colA:
+        status = st.selectbox("Statut", ["Toutes", "EN_COURS", "TERMINEE"], index=0, key="urg_status")
+    with colB:
+        days_back = st.number_input("Jours à afficher", min_value=1, max_value=120, value=30, step=1, key="urg_days_back")
+    with colC:
+        st.caption("Les urgences = lignes planning où **URGENCE=1**.")
+
+    df = get_urgences(
+        status=None if status == "Toutes" else status,
+        days_back=int(days_back),
+    )
+
+    if df is None or df.empty:
+        st.success("✅ Aucune urgence")
+        return
+
+    # Colonnes utiles (évite dataframe trop large)
+    cols_show = []
+    for c in ["DATE", "HEURE", "CH", "IMMAT", "PAX", "DESIGNATION", "NOM", "ADRESSE", "VOL", "URGENCE_STATUS", "URGENCE_NOTIFIED_AT", "id"]:
+        if c in df.columns:
+            cols_show.append(c)
+
+    st.dataframe(df[cols_show], use_container_width=True, hide_index=True, height=320)
+
+    st.markdown("----")
+    st.markdown("### Détails / actions")
+
+    for _, row in df.iterrows():
+        rid = int(row.get("id") or 0)
+        title = f"{row.get('DATE','')} {row.get('HEURE','')} — {row.get('CH','')} — {row.get('NOM','')}"
+        with st.expander(title, expanded=False):
+            row_dict = row.to_dict()
+
+            st.write(f"**Destination** : {row.get('DESIGNATION','')}")
+            st.write(f"**Adresse** : {row.get('ADRESSE','')}")
+            st.write(f"**Vol** : {row.get('VOL','')}")
+            st.write(f"**Statut** : {row.get('URGENCE_STATUS','') or 'EN_COURS'}")
+
+            # Conflits rapides (si CH présent)
+            ch = (row.get("CH") or "").strip()
+            date_iso = row.get("DATE_ISO")
+            heure = row.get("HEURE")
+            if date_iso and heure and ch:
+                df_conf = find_time_conflicts(
+                    date_iso=str(date_iso),
+                    heure=str(heure),
+                    ch=str(split_chauffeurs(ch)[0]) if split_chauffeurs(ch) else ch,
+                    window_min=90,
+                    exclude_id=rid,
+                )
+                if df_conf is not None and not df_conf.empty:
+                    st.warning("⚠️ Conflit horaire détecté (même chauffeur, +/- 90 min)")
+                    show_cols = [c for c in ["DATE", "HEURE", "CH", "NOM", "ADRESSE", "DESIGNATION", "VOL", "id"] if c in df_conf.columns]
+                    st.dataframe(df_conf[show_cols], use_container_width=True, hide_index=True)
+
+            c1, c2, c3, c4 = st.columns(4)
+
+            with c1:
+                if st.button("🔔 Notifier chauffeur", key=f"urg_notify_{rid}"):
+                    res = notify_chauffeur_urgence(row_dict)
+                    if not res.get("ok"):
+                        st.error(res.get("error", "Erreur notification"))
+                    else:
+                        st.success("✅ Notification envoyée")
+                        if res.get("wa_links"):
+                            for ch_code, link in res["wa_links"]:
+                                st.markdown(f"[💬 WhatsApp {ch_code}]({link})")
+
+            with c2:
+                if st.button("✅ Marquer terminée", key=f"urg_done_{rid}"):
+                    try:
+                        set_urgence_status(rid, status="TERMINEE")
+                        st.success("OK")
+                        request_soft_refresh("urgences_admin", clear_cache=True, mute_autosync_sec=10)
+                    except Exception as e:
+                        st.error(str(e))
+
+            with c3:
+                # ⚡ Génération PDF à la demande (évite lenteur à chaque rerun)
+                pdf_key = f"_urg_pdf_bytes_{rid}"
+
+                if st.button("⚙️ Générer PDF", key=f"urg_genpdf_{rid}"):
+                    try:
+                        st.session_state[pdf_key] = generate_urgence_mission_pdf_bytes(row_dict)
+                        st.success("PDF prêt ✅")
+                    except Exception as e:
+                        st.error(f"Erreur PDF : {e}")
+
+                pdf_bytes = st.session_state.get(pdf_key)
+                if pdf_bytes:
+                    st.download_button(
+                        "📄 Télécharger PDF mission",
+                        data=pdf_bytes,
+                        file_name=f"MISSION_URGENTE_{rid}.pdf",
+                        mime="application/pdf",
+                        key=f"urg_pdf_{rid}",
+                    )
+                else:
+                    st.caption("Génère le PDF avant téléchargement.")
+
+
+
+            with c4:
+                if st.button("🧹 Retirer l'urgence", key=f"urg_clear_{rid}"):
+                    try:
+                        update_planning_row(rid, {"URGENCE": 0, "URGENCE_STATUS": "TERMINEE"})
+                        st.success("OK")
+                        request_soft_refresh("urgences_admin", clear_cache=True, mute_autosync_sec=10)
+                    except Exception as e:
+                        st.error(str(e))
+
+def export_chauffeur_planning_table_pdf(df, ch_code):
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
+    from reportlab.lib import colors
+    from io import BytesIO
+
+    buffer = BytesIO()
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=landscape(A4),
+        leftMargin=10,
+        rightMargin=10,
+        topMargin=15,
+        bottomMargin=15,
+    )
+
+    cols = [
+        "DATE","HEURE","CH","²²²²","IMMAT","PAX","Reh","Siège","",
+        "DESIGNATION","H South","Décollage","N° Vol","Origine","GO","Num BDC",
+        "NOM","ADRESSE","CP","Localité","Tél","Type Nav","PAIEMENT","Caisse"
+    ]
+
+    if "Unnamed: 8" in df.columns:
+        df = df.rename(columns={"Unnamed: 8": ""})
+
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ""
+
+    df = df[cols].fillna("")
+
+    data = [cols]
+    row_styles = []
+
+    for i, row in df.iterrows():
+        data.append([str(row[c]) for c in cols])
+        r = len(data) - 1
+
+        # 🎨 Couleurs métier (PDF)
+        if int(row.get("IS_INDISPO", 0) or 0) == 1:
+            row_styles.append(("BACKGROUND", (0, r), (-1, r), colors.lightgrey))
+
+        if int(row.get("IS_URGENT", 0) or 0) == 1:
+            row_styles.append(("BACKGROUND", (0, r), (-1, r), colors.salmon))
+
+        if int(row.get("IS_GROUPAGE", 0) or 0) == 1:
+            row_styles.append(("BACKGROUND", (0, r), (-1, r), colors.lightyellow))
+
+        if int(row.get("IS_PARTAGE", 0) or 0) == 1:
+            row_styles.append(("BACKGROUND", (0, r), (-1, r), colors.beige))
+
+        paiement = str(row.get("PAIEMENT","")).lower()
+        caisse = row.get("Caisse")
+        if paiement == "caisse" and caisse not in ("",None,0,"0"):
+            row_styles.append(("TEXTCOLOR", (-1, r), (-1, r), colors.red))
+            row_styles.append(("FONT", (-1, r), (-1, r), "Helvetica-Bold"))
+
+        if is_navette_confirmed(row):
+            row_styles.append(("BACKGROUND", (0, r), (-1, r), colors.lightgreen))
+
+    # 👉 Largeurs calibrées pour tenir sur 1 page A4 paysage
+    col_widths = [
+        32, 32, 30, 20, 36, 22, 22, 22, 8,
+        48, 32, 32, 42, 36, 26, 36,
+        44, 90, 28, 44, 44,
+        38, 36, 32
+    ]
+
+    table = Table(data, colWidths=col_widths, repeatRows=1)
+
+    table.setStyle(TableStyle(
+        [
+            ("GRID", (0,0), (-1,-1), 0.4, colors.grey),
+            ("BACKGROUND", (0,0), (-1,0), colors.lightblue),
+            ("FONT", (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTSIZE", (0,0), (-1,-1), 6.5),
+            ("ALIGN", (0,0), (-1,-1), "CENTER"),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+            ("LEFTPADDING", (0,0), (-1,-1), 2),
+            ("RIGHTPADDING", (0,0), (-1,-1), 2),
+        ] + row_styles
+    ))
+
+    doc.build([table])
+    buffer.seek(0)
+    return buffer.read()
+
+def style_planning_chauffeur(row):
+    styles = [""] * len(row)
+
+    try:
+        if int(row.get("IS_INDISPO", 0) or 0) == 1:
+            styles = ["background-color:#eeeeee"] * len(row)
+
+        elif int(row.get("IS_URGENT", 0) or 0) == 1:
+            styles = ["background-color:#ffcccb"] * len(row)
+
+        elif int(row.get("IS_GROUPAGE", 0) or 0) == 1:
+            styles = ["background-color:#fff9c4"] * len(row)
+
+        elif int(row.get("IS_PARTAGE", 0) or 0) == 1:
+            styles = ["background-color:#ffe0b2"] * len(row)
+
+        paiement = str(row.get("PAIEMENT", "")).lower()
+        caisse = row.get("Caisse")
+
+        if paiement == "caisse" and caisse not in ("", None, 0, "0"):
+            idx = list(row.index).index("Caisse")
+            styles[idx] = "background-color:#ffebee;font-weight:900;color:#c62828;"
+
+        if is_navette_confirmed(row):
+            styles = ["background-color:#e8f5e9"] * len(row)
+
+    except Exception:
+        pass
+
+    return styles
+
 def render_tab_chauffeur_driver():
     ch_selected = st.session_state.get("chauffeur_code")
     if not ch_selected:
         st.error("Chauffeur non identifié.")
         return
-    df_ch = pd.DataFrame()   # ✅ initialisation de sécurité
 
-
+    df_ch = pd.DataFrame()  # sécurité
     today = date.today()
 
     # ===================================================
-    # 💶 BADGE — CAISSE À REMETTRE (CHAUFFEUR)
+    # 💶 BADGE — CAISSE À REMETTRE
     # ===================================================
     has_caisse_due = False
     total_caisse_due = 0.0
+    start_date = date(2026, 1, 1)
 
-    d1 = today - timedelta(days=60)
-
-    df_badge = get_planning(
-        start_date=d1,
-        end_date=today,
-        chauffeur=ch_selected,
-        source="full",
-        max_rows=3000,
-    )
-
-    if df_badge is not None and not df_badge.empty:
-        df_badge = df_badge.copy()
-
-        df_badge = df_badge[
-            df_badge["PAIEMENT"]
-            .fillna("")
-            .astype(str)
-            .str.lower()
-            .eq("caisse")
-        ]
-
-        df_badge["Caisse"] = (
-            df_badge.get(
-                "Caisse",
-                pd.Series(0, index=df_badge.index),
-            )
-            .pipe(pd.to_numeric, errors="coerce")
-            .fillna(0)
+    with get_connection() as conn:
+        df_badge = pd.read_sql_query(
+            """
+            SELECT DATE, HEURE, NOM, DESIGNATION, ADRESSE, PAX, PAIEMENT, Caisse
+            FROM planning
+            WHERE COALESCE(IS_INDISPO,0)=0
+              AND COALESCE(IS_SUPERSEDED,0)=0
+              AND LOWER(COALESCE(PAIEMENT,''))='caisse'
+              AND COALESCE(CAISSE_PAYEE,0)=0
+              AND DATE_ISO BETWEEN ? AND ?
+              AND UPPER(REPLACE(REPLACE(CH,'*',''),' ','')) LIKE ?
+            ORDER BY DATE_ISO, HEURE
+            """,
+            conn,
+            params=(start_date.isoformat(), today.isoformat(), f"{normalize_ch_code(ch_selected)}%"),
         )
 
-        if "CAISSE_PAYEE" in df_badge.columns:
-            df_badge = df_badge[df_badge["CAISSE_PAYEE"] == 0]
-
+    if not df_badge.empty:
+        df_badge["Caisse"] = pd.to_numeric(df_badge["Caisse"], errors="coerce").fillna(0.0)
         total_caisse_due = float(df_badge["Caisse"].sum())
         has_caisse_due = total_caisse_due > 0
-
-    # ===================================================
-    # 🧾 TITRE + BADGE
-    # ===================================================
-    st.subheader(f"🚖 Mon planning — {ch_selected}")
 
     if has_caisse_due:
         st.markdown(
             f"""
-            <div style="
-                background:#fff3e0;
-                border:1px solid #ff9800;
-                padding:10px;
-                border-radius:8px;
-                margin-bottom:12px;
-            ">
+            <div style="background:#fff3e0;border:1px solid #ff9800;
+                        padding:12px;border-radius:10px;margin-bottom:10px;">
                 💶 <b>Caisse à remettre :</b>
-                <span style="color:#d32f2f;font-weight:800;">
+                <span style="color:#d32f2f;font-weight:900;font-size:18px;">
                     {total_caisse_due:.2f} €
                 </span>
-                <br>
-                👉 <a href="#paiement-bureau">
-                    Aller au paiement à faire au bureau
-                </a>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
+        if st.toggle("🧾 Voir le détail de la caisse", False):
+            st.dataframe(df_badge, use_container_width=True, height=300)
+    else:
+        st.success("✅ Aucune caisse à remettre pour le moment.")
 
     # ===================================================
-    # 📅 CHOIX DE LA PÉRIODE (CHAUFFEUR)
+    # 📅 PÉRIODE
     # ===================================================
-    planning_source = "7j"   # 👈 INITIALISATION OBLIGATOIRE
-
     scope = st.radio(
         "📅 Quelles navettes veux-tu voir ?",
-        [
-            "📍 Aujourd’hui",
-            "➡️ À partir de demain",
-        ],
-        index=0,
+        ["📍 Aujourd’hui", "➡️ À partir de demain"],
         horizontal=True,
-        key="vue_chauffeur_scope",
     )
 
     if scope == "📍 Aujourd’hui":
-        from_date = today
-        to_date = today
+        from_date, to_date = today, today
         scope_label = "du jour"
-
-    elif scope == "➡️ À partir de demain":
-        from_date = today + timedelta(days=1)
-        to_date = None
+    else:
+        from_date, to_date = today + timedelta(days=1), None
         scope_label = "à partir de demain"
-
-
-    # ===================================================
-    # 🔄 CHARGEMENT DU PLANNING (SOURCE ADAPTÉE AU SCOPE)
-    # ===================================================
-
-        planning_source = "7j"
 
     df_all = get_planning(
         start_date=from_date,
         end_date=to_date,
-        chauffeur=None,          # filtrage chauffeur APRÈS
-        type_filter=None,
-        search="",
+        chauffeur=None,
         max_rows=5000,
-        source=planning_source,
+        source="7j",
     )
 
     if df_all is None or df_all.empty:
         st.info(f"Aucune navette {scope_label}.")
         return
-    # ===================================================
-    # 🔔 BADGE — NOUVEAUX MESSAGES ADMIN (GLOBAL)
-    # ===================================================
-    has_new_admin_msg = False
-
-    if "ADMIN_REPLY" in df_ch.columns:
-        has_new_admin_msg = (
-            df_ch["ADMIN_REPLY"].notna()
-            & (df_ch.get("ADMIN_REPLY_READ", 0).fillna(0) == 0)
-        ).any()
-
-    if has_new_admin_msg:
-        st.markdown(
-            """
-            <div style="
-                background:#e3f2fd;
-                border-left:6px solid #1976d2;
-                padding:10px;
-                border-radius:8px;
-                margin-bottom:12px;
-                font-weight:700;
-            ">
-                🔔 Nouveau message du bureau — merci de consulter vos navettes
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
 
     # ===================================================
-    # ⚡ FILTRAGE CHAUFFEUR DÉFINITIF (ROBUSTE)
+    # 🧭 MODE D’AFFICHAGE
     # ===================================================
-
-    ch = ch_selected.strip().upper()
-
-    ch_series = (
-        df_all["CH"]
-        .fillna("")
-        .astype(str)
-        .str.upper()
-        .str.strip()
+    view_mode = st.radio(
+        "Vue",
+        ["🧾 Mes navettes", "📅 Mon planning"],
+        horizontal=True,
+        key="chauffeur_view_mode",
     )
 
-    # correspondances autorisées :
-    # FA  -> FA, FA*, FADO, DOFA
-    # DO  -> DO, DO*, DOFA
-    # NP  -> NP, NP*
-    mask_exact = ch_series == ch
-    mask_star = ch_series == f"{ch}*"
-    mask_contains = ch_series.str.contains(ch, regex=False)
-
-    # évite FA1, DO2, etc.
-    mask_not_digit_suffix = ~ch_series.str.match(rf"{ch}\d")
-
-    df_ch = df_all[
-        (mask_exact | mask_star | mask_contains) & mask_not_digit_suffix
-    ].copy()
-
     # ===================================================
-    # 🔔 BADGE — NOUVEAUX MESSAGES ADMIN (GLOBAL)
+    # ⚡ FILTRAGE CHAUFFEUR
     # ===================================================
-    has_new_admin_msg = False
+    ch = ch_selected.strip().upper()
+    ch_series = df_all["CH"].fillna("").str.upper().str.strip()
 
-    if "ADMIN_REPLY" in df_ch.columns:
-        has_new_admin_msg = (
-            df_ch["ADMIN_REPLY"].notna()
-            & (df_ch.get("ADMIN_REPLY_READ", 0).fillna(0) == 0)
-        ).any()
+    mask = (
+        (ch_series == ch)
+        | (ch_series == f"{ch}*")
+        | (ch_series.str.contains(ch, regex=False))
+    ) & (~ch_series.str.match(rf"{ch}\d"))
 
-    if has_new_admin_msg:
-        st.markdown(
-            """
-            <div style="
-                background:#e3f2fd;
-                border-left:6px solid #1976d2;
-                padding:10px;
-                border-radius:8px;
-                margin-bottom:12px;
-                font-weight:700;
-            ">
-                🔔 Nouveau message du bureau — merci de consulter vos navettes
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    df_ch = _sort_df_by_date_heure(df_all[mask].copy())
 
     if df_ch.empty:
         st.info(f"Aucune navette {scope_label}.")
         return
 
-    df_ch = _sort_df_by_date_heure(df_ch)
     cols = df_ch.columns.tolist()
 
     # ===================================================
-    # 📄 PDF
+    # 📅 VUE PLANNING (TABLEAU)
     # ===================================================
-    st.markdown("### 📄 Mon planning")
-    if st.button("📄 Télécharger mon planning en PDF"):
-        pdf = export_chauffeur_planning_pdf(df_ch, ch_selected)
-        st.download_button(
-            label="⬇️ Télécharger le PDF",
-            data=pdf,
-            file_name=f"planning_{ch_selected}.pdf",
-            mime="application/pdf",
+    if view_mode == "📅 Mon planning":
+
+        st.markdown("### 📅 Mon planning (chauffeur)")
+
+        planning_cols_driver = [
+            "DATE","HEURE","CH","²²²²","IMMAT","PAX","Reh","Siège",
+            "Unnamed: 8","DESIGNATION","H South","Décollage","N° Vol","Origine",
+            "GO","Num BDC","NOM","ADRESSE","CP","Localité","Tél",
+            "Type Nav","PAIEMENT","Caisse"
+        ]
+
+        df_table = df_ch.copy()
+        for c in planning_cols_driver:
+            if c not in df_table.columns:
+                df_table[c] = ""
+
+        df_table = df_table[planning_cols_driver]
+
+        def style_rows(row):
+            if str(row.get("PAIEMENT","")).lower()=="caisse" and row.get("Caisse"):
+                return ["background-color:#fdecea"] * len(row)
+            if int(row.get("IS_GROUPAGE",0) or 0)==1:
+                return ["background-color:#fffde7"] * len(row)
+            if int(row.get("IS_PARTAGE",0) or 0)==1:
+                return ["background-color:#f3e5f5"] * len(row)
+            if int(row.get("IS_URGENT",0) or 0)==1:
+                return ["background-color:#ffcdd2"] * len(row)
+            return [""] * len(row)
+
+        st.dataframe(
+            df_table.style.apply(style_planning_chauffeur, axis=1),
+            use_container_width=True,
+            height=520,
         )
 
-    st.markdown("---")
+        if st.button("📄 Télécharger mon planning (PDF)"):
+            pdf = export_chauffeur_planning_table_pdf(df_table, ch_selected)
+            st.download_button(
+                "⬇️ Télécharger",
+                data=pdf,
+                file_name=f"planning_{ch_selected}.pdf",
+                mime="application/pdf",
+            )
+
+        return  # ⛔ STOP ICI → la vue détaillée n’est PAS affichée
+
+    # ===================================================
+    # 🧾 VUE DÉTAILLÉE (STRICTEMENT IDENTIQUE)
+    # ===================================================
+    # ⬇️⬇️⬇️ TOUT TON CODE EXISTANT ICI, NON MODIFIÉ ⬇️⬇️⬇️
+    # (bloc for row in df_ch.iterrows(), confirmations, messages, etc.)
+
 
     # ===================================================
     # 🚖 NAVETTES
@@ -5433,6 +6503,78 @@ def render_tab_chauffeur_driver():
 
         st.markdown("---")
 
+    # ===================================================
+    # 📅 VUE TABLEAU — PLANNING CHAUFFEUR
+    # ===================================================
+    if view_mode == "📅 Mon planning":
+
+        st.markdown("### 📅 Mon planning")
+
+        # Colonnes visibles chauffeur (ordre métier)
+        planning_cols_driver = [
+            "DATE",
+            "HEURE",
+            "Unnamed: 8",   # SENS
+            "DESIGNATION",  # DEST
+            "NOM",
+            "ADRESSE",
+            "CP",
+            "Localité",
+            "Tél",
+            "PAX",
+            "PAIEMENT",
+            "Caisse",
+        ]
+
+        df_table = df_ch.copy()
+
+        # Sécurité colonnes
+        for c in planning_cols_driver:
+            if c not in df_table.columns:
+                df_table[c] = ""
+
+        df_table = df_table[planning_cols_driver]
+
+        # Renommage propre affichage
+        df_table = df_table.rename(columns={
+            "Unnamed: 8": "SENS",
+            "DESIGNATION": "DEST",
+            "Localité": "LOCALITÉ",
+            "Tél": "TÉL",
+        })
+
+        # 🔴 Mise en évidence CAISSE
+        def _style_caisse(v):
+            try:
+                if float(v) > 0:
+                    return "background-color:#fdecea;font-weight:800;"
+            except Exception:
+                pass
+            return ""
+
+        st.dataframe(
+            df_table.style.applymap(_style_caisse, subset=["Caisse"]),
+            use_container_width=True,
+            height=420,
+        )
+
+        st.markdown("")
+
+        # ===================================================
+        # 📄 EXPORT PDF (PAYSAGE)
+        # ===================================================
+        if st.button("📄 Télécharger mon planning (PDF)", key="driver_planning_pdf"):
+            pdf = export_chauffeur_planning_table_pdf(
+                df_table,
+                ch_selected,
+            )
+
+            st.download_button(
+                "⬇️ Télécharger le PDF",
+                data=pdf,
+                file_name=f"planning_{ch_selected}.pdf",
+                mime="application/pdf",
+            )
 
     # ===================================================
     # 📤 ENVOI CONFIRMATION (RÉPONSE CHAUFFEUR)
@@ -5687,7 +6829,6 @@ def render_tab_feuil3():
 
 def render_tab_excel_sync():
 
-    from streamlit_autorefresh import st_autorefresh
     from datetime import datetime
 
     # ===================================================
@@ -5756,25 +6897,23 @@ def render_tab_excel_sync():
             type="secondary",
             disabled=not confirm_upload,
         ):
-            with st.spinner("🔄 Synchronisation depuis fichier manuel…"):
-                sync_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                inserted = sync_planning_from_uploaded_file(
-                    uploaded_file,
-                    excel_sync_ts=sync_ts,
-                )
-                cleanup_orphan_planning_rows(sync_ts)
-                log_event(
-                    f"Sync fichier manuel + cleanup exécutés ({inserted} lignes)",
-                    "SYNC",
-                )
+            st.session_state["_do_manual_excel_sync"] = True
 
-            st.session_state["last_sync_time"] = datetime.now().strftime(
-                "%d/%m/%Y %H:%M"
+    if st.session_state.pop("_do_manual_excel_sync", False):
+        with st.spinner("🔄 Synchronisation depuis fichier manuel…"):
+            sync_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            inserted = sync_planning_from_uploaded_file(
+                uploaded_file,
+                excel_sync_ts=sync_ts,
+            )
+            cleanup_orphan_planning_rows(sync_ts)
+            log_event(
+                f"Sync fichier manuel + cleanup exécutés ({inserted} lignes)",
+                "SYNC",
             )
 
-            st.success(f"✅ DB mise à jour ({inserted} lignes)")
-            st.cache_data.clear()
-            st.rerun()
+        st.session_state["last_sync_time"] = datetime.now().strftime("%d/%m/%Y %H:%M")
+        st.success(f"✅ DB mise à jour ({inserted} lignes)")
 
     st.markdown("---")
 
@@ -5783,17 +6922,18 @@ def render_tab_excel_sync():
     # ===================================================
     confirm = st.checkbox(
         "Je confirme vouloir forcer la mise à jour de la base depuis Dropbox",
-        key="confirm_force_sync_dropbox",
+        key="confirm_force_sync_dropbox_v2",
     )
 
     col1, col2 = st.columns([2, 3])
 
     with col1:
-        btn_force = st.button(
+        if st.button(
             "🔄 FORCER MAJ DROPBOX → DB",
             type="primary",
             disabled=not confirm,
-        )
+        ):
+            st.session_state["_do_dropbox_sync"] = True
 
     with col2:
         st.caption(
@@ -5801,7 +6941,7 @@ def render_tab_excel_sync():
             "si elles ne sont ni confirmées ni payées."
         )
 
-    if btn_force:
+    if st.session_state.pop("_do_dropbox_sync", False):
         with st.spinner("🔄 Synchronisation en cours depuis Dropbox…"):
             sync_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             inserted = sync_planning_from_today(excel_sync_ts=sync_ts)
@@ -5811,13 +6951,8 @@ def render_tab_excel_sync():
                 "SYNC",
             )
 
-        st.session_state["last_sync_time"] = datetime.now().strftime(
-            "%d/%m/%Y %H:%M"
-        )
-
+        st.session_state["last_sync_time"] = datetime.now().strftime("%d/%m/%Y %H:%M")
         st.success(f"✅ DB mise à jour depuis aujourd’hui ({inserted} lignes)")
-        st.cache_data.clear()
-        st.rerun()
 
     st.markdown("---")
 
@@ -5843,13 +6978,14 @@ def render_tab_excel_sync():
         key="confirm_full_rebuild",
     )
 
-    btn_rebuild = st.button(
+    if st.button(
         "🔥 RECONSTRUIRE DB COMPLÈTE",
         type="secondary",
         disabled=not (confirm_full and rebuild_file_1 and rebuild_file_2),
-    )
+    ):
+        st.session_state["_do_full_rebuild"] = True
 
-    if btn_rebuild:
+    if st.session_state.pop("_do_full_rebuild", False):
         with st.spinner("🔥 Reconstruction complète de la base en cours…"):
             inserted = rebuild_planning_db_from_two_excel_files(
                 rebuild_file_1,
@@ -5858,8 +6994,7 @@ def render_tab_excel_sync():
 
         st.session_state["last_sync_time"] = datetime.now().strftime("%d/%m/%Y %H:%M")
         st.success(f"✅ DB reconstruite ({inserted} lignes)")
-        st.cache_data.clear()
-        st.rerun()
+
 
 
 # ============================================================
@@ -5867,86 +7002,267 @@ def render_tab_excel_sync():
 # ============================================================
 
 def render_tab_admin_transferts():
+    import pandas as pd
+    import streamlit as st
+    from datetime import date, datetime, timedelta
+
     st.subheader("📦 Tous les transferts — vue admin")
 
-    # ✅ 4 variables pour 4 onglets
-    tab_transferts, tab_excel, tab_heures, tab_mail = st.tabs([
-        "📋 Transferts / SMS",
-        "🟡 À reporter dans Excel",
-        "⏱️ Calcul d’heures",
-        "📥 Mail → Navette",
-    ])
+    # ✅ 5 onglets
+    tab_transferts, tab_excel, tab_heures, tab_mail, tab_urgences = st.tabs(
+        [
+            "📋 Transferts / SMS",
+            "🟡 À reporter dans Excel",
+            "⏱️ Calcul d’heures",
+            "📥 Mail → Navette",
+            "🚨 Urgences",
+        ]
+    )
 
+    # ------------------------------------------------------
+    # Helpers dates -> ISO (évite 0 lignes)
+    # ------------------------------------------------------
+    def _to_iso(d):
+        if isinstance(d, (datetime, date)):
+            return d.strftime("%Y-%m-%d")
+        s = str(d or "").strip()
+        if not s:
+            return ""
+        try:
+            dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
+            if pd.isna(dt):
+                return s
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            return s
     # ======================================================
-    # 📥 ONGLET MAIL → NAVETTE
+    # 📥 ONGLET MAIL → NAVETTE (PRO – AUTO / MÉTIER)
     # ======================================================
     with tab_mail:
         st.subheader("📥 Mail → Navette")
-        st.caption("Copie-colle un mail client, vérifie, puis ajoute au planning.")
-
-        raw_mail = st.text_area(
-            "📋 Mail du client",
-            height=260,
-            placeholder=(
-                "Bonjour,\n"
-                "Transfert le 12/02/2026\n"
-                "Départ à 04h30 de 4000 Liège\n"
-                "Destination Zaventem\n"
-                "2 personnes\n"
-                "Vol SN1234 à 07h10"
-            ),
+        st.caption(
+            "Colle une demande → pré-création automatique → ajustement → validation."
         )
 
-        if st.button("🧠 Analyser le mail"):
-            from utils import parse_mail_to_navette
-            st.session_state.mail_parsed = parse_mail_to_navette(raw_mail)
+        consume_soft_refresh("admin_tab_mail")
+
+        # ================= OPTIONS =================
+        col_opt1, col_opt2, col_opt3 = st.columns([1, 1, 2])
+        with col_opt1:
+            urgence_mode = st.checkbox("🚨 Mode urgence", value=False, key="mail_urgence_mode")
+        with col_opt2:
+            notify_now = st.checkbox("🔔 Notifier chauffeur", value=False, key="mail_notify_now")
+        with col_opt3:
+            auto_retour = st.checkbox("🔁 Créer retour automatiquement", value=True, key="mail_auto_retour")
+
+        raw_mail = st.text_area(
+            "📋 Mail / message client",
+            height=260,
+            key="mail_raw_input",
+        )
+
+        # ================= HELPERS =================
+        import re
+        from datetime import date
+
+        def _normalize_time_txt(s):
+            s = str(s or "").upper().replace(":", "H")
+            m = re.search(r"(\d{1,2})\s*H\s*(\d{2})?", s)
+            if not m:
+                return ""
+            return f"{int(m.group(1)):02d}:{int(m.group(2) or 0):02d}"
+
+        def _parse_sens_from_text(txt):
+            t = (txt or "").upper()
+            if "EX " in t or "ARRIV" in t:
+                return "DE"
+            if "DEVRA ETRE A" in t or "POUR" in t or "DEPART" in t:
+                return "VERS"
+            if "RETOUR" in t or "ALLER-RETOUR" in t or "A/R" in t:
+                return "A/R"
+            return ""
+
+        def _flex_parse_mail(text):
+            lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+            year = date.today().year
+            rows = []
+            buf = {
+                "DATE":"", "HEURE":"", "DESIGNATION":"", "Unnamed: 8":"",
+                "NOM":"", "ADRESSE":"", "CP":"", "Localité":"",
+                "Tél":"", "N° Vol":"", "Origine":"", "REMARQUE":""
+            }
+
+            def flush():
+                if any(buf.get(k) for k in ["DATE","HEURE","DESIGNATION","ADRESSE","Tél"]):
+                    rows.append(dict(buf))
+
+            for l in lines:
+                m = re.search(r"(\d{1,2})[/-](\d{1,2})", l)
+                if m:
+                    flush()
+                    buf = dict(buf)
+                    buf["DATE"] = f"{year:04d}-{int(m.group(2)):02d}-{int(m.group(1)):02d}"
+                    buf["HEURE"] = ""
+                    continue
+
+                sens = _parse_sens_from_text(l)
+                if sens:
+                    buf["Unnamed: 8"] = sens
+
+                ht = _normalize_time_txt(l)
+                if ht:
+                    buf["HEURE"] = ht
+
+                m = re.search(r"(\+?\d[\d\s]{7,})", l)
+                if m:
+                    buf["Tél"] = re.sub(r"\D", "", m.group(1))
+
+                if any(k in l.upper() for k in ["ZAV","BRU","CRL","CHARLEROI","LUX"]):
+                    buf["DESIGNATION"] = l.upper()
+
+                if "–" in l or "-" in l:
+                    p = re.split(r"\s+[–-]\s+", l)
+                    if len(p) == 2:
+                        buf["ADRESSE"] = p[0]
+                        m = re.search(r"(\d{4})\s+(.+)", p[1])
+                        if m:
+                            buf["CP"], buf["Localité"] = m.group(1), m.group(2)
+
+            flush()
+            return rows
+
+        # ================= ACTIONS =================
+        colA, colB = st.columns(2)
+        with colA:
+            if st.button("🧠 Analyser"):
+                try:
+                    parsed = parse_mail_to_navette_v2_cached(raw_mail) or {}
+                    rows = parsed.get("ROWS") or []
+                except Exception:
+                    rows = []
+
+                if not rows:
+                    rows = _flex_parse_mail(raw_mail)
+
+                if not rows:
+                    rows = [{"REMARQUE": raw_mail[:200]}]
+
+                st.session_state.mail_parsed = {"ROWS": rows}
+
+        with colB:
+            if st.button("🧹 Réinitialiser"):
+                st.session_state.pop("mail_parsed", None)
 
         parsed = st.session_state.get("mail_parsed")
 
+        # ================= ÉDITION =================
         if parsed:
-            st.markdown("### ✏️ Vérification / correction")
+            df = pd.DataFrame(parsed["ROWS"]).fillna("")
 
-            col1, col2 = st.columns(2)
+            planning_cols = [
+                "DATE","HEURE","CH","IMMAT","PAX","Reh","Siège",
+                "Unnamed: 8","DESIGNATION",
+                "NOM","ADRESSE","CP","Localité","Tél",
+                "Type Nav","PAIEMENT","KM","H TVA","TTC",
+                "REMARQUE","DEMANDEUR","IMPUTATION"
+            ]
 
-            with col1:
-                date_val = st.text_input("📆 Date", parsed.get("DATE", ""))
-                heure_val = st.text_input("⏱ Heure", parsed.get("HEURE", ""))
-                pax_val = st.number_input(
-                    "👥 Pax",
-                    min_value=1,
-                    max_value=8,
-                    value=int(parsed.get("PAX", 1)),
-                )
+            for c in planning_cols:
+                if c not in df.columns:
+                    df[c] = ""
 
-            with col2:
-                dest_val = st.text_input(
-                    "🎯 Destination",
-                    parsed.get("DESTINATION", ""),
-                )
-                vol_val = st.text_input("✈️ Vol", parsed.get("VOL", ""))
+            df = df[planning_cols]
 
-            adr_val = st.text_area("📍 Adresse", parsed.get("ADRESSE", ""))
-            nom_val = st.text_input("🙂 Nom client")
-            rem_val = st.text_area("📝 Remarques")
+            # 🔁 RETOUR AUTO
+            if auto_retour and len(df) == 1:
+                s = df.iloc[0]["Unnamed: 8"]
+                if s in ("A/R","DE","VERS"):
+                    r2 = df.iloc[0].to_dict()
+                    r2["DATE"], r2["HEURE"] = "", ""
+                    r2["Unnamed: 8"] = "DE" if s == "VERS" else "VERS"
+                    r2["REMARQUE"] += " | RETOUR auto"
+                    df = pd.concat([df, pd.DataFrame([r2])], ignore_index=True)
 
-            if st.button("✅ Ajouter au planning"):
-                from database import insert_planning_row_from_mail
+            # 🟡 GROUPAGE SIMPLE
+            if len(df) > 1:
+                for i in range(len(df)):
+                    for j in range(i+1, len(df)):
+                        if (
+                            df.at[i,"DATE"] == df.at[j,"DATE"]
+                            and df.at[i,"CP"] == df.at[j,"CP"]
+                        ):
+                            df.at[i,"REMARQUE"] += " | GROUPAGE AUTO"
+                            df.at[j,"REMARQUE"] += " | GROUPAGE AUTO"
 
-                insert_planning_row_from_mail({
-                    "DATE": date_val,
-                    "HEURE": heure_val,
-                    "DESIGNATION": dest_val,
-                    "ADRESSE": adr_val,
-                    "NOM": nom_val,
-                    "PAX": pax_val,
-                    "VOL": vol_val,
-                    "REMARQUE": rem_val,
-                })
+            # 🧠 AUTO-REMPLISSAGE DB
+            from database import find_similar_transfer_in_db
+            for i in range(len(df)):
+                sim = find_similar_transfer_in_db(df.iloc[i].to_dict()) or {}
+                if sim.get("_SIMILAR_INFO"):
+                    st.success(f"🧠 Trajet reconnu : {sim['_SIMILAR_INFO']}")
+                for k in ["KM","H TVA","TTC","PAIEMENT","Type Nav","DEMANDEUR","IMPUTATION"]:
+                    if not df.at[i,k]:
+                        df.at[i,k] = sim.get(k,"")
 
-                st.success("✅ Navette ajoutée au planning")
-                st.cache_data.clear()
-                st.session_state.mail_parsed = None
-                st.rerun()
+            # 🚨 URGENT FLAG
+            if urgence_mode:
+                df["REMARQUE"] = df["REMARQUE"] + " | URGENT"
+
+            # 🎨 PRÉVISUALISATION COULEUR
+            def _row_style(r):
+                if "GROUPAGE AUTO" in r.get("REMARQUE",""):
+                    return ["background-color:#FFF3CD"]*len(r)
+                if "URGENT" in r.get("REMARQUE",""):
+                    return ["background-color:#F8D7DA"]*len(r)
+                return [""]*len(r)
+
+            st.markdown("### ✏️ Prévisualisation planning")
+            st.dataframe(df.style.apply(_row_style, axis=1), use_container_width=True)
+
+            df_edit = st.data_editor(df, use_container_width=True, hide_index=True)
+
+            # ================= LIGNES COPIABLES =================
+            def build_planning_lines(df_edit):
+                cols_excel = [
+                    "DATE","HEURE","CH","IMMAT","PAX","Reh","Siège",
+                    "", "DESIGNATION",
+                    "NOM","ADRESSE","CP","Localité","Tél",
+                    "Type Nav","PAIEMENT","KM","H TVA","TTC",
+                    "REMARQUE","DEMANDEUR","IMPUTATION"
+                ]
+
+                def getv(r,c):
+                    if c == "":
+                        return ""
+                    if c == "AL-GL":
+                        return r.get("Unnamed: 8","")
+                    return r.get(c,"")
+
+                lines = []
+                for _, r in df_edit.iterrows():
+                    lines.append("\t".join(str(getv(r,c) or "") for c in cols_excel))
+                return "\n".join(lines)
+
+            tsv_lines = build_planning_lines(df_edit)
+
+            st.markdown("### 📋 Lignes planning prêtes à coller")
+            st.code(tsv_lines, language="tsv")
+            st.caption("Utilise l’icône 📋 pour copier")
+
+            # ================= VALIDATION =================
+            if st.button("✅ Valider et envoyer"):
+                payload = df_edit.fillna("").to_dict(orient="records")
+                for r in payload:
+                    r["_URGENT"] = bool(urgence_mode)
+                    r["_NOTIFY"] = bool(notify_now)
+
+                from database import insert_planning_rows_from_table
+                insert_planning_rows_from_table(payload, ignore_conflict=True)
+
+                request_soft_refresh("planning", clear_cache=True, mute_autosync_sec=10)
+                request_soft_refresh("admin_tab_mail")
+                st.success("✅ Navette(s) ajoutée(s)")
+
 
 
 
@@ -5956,8 +7272,8 @@ def render_tab_admin_transferts():
     with tab_excel:
         st.subheader("🟡 Modifications à reporter dans Excel (Feuil1)")
 
-        from database import list_pending_actions
-        import pandas as pd
+        from database import list_pending_actions, mark_actions_done
+        from utils import update_excel_rows_by_row_key
 
         actions = list_pending_actions(limit=300)
 
@@ -5965,57 +7281,71 @@ def render_tab_admin_transferts():
             st.success("✅ Aucune modification en attente. Excel et l’application sont alignés.")
         else:
             rows = []
-            for (
-                action_id,
-                row_key,
-                action_type,
-                old_value,
-                new_value,
-                user,
-                created_at,
-            ) in actions:
-                rows.append({
-                    "Type": action_type,
-                    "Avant": old_value,
-                    "Après": new_value,
-                    "Modifié par": user,
-                    "Date / heure": created_at,
-                })
+            for (action_id, row_key, action_type, old_value, new_value, user, created_at) in actions:
+                rows.append(
+                    {
+                        "Type": action_type,
+                        "Avant": old_value,
+                        "Après": new_value,
+                        "Modifié par": user,
+                        "Date / heure": created_at,
+                        "row_key": row_key,
+                        "action_id": action_id,
+                    }
+                )
 
             df_actions = pd.DataFrame(rows)
+            st.info("Modifs faites dans l’app mais pas encore reportées dans Excel (Feuil1).")
+            st.dataframe(df_actions.drop(columns=["row_key", "action_id"], errors="ignore"), width="stretch", hide_index=True)
 
-            st.info(
-                "Ces modifications ont été faites dans l’application "
-                "mais ne sont pas encore reportées dans Excel (Feuil1)."
-            )
+            st.markdown("### 📤 Envoyer ces modifications vers Excel")
 
-            st.dataframe(df_actions, use_container_width=True, hide_index=True)
+            if st.button("📤 Envoyer vers Excel maintenant", type="primary"):
+                try:
+                    updates = {}
+                    action_ids = []
+
+                    for (action_id, row_key, action_type, old_value, new_value, user, created_at) in actions:
+                        if action_type != "CH_CHANGE":
+                            continue
+                        if not row_key:
+                            continue
+                        updates.setdefault(row_key, {})
+                        updates[row_key]["CH"] = new_value
+                        action_ids.append(action_id)
+
+                    if not updates:
+                        st.warning("Aucune modification 'CH_CHANGE' à envoyer.")
+                    else:
+                        updated_count = update_excel_rows_by_row_key(updates)
+                        mark_actions_done(action_ids)
+                        st.success(f"✅ Excel mis à jour ({updated_count} ligne(s))")
+                        st.cache_data.clear()
+                        st.rerun()
+
+                except Exception as e:
+                    st.error(f"Erreur en envoyant vers Excel : {e}")
 
     # ======================================================
-    # 📋 ONGLET TRANSFERTS / SMS
+    # 📋 ONGLET TRANSFERTS / SMS  ✅ FIX (dates ISO + WhatsApp client)
     # ======================================================
     with tab_transferts:
-
         today = date.today()
         start_60j = today - timedelta(days=60)
 
         col1, col2 = st.columns(2)
         with col1:
-            start_date = st.date_input(
-                "Date de début",
-                value=start_60j,
-                key="admin_start_date",
-            )
+            start_date = st.date_input("Date de début", value=start_60j, key="admin_start_date")
         with col2:
-            end_date = st.date_input(
-                "Date de fin",
-                value=today,
-                key="admin_end_date",
-            )
+            end_date = st.date_input("Date de fin", value=today, key="admin_end_date")
 
+        start_iso = _to_iso(start_date)
+        end_iso = _to_iso(end_date)
+
+        # ✅ charge FULL (puis fallback si ton get_planning ne supporte pas source="full")
         df = get_planning(
-            start_date=start_date,
-            end_date=end_date,
+            start_date=start_iso,
+            end_date=end_iso,
             chauffeur=None,
             type_filter=None,
             search="",
@@ -6023,12 +7353,22 @@ def render_tab_admin_transferts():
             source="full",
         )
 
-        if not df.empty and "DATE" in df.columns:
-            df["DATE"] = pd.to_datetime(
-                df["DATE"],
-                dayfirst=True,
-                errors="coerce"
-            ).dt.date
+        # fallback “safe”
+        if df is None or df.empty:
+            df = get_planning(
+                start_date=start_iso,
+                end_date=end_iso,
+                chauffeur=None,
+                type_filter=None,
+                search="",
+                max_rows=5000,
+                source="7j",
+            )
+
+        if df is None:
+            df = pd.DataFrame()
+
+        st.caption(f"DEBUG admin transferts — lignes chargées : {len(df)}")
 
         try:
             df = apply_actions_overrides(df)
@@ -6037,54 +7377,169 @@ def render_tab_admin_transferts():
 
         if df.empty:
             st.warning("Aucun transfert pour cette période.")
-            return
+        else:
+            # 🔽 filtres
+            col3, col4, col5 = st.columns(3)
+            with col3:
+                bdc_prefix = st.text_input("Filtrer par Num BDC", "", key="admin_bdc_prefix")
+            with col4:
+                paiement_filter = st.text_input("Filtrer par paiement", "", key="admin_paiement_filter")
+            with col5:
+                ch_filter = st.text_input("Filtrer par chauffeur", "", key="admin_ch_filter")
 
-        # 🔽 Filtres
-        col3, col4, col5 = st.columns(3)
-        with col3:
-            bdc_prefix = st.text_input("Filtrer par Num BDC", "", key="admin_bdc_prefix")
-        with col4:
-            paiement_filter = st.text_input("Filtrer par paiement", "", key="admin_paiement_filter")
-        with col5:
-            ch_filter = st.text_input("Filtrer par chauffeur", "", key="admin_ch_filter")
+            if bdc_prefix.strip() and "Num BDC" in df.columns:
+                df = df[df["Num BDC"].astype(str).str.upper().str.startswith(bdc_prefix.upper())]
 
-        if bdc_prefix.strip() and "Num BDC" in df.columns:
-            df = df[df["Num BDC"].astype(str).str.upper().str.startswith(bdc_prefix.upper())]
+            if paiement_filter.strip() and "PAIEMENT" in df.columns:
+                df = df[df["PAIEMENT"].astype(str).str.upper().str.contains(paiement_filter.upper(), na=False)]
 
-        if paiement_filter.strip() and "PAIEMENT" in df.columns:
-            df = df[df["PAIEMENT"].astype(str).str.upper().str.contains(paiement_filter.upper())]
+            if ch_filter.strip() and "CH" in df.columns:
+                df = df[df["CH"].astype(str).str.upper() == ch_filter.upper()]
 
-        if ch_filter.strip() and "CH" in df.columns:
-            df = df[df["CH"].astype(str).str.upper() == ch_filter.upper()]
+            if df.empty:
+                st.warning("Aucun transfert après filtres.")
+            else:
+                sort_mode = st.radio("Tri", ["DATE + HEURE", "CH + DATE + HEURE"], horizontal=True)
 
-        if df.empty:
-            st.warning("Aucun transfert après filtres.")
-            return
+                sort_cols = []
+                if sort_mode == "CH + DATE + HEURE" and "CH" in df.columns:
+                    sort_cols.append("CH")
+                for c in ["DATE", "HEURE"]:
+                    if c in df.columns:
+                        sort_cols.append(c)
 
-        sort_mode = st.radio(
-            "Tri",
-            ["DATE + HEURE", "CH + DATE + HEURE"],
-            horizontal=True,
-        )
+                if sort_cols:
+                    try:
+                        df = df.sort_values(sort_cols)
+                    except Exception:
+                        pass
 
-        sort_cols = []
-        if sort_mode == "CH + DATE + HEURE":
-            sort_cols.append("CH")
-        sort_cols += ["DATE", "HEURE"]
+                # ✅ Badges
+                if "Badges" not in df.columns:
+                    try:
+                        df["Badges"] = df.apply(navette_badges, axis=1)
+                    except Exception:
+                        df["Badges"] = ""
 
-        df = df.sort_values(sort_cols)
+                # ✅ WhatsApp client (remis)
+                def _clean_gsm(x: str) -> str:
+                    s = str(x or "").strip()
+                    s = s.replace(" ", "").replace("/", "").replace(".", "").replace("-", "")
+                    s = s.replace("+", "")
+                    if s.startswith("00"):
+                        s = s[2:]
+                    return s
 
-        if "Badges" not in df.columns:
-            df["Badges"] = df.apply(navette_badges, axis=1)
+                def _wa_link(gsm: str, msg: str) -> str:
+                    gsm2 = _clean_gsm(gsm)
+                    if not gsm2:
+                        return ""
+                    try:
+                        return build_whatsapp_link(gsm2, msg)
+                    except Exception:
+                        return f"https://wa.me/{gsm2}"
 
-        df_display = df.copy()
-        st.dataframe(df_display, use_container_width=True, height=500)
+                gsm_col = None
+                for c in ["Tél", "TEL", "GSM", "Tel", "Téléphone"]:
+                    if c in df.columns:
+                        gsm_col = c
+                        break
+
+                if gsm_col:
+                    # message simple client
+                    def _mk_msg(r):
+                        d = str(r.get("DATE", "") or "")
+                        h = str(r.get("HEURE", "") or "")
+                        dest = str(r.get("DESIGNATION", "") or r.get("Unnamed: 8", "") or "")
+                        nom = str(r.get("NOM", "") or "")
+                        return (
+                            f"Bonjour {nom},\n"
+                            f"Votre transfert est bien noté.\n"
+                            f"📆 {d} à {h}\n"
+                            f"🚐 Destination : {dest}\n"
+                            f"Merci, Airports Lines"
+                        )
+
+                    df = df.copy()
+                    df["WA client"] = df.apply(
+                        lambda r: _wa_link(r.get(gsm_col, ""), _mk_msg(r)),
+                        axis=1,
+                    )
+
+                # affichage : on garde les liens cliquables via st.data_editor (link column)
+                if "WA client" in df.columns:
+                    st.data_editor(
+                        df,
+                        width="stretch",
+                        hide_index=True,
+                        disabled=True,
+                        column_config={
+                            "WA client": st.column_config.LinkColumn("💬 WA client"),
+                        },
+                        height=520,
+                    )
+                else:
+                    st.dataframe(df, width="stretch", height=520)
+
+    # ======================================================
+    # 🚨 ONGLET URGENCES (✅ déplacé ici)
+    # ======================================================
+    with tab_urgences:
+        st.subheader("🚨 Urgences — actions rapides")
+
+        # Charge DB (safe)
+        with get_connection() as conn:
+            urgence_df = pd.read_sql_query(
+                """
+                SELECT *
+                FROM planning
+                ORDER BY DATE_ISO, HEURE
+                """,
+                conn,
+            )
+
+        # Filtrage urgences
+        if urgence_df is not None and not urgence_df.empty:
+            adm = urgence_df.get("ADM", pd.Series([""])).fillna("").astype(str).str.upper()
+            rem = urgence_df.get("REMARQUE", pd.Series([""])).fillna("").astype(str).str.upper()
+
+            urgence_df = urgence_df[(adm.eq("URGENT")) | (rem.str.contains("URGENCE", na=False))]
+
+        if urgence_df is None or urgence_df.empty:
+            st.success("✅ Aucune urgence en cours")
+        else:
+            for _, rep in urgence_df.iterrows():
+                rid = rep.get("id")
+                st.markdown(
+                    f"**Urgence #{rid}** — {rep.get('DATE', '')} {rep.get('HEURE', '')} — {rep.get('CH', '')}"
+                )
+
+                gsm = rep.get("Tél") or rep.get("TEL") or ""
+                if gsm:
+                    wa_link = f"https://wa.me/{str(gsm).replace(' ', '').replace('/', '').replace('+','')}"
+                    st.markdown(f"[💬 WhatsApp chauffeur]({wa_link})")
+
+                pdf_path = rep.get("PDF_PATH")
+                if pdf_path:
+                    try:
+                        with open(pdf_path, "rb") as f:
+                            st.download_button(
+                                f"📄 PDF mission (#{rid})",
+                                data=f,
+                                file_name=f"MISSION_URGENTE_{rid}.pdf",
+                                mime="application/pdf",
+                                key=f"dl_urg_pdf_{rid}",
+                            )
+                    except Exception:
+                        st.warning("⚠️ PDF introuvable")
 
     # ======================================================
     # ⏱️ ONGLET CALCUL D’HEURES
     # ======================================================
     with tab_heures:
         render_tab_calcul_heures()
+
+
 # ============================================================
 # ⏱️ HELPERS RÈGLES HEURES (OBLIGATOIRES)
 # ============================================================
@@ -6208,7 +7663,7 @@ def render_tab_confirmation_chauffeur():
         df = get_planning(
             start_date=start_date,
             end_date=None,
-            source="7j",
+            source="full",
         )
 
         if df is None or df.empty:
@@ -6466,7 +7921,7 @@ def _match_rule_minutes(rules_norm, ch, sens, dest):
     Règles :
     - ch : 'NP', 'NP*', '*', 'ALL'
     - sens : 'VERS', 'DE', '*'
-    - dest : texte EXACT contenu dans la destination (ex: BRU, ZAVENTEM, CDG), ou '*'
+    - dest : texte contenu dans la destination (BRU, ZAVENTEM, CDG), ou '*'
     - la première règle la plus spécifique qui matche gagne
     """
 
@@ -6504,32 +7959,30 @@ def _match_rule_minutes(rules_norm, ch, sens, dest):
                 continue
 
         # -----------------------------
-        # Destination (MATCH TEXTE EXACT / PARTIEL)
+        # Destination
         # -----------------------------
         rule_dest = str(rule.get("dest_contains", "")).strip().upper()
-
         if rule_dest not in ("", "*"):
             if rule_dest not in dest:
                 continue
 
         # -----------------------------
-        # MATCH OK → minutes
+        # ✅ MATCH OK → minutes NORMALISÉES
         # -----------------------------
-        minutes = int(rule.get("minutes", 0))
+        minutes = int(rule.get("minutes_norm", 0) or 0)
         return minutes
 
-    # Aucune règle trouvée
     return 0
 
-# ============================================================
-# ⏱️ CALCUL D’HEURES + CAISSE
-# ============================================================
-
-from database import init_time_rules_table
-init_time_rules_table()
 
 def render_tab_calcul_heures():
-    st.subheader("⏱️ Calcul d’heures")
+    import pandas as pd
+    import streamlit as st
+    from datetime import date, timedelta, datetime
+    from io import BytesIO
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import cm
+    from reportlab.pdfgen import canvas
 
     from database import (
         get_time_rules_df,
@@ -6537,42 +7990,36 @@ def render_tab_calcul_heures():
         _detect_sens_dest_from_row,
         _minutes_to_hhmm,
         split_chauffeurs,
+        get_last_caisse_paid_dates,
         init_time_adjustments_table,
         get_time_adjustments_df,
         insert_time_adjustment,
+        get_connection,
     )
+
+    st.subheader("⏱️ Calcul d’heures")
 
     tab_calc, tab_rules, tab_caisse = st.tabs([
         "📊 Heures (60 jours)",
         "⚙️ Règles (éditables)",
         "💶 Caisse non rentrée (60j)",
     ])
+
     # ======================================================
-    # 📊 HEURES — PÉRIODE AU CHOIX
+    # 📊 HEURES
     # ======================================================
     with tab_calc:
-        st.markdown("### 📊 Heures chauffeurs")
-
         today = date.today()
 
         mode = st.radio(
             "📅 Période",
             ["Mois complet", "Période personnalisée"],
             horizontal=True,
-            key="hrs_mode",
         )
 
         if mode == "Mois complet":
-            mois = st.selectbox(
-                "Mois",
-                list(range(1, 13)),
-                index=today.month - 1,
-            )
-            annee = st.selectbox(
-                "Année",
-                list(range(2026, today.year + 1)),
-                index=list(range(2026, today.year + 1)).index(today.year),
-            )
+            mois = st.selectbox("Mois", list(range(1, 13)), index=today.month - 1)
+            annee = st.selectbox("Année", list(range(2026, today.year + 1)), index=len(list(range(2026, today.year + 1))) - 1)
 
             d1 = date(annee, mois, 1)
             d2 = (
@@ -6581,35 +8028,42 @@ def render_tab_calcul_heures():
                 else date(annee, mois + 1, 1) - timedelta(days=1)
             )
         else:
-            colA, colB = st.columns(2)
-            with colA:
-                d1 = st.date_input("Du", today.replace(day=1))
-            with colB:
+            c1, c2 = st.columns(2)
+            with c1:
+                d1 = st.date_input("Du", date(2026, 1, 1))
+            with c2:
                 d2 = st.date_input("Au", today)
 
         if d1 > d2:
             st.error("La date de début est après la date de fin.")
             return
-        df_hours = get_planning(
-            start_date=d1,
-            end_date=d2,
-            source="full",
-            max_rows=20000,
-        )
 
-        if df_hours is None or df_hours.empty:
+        # 🔒 LECTURE STRICTE TABLE planning (ANTI EXPLOSION)
+        with get_connection() as conn:
+            df_hours = pd.read_sql_query(
+                """
+                SELECT *
+                FROM planning
+                WHERE
+                    COALESCE(IS_INDISPO,0) = 0
+                    AND COALESCE(IS_SUPERSEDED,0) = 0
+                    AND DATE_ISO >= ?
+                    AND DATE_ISO <= ?
+                ORDER BY DATE_ISO, HEURE
+                """,
+                conn,
+                params=(d1.isoformat(), d2.isoformat()),
+            )
+
+        if df_hours.empty:
             st.info("Aucune navette sur cette période.")
             return
 
-        df_hours = df_hours.copy()
-
-        if "IS_INDISPO" in df_hours.columns:
-            df_hours = df_hours[
-                df_hours["IS_INDISPO"]
-                .fillna(0)
-                .astype(int)
-                .eq(0)
-            ]
+        # Anti-doublons
+        if "row_key" in df_hours.columns:
+            df_hours = df_hours.drop_duplicates(subset=["row_key"])
+        elif "id" in df_hours.columns:
+            df_hours = df_hours.drop_duplicates(subset=["id"])
 
         # Chauffeurs
         df_hours["CH_LIST"] = (
@@ -6622,9 +8076,7 @@ def render_tab_calcul_heures():
 
         # Sens / destination
         df_hours[["SENS", "DEST"]] = df_hours.apply(
-            lambda r: pd.Series(
-                _detect_sens_dest_from_row(r.to_dict())
-            ),
+            lambda r: pd.Series(_detect_sens_dest_from_row(r.to_dict())),
             axis=1,
         )
 
@@ -6632,26 +8084,44 @@ def render_tab_calcul_heures():
 
         totals = {}
         rows_not_matched = []
+        debug_rows = []
 
         for _, r in df_hours.iterrows():
+
+            ch_list = r.get("CH_LIST") or []
+            if not ch_list:
+                continue
+
+            ch_main = str(ch_list[0]).strip().upper()
+            if not ch_main:
+                continue
+
             minutes = _match_rule_minutes(
                 rules_norm,
-                r["CH"],
-                r["SENS"],
-                r["DEST"],
+                ch_main,
+                r.get("SENS"),
+                r.get("DEST"),
             )
+
+            debug_rows.append({
+                "DATE": r.get("DATE_ISO"),
+                "CH": ch_main,
+                "SENS": r.get("SENS"),
+                "DEST": r.get("DEST"),
+                "MINUTES": minutes,
+            })
 
             if minutes <= 0:
                 rows_not_matched.append({
-                    "Date": r["DATE"],
-                    "CH": r["CH"],
-                    "Sens": r["SENS"],
-                    "Destination": r["DEST"],
+                    "DATE": r.get("DATE_ISO"),
+                    "CH": ch_main,
+                    "SENS": r.get("SENS"),
+                    "DEST": r.get("DEST"),
                 })
                 continue
 
-            for ch in r["CH_LIST"]:
-                totals[ch] = totals.get(ch, 0) + minutes
+            totals[ch_main] = totals.get(ch_main, 0) + minutes
+
         if totals:
             df_tot = pd.DataFrame([
                 {
@@ -6663,6 +8133,44 @@ def render_tab_calcul_heures():
 
             st.markdown("#### ✅ Heures calculées")
             st.dataframe(df_tot, use_container_width=True, hide_index=True)
+
+        if rows_not_matched:
+            st.markdown("#### ⚠️ Navettes sans règle")
+            st.dataframe(pd.DataFrame(rows_not_matched), use_container_width=True, hide_index=True)
+
+        # ================= DEBUG =================
+        with st.expander("🧪 Debug calcul heures", expanded=False):
+            df_dbg = pd.DataFrame(debug_rows)
+
+            st.caption(f"Navettes analysées : {len(df_dbg)}")
+            st.caption(f"Minutes totales : {df_dbg['MINUTES'].sum()}")
+
+            st.markdown("🔴 Top 10 navettes les plus lourdes")
+            st.dataframe(
+                df_dbg.sort_values("MINUTES", ascending=False).head(10),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.markdown("⚠️ Navettes à 0 minute")
+            st.dataframe(
+                df_dbg[df_dbg["MINUTES"] == 0].head(20),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+
+            # 📤 Export paie (CSV)
+            try:
+                csv_tot = df_tot.to_csv(index=False, sep=";", encoding="utf-8")
+                st.download_button(
+                    "📤 Télécharger heures chauffeurs (CSV)",
+                    data=csv_tot,
+                    file_name=f"heures_chauffeurs_{d1.strftime('%Y%m%d')}_{d2.strftime('%Y%m%d')}.csv",
+                    mime="text/csv",
+                )
+            except Exception:
+                pass
 
         if rows_not_matched:
             st.markdown("#### ⚠️ Navettes non calculées (ajouter des règles)")
@@ -6747,6 +8255,56 @@ def render_tab_calcul_heures():
 
             st.markdown("#### ✅ Total final (avec ajustements)")
             st.dataframe(df_final, use_container_width=True, hide_index=True)
+
+            # 📄 Export PDF
+            def _hours_pdf_bytes(df_pdf: pd.DataFrame, d1_local: date, d2_local: date) -> bytes:
+                buf = BytesIO()
+                c = canvas.Canvas(buf, pagesize=A4)
+                w, h = A4
+                x = 2 * cm
+                y = h - 2 * cm
+                c.setFont("Helvetica-Bold", 14)
+                c.drawString(x, y, "Heures chauffeurs")
+                y -= 0.8 * cm
+                c.setFont("Helvetica", 10)
+                c.drawString(x, y, f"Période : {d1_local.strftime('%d/%m/%Y')} → {d2_local.strftime('%d/%m/%Y')}")
+                y -= 1.0 * cm
+
+                c.setFont("Helvetica-Bold", 10)
+                cols = ["Chauffeur", "Heures calculées", "Ajustement", "Heures finales"]
+                col_w = [4*cm, 4*cm, 4*cm, 4*cm]
+                for i, col in enumerate(cols):
+                    c.drawString(x + sum(col_w[:i]), y, col)
+                y -= 0.5 * cm
+                c.setFont("Helvetica", 10)
+
+                for _, rr in df_pdf.iterrows():
+                    if y < 2.2 * cm:
+                        c.showPage()
+                        y = h - 2 * cm
+                        c.setFont("Helvetica-Bold", 10)
+                        for i, col in enumerate(cols):
+                            c.drawString(x + sum(col_w[:i]), y, col)
+                        y -= 0.5 * cm
+                        c.setFont("Helvetica", 10)
+
+                    c.drawString(x + 0, y, str(rr.get("Chauffeur", "")))
+                    c.drawString(x + col_w[0], y, str(rr.get("Heures calculées", "")))
+                    c.drawString(x + col_w[0] + col_w[1], y, str(rr.get("Ajustement", "")))
+                    c.drawString(x + col_w[0] + col_w[1] + col_w[2], y, str(rr.get("Heures finales", "")))
+                    y -= 0.45 * cm
+
+                c.save()
+                buf.seek(0)
+                return buf.read()
+
+            pdf_bytes = _hours_pdf_bytes(df_final, d1, d2)
+            st.download_button(
+                "📄 Export PDF heures chauffeurs",
+                data=pdf_bytes,
+                file_name=f"heures_chauffeurs_{d1.strftime('%Y%m%d')}_{d2.strftime('%Y%m%d')}.pdf",
+                mime="application/pdf",
+            )
     # ======================================================
     # ⚙️ RÈGLES (ÉDITABLES)
     # ======================================================
@@ -6772,11 +8330,33 @@ def render_tab_calcul_heures():
                 ]
             )
         else:
+            # 🔁 DB => UI
+            # DB: ch_base + is_star (0/1)  => UI: ch = "*" ou "FA" ou "FA*" si tu veux distinguer
             df_ui = pd.DataFrame()
-            df_ui["ch"] = df_rules["ch"]
-            df_ui["sens"] = df_rules["sens"]
-            df_ui["dest"] = df_rules["dest_contains"]
-            df_ui["heures"] = (df_rules["minutes"] / 60).astype(str)
+
+            if "ch_base" in df_rules.columns:
+                ch_base = df_rules["ch_base"].fillna("").astype(str).str.upper().str.strip()
+            else:
+                ch_base = pd.Series("", index=df_rules.index)
+
+            is_star = df_rules.get("is_star", 0)
+            try:
+                is_star = is_star.fillna(0).astype(int)
+            except Exception:
+                is_star = 0
+
+            # "*" = règle pour tous
+            df_ui["ch"] = [
+                "*" if (cb in ("", "*")) else (cb + "*" if int(star or 0) == 1 else cb)
+                for cb, star in zip(ch_base.tolist(), list(is_star))
+            ]
+
+            df_ui["sens"] = df_rules.get("sens", "*")
+            df_ui["dest"] = df_rules.get("dest_contains", "*")
+            df_ui["heures"] = (df_rules.get("minutes", 0).fillna(0).astype(float) / 60).astype(str)
+
+
+
 
         df_edit = st.data_editor(
             df_ui,
@@ -6803,10 +8383,42 @@ def render_tab_calcul_heures():
             },
         )
 
-        if st.button("💾 Sauvegarder les règles"):
-            save_time_rules_df(df_edit)
-            st.success("Règles sauvegardées ✅")
-            st.rerun()
+        from database import is_time_rules_locked, set_time_rules_locked, get_time_rules_audit_df
+
+        locked = is_time_rules_locked()
+        if locked:
+            st.warning("🔒 Règles verrouillées (modification désactivée)")
+        
+        # Boutons lock/unlock (admin)
+        if st.session_state.get('role') == 'admin':
+            c1, c2, c3 = st.columns([1,1,2])
+            with c1:
+                if st.button("🔒 Verrouiller", disabled=locked):
+                    set_time_rules_locked(True, user=st.session_state.get('username',''), details='UI')
+                    st.toast('Règles verrouillées', icon='🔒')
+                    st.rerun()
+            with c2:
+                if st.button("🔓 Déverrouiller", disabled=not locked):
+                    set_time_rules_locked(False, user=st.session_state.get('username',''), details='UI')
+                    st.toast('Règles déverrouillées', icon='🔓')
+                    st.rerun()
+            with c3:
+                st.caption("Le verrou empêche toute modification des règles.")
+
+        if st.button("💾 Sauvegarder les règles", disabled=locked):
+            try:
+                save_time_rules_df(df_edit, user=st.session_state.get('username',''))
+                st.success("Règles sauvegardées ✅")
+                st.rerun()
+            except PermissionError:
+                st.error("🔒 Règles verrouillées")
+
+        with st.expander("🧾 Historique (audit)", expanded=False):
+            try:
+                df_a = get_time_rules_audit_df(limit=30)
+                st.dataframe(df_a, use_container_width=True, hide_index=True)
+            except Exception:
+                st.info("Aucun audit disponible.")
 
 
 
@@ -6814,175 +8426,335 @@ def render_tab_calcul_heures():
     # ======================================================
     # 💶 CAISSE NON RENTRÉE — GESTION BUREAU
     # ======================================================
-    with tab_caisse:
-        st.markdown("### 💶 Caisse non rentrée (60 jours)")
+            # ======================================================
+        # 🗺️ ALIAS LIEUX / CLIENTS (JCO/JCC/GUIL/BRU/...)
+        # ======================================================
+        st.markdown("---")
+        st.markdown("### 🗺️ Alias lieux / clients (normalisation)")
 
-        today = date.today()
-        d1 = today - timedelta(days=60)
-        if d1 < date(2026, 1, 1):
-            d1 = date(2026, 1, 1)
-
-        # ----------------- Chauffeur -----------------
-        chs = get_chauffeurs_for_ui()
-        ch_filter = st.selectbox(
-            "👨‍✈️ Chauffeur",
-            ["(Tous)"] + chs,
-        )
-        if ch_filter == "(Tous)":
-            ch_filter = None
-
-        # ----------------- Lecture DB -----------------
-        df_cash = get_planning(
-            start_date=d1,
-            end_date=today,
-            chauffeur=ch_filter,
-            source="full",
-            max_rows=15000,
-        )
-
-        if df_cash is None or df_cash.empty:
-            st.info("Aucune donnée caisse.")
-            return
-
-        # ----------------- Nettoyage -----------------
-        df_cash = df_cash.copy()
-
-        # Exclure indispos
-        df_cash = df_cash[
-            ~df_cash.apply(
-                lambda r: is_indispo_row(r, df_cash.columns),
-                axis=1,
+        try:
+            from database import get_location_aliases_df, save_location_aliases_df
+            df_alias = get_location_aliases_df()
+            df_alias_edit = st.data_editor(
+                df_alias,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="dynamic",
+                column_config={
+                    "code": st.column_config.TextColumn("Code (ex: BRU)"),
+                    "label": st.column_config.TextColumn("Libellé (ex: Zaventem)"),
+                },
+                key="alias_editor",
             )
-        ]
-
-        # Paiement caisse uniquement
-        df_cash = df_cash[
-            df_cash["PAIEMENT"]
-            .fillna("")
-            .astype(str)
-            .str.lower()
-            .eq("caisse")
-        ]
-
-        # Montant > 0
-        df_cash["Caisse"] = (
-            df_cash.get(
-                "Caisse",
-                pd.Series(0, index=df_cash.index),
-            )
-            .pipe(pd.to_numeric, errors="coerce")
-            .fillna(0)
-        )
-
-        df_cash = df_cash[df_cash["Caisse"] > 0]
-
-        # Non payées uniquement
-        if "CAISSE_PAYEE" in df_cash.columns:
-            df_cash = df_cash[df_cash["CAISSE_PAYEE"] == 0]
-
-        if df_cash.empty:
-            st.success("✅ Aucune caisse à rentrer")
-            return
-
-        # ==================================================
-        # 📋 TABLE ÉDITABLE
-        # ==================================================
-        df_out = df_cash[
-            [
-                "id",
-                "DATE",
-                "CH",
-                "NOM",
-                "Caisse",
-            ]
-        ].copy()
-
-        df_out.rename(
-            columns={
-                "NOM": "Client",
-                "Caisse": "Montant €",
-            },
-            inplace=True,
-        )
-
-        df_out["Valider"] = False
-
-        edited = st.data_editor(
-            df_out,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Valider": st.column_config.CheckboxColumn("Payé"),
-            },
-        )
-
-        total_due = float(edited["Montant €"].sum())
-        st.metric("💶 Total à rentrer", f"{total_due:.2f} €")
-
-        # ==================================================
-        # 📝 COMMENTAIRE
-        # ==================================================
-        comment = st.text_input(
-            "📝 Commentaire (ex : finalement paiement bancontact)",
-            "",
-        )
-
-        # ==================================================
-        # ✅ VALIDATION
-        # ==================================================
-        colv1, colv2 = st.columns(2)
-
-        with colv1:
-            if st.button("✅ Valider la sélection"):
-                ids = edited[edited["Valider"] == True]["id"].tolist()
-
-                if not ids:
-                    st.warning("Aucune ligne sélectionnée.")
-                else:
-                    with get_connection() as conn:
-                        for rid in ids:
-                            conn.execute(
-                                """
-                                UPDATE planning
-                                SET CAISSE_PAYEE = 1,
-                                    CAISSE_PAYEE_AT = ?,
-                                    CAISSE_COMMENT = ?
-                                WHERE id = ?
-                                """,
-                                (
-                                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                    comment or "Validé manuellement",
-                                    int(rid),
-                                ),
-                            )
-                        conn.commit()
-
-                    st.success("Caisse validée ✅")
-                    st.rerun()
-
-        with colv2:
-            if ch_filter and st.button("✅ Tout valider pour ce chauffeur"):
-                with get_connection() as conn:
-                    conn.execute(
-                        """
-                        UPDATE planning
-                        SET CAISSE_PAYEE = 1,
-                            CAISSE_PAYEE_AT = ?,
-                            CAISSE_COMMENT = ?
-                        WHERE CH LIKE ?
-                          AND PAIEMENT = 'caisse'
-                          AND CAISSE_PAYEE = 0
-                        """,
-                        (
-                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            comment or "Validé globalement",
-                            f"{ch_filter}%",
-                        ),
-                    )
-                    conn.commit()
-
-                st.success(f"Toute la caisse de {ch_filter} est validée ✅")
+            if st.button("💾 Sauvegarder les alias", key="save_aliases"):
+                save_location_aliases_df(df_alias_edit)
+                st.success("✅ Alias sauvegardés")
+                st.cache_data.clear()
                 st.rerun()
+        except Exception as e:
+            st.error(f"Erreur alias: {e}")
+
+        # ======================================================
+        # 🧠 MÉMOIRE PRIX & DEMANDEUR (mail → navette)
+        # ======================================================
+        st.markdown("---")
+        st.markdown("### 🧠 Mémoire (prix / demandeur)")
+        colM1, colM2 = st.columns(2)
+
+        with colM1:
+                st.markdown("#### 💶 Prix mémorisés")
+                try:
+                        from database import init_price_memory_table
+                        init_price_memory_table()
+                        with get_connection() as conn:
+                                df_pm = pd.read_sql(
+                                        """
+                                        SELECT dest_code, sens, nom_key, paiement,
+                                               prix_ttc, prix_htva, updated_at
+                                        FROM price_memory
+                                        ORDER BY updated_at DESC
+                                        LIMIT 200
+                                        """,
+                                        conn,
+                                )
+                        st.dataframe(df_pm, use_container_width=True, hide_index=True)
+                except Exception:
+                        st.info("Aucun prix mémorisé ou erreur lecture.")
+
+        with colM2:
+                st.markdown("#### 👤 Demandeurs mémorisés")
+                try:
+                        from database import init_requester_memory_table
+                        init_requester_memory_table()
+                        with get_connection() as conn:
+                                df_rm = pd.read_sql(
+                                        """
+                                        SELECT demandeur, societe, tva, bdc,
+                                               imputation, updated_at
+                                        FROM requester_memory
+                                        ORDER BY updated_at DESC
+                                        LIMIT 200
+                                        """,
+                                        conn,
+                                )
+                        st.dataframe(df_rm, use_container_width=True, hide_index=True)
+                except Exception:
+                        st.info("Aucun demandeur mémorisé ou erreur lecture.")
+
+        # ======================================================
+        # 💶 ONGLET CAISSE
+        # ======================================================
+        with tab_caisse:
+                st.markdown("### 💶 Caisse non rentrée (60 jours)")
+                consume_soft_refresh("caisse")
+
+                render_excel_modified_indicator()
+
+                if st.button("🔄 Rafraîchir la caisse depuis Excel"):
+                        request_soft_refresh("caisse")
+
+                # ----------------- Période -----------------
+                today = date.today()
+                d1 = today - timedelta(days=60)
+                if d1 < date(2026, 1, 1):
+                        d1 = date(2026, 1, 1)
+
+                # ----------------- Chauffeur -----------------
+                chs = get_chauffeurs_for_ui()
+                ch_filter = st.selectbox(
+                        "👨‍✈️ Chauffeur",
+                        ["(Tous)"] + chs,
+                )
+                if ch_filter == "(Tous)":
+                        ch_filter = None
+
+                # ==================================================
+                # 🔒 LECTURE DB DIRECTE (PAS get_planning)
+                # ==================================================
+                with get_connection() as conn:
+                        df_cash = pd.read_sql_query(
+                                """
+                                SELECT *
+                                FROM planning
+                                WHERE
+                                        COALESCE(IS_INDISPO,0) = 0
+                                        AND COALESCE(IS_SUPERSEDED,0) = 0
+                                        AND LOWER(COALESCE(PAIEMENT,'')) = 'caisse'
+                                        AND DATE_ISO >= ?
+                                        AND DATE_ISO <= ?
+                                ORDER BY DATE_ISO, HEURE
+                                """,
+                                conn,
+                                params=(d1.isoformat(), today.isoformat()),
+                        )
+
+
+                # ==================================================
+                # 📊 RÉCAP PAR CHAUFFEUR (comme la vue chauffeur)
+                # ==================================================
+                if not df_cash.empty:
+                        df_cash2 = df_cash.copy()
+                        df_cash2["Caisse"] = pd.to_numeric(df_cash2.get("Caisse", 0), errors="coerce").fillna(0.0)
+                        if "CAISSE_PAYEE" in df_cash2.columns:
+                                df_cash2 = df_cash2[df_cash2["CAISSE_PAYEE"].fillna(0).astype(int).eq(0)]
+                        recap = (
+                                df_cash2.groupby(df_cash2["CH"].fillna("").astype(str).str.strip().str.upper())["Caisse"]
+                                .sum()
+                                .reset_index()
+                                .rename(columns={"CH": "Chauffeur", "Caisse": "Caisse due (€)"})
+                                .sort_values("Caisse due (€)", ascending=False)
+                        )
+                        recap = recap[recap["Chauffeur"] != ""]
+                        if not recap.empty:
+                                st.markdown("#### 💶 Caisse due par chauffeur (60 jours)")
+                                st.dataframe(recap, use_container_width=True, height=220)
+
+                # DEBUG
+                if not df_cash.empty:
+                        st.caption(
+                                f"DEBUG caisse — lignes chargées : {len(df_cash)} | "
+                                f"date min = {df_cash['DATE_ISO'].min()} | "
+                                f"date max = {df_cash['DATE_ISO'].max()}"
+                        )
+
+                if df_cash is None or df_cash.empty:
+                        st.success("✅ Aucune caisse à rentrer")
+                        st.stop()
+
+                df_cash = df_cash.copy()
+
+                # ----------------- Filtre chauffeur -----------------
+                if ch_filter and "CH" in df_cash.columns:
+                        ch_norm = normalize_ch_code(ch_filter)
+                        df_cash = df_cash[
+                                df_cash["CH"]
+                                .fillna("")
+                                .astype(str)
+                                .str.upper()
+                                .str.replace("*", "", regex=False)
+                                .str.replace(" ", "", regex=False)
+                                .str.startswith(ch_norm)
+                        ]
+
+                if df_cash.empty:
+                        st.success("✅ Aucune caisse à rentrer")
+                        st.stop()
+
+                # ----------------- Montant > 0 -----------------
+                df_cash["Caisse"] = (
+                        df_cash.get("Caisse", pd.Series(0, index=df_cash.index))
+                        .pipe(pd.to_numeric, errors="coerce")
+                        .fillna(0)
+                )
+                df_cash = df_cash[df_cash["Caisse"] > 0]
+
+                if df_cash.empty:
+                        st.success("✅ Aucune caisse à rentrer")
+                        st.stop()
+
+                # ----------------- Dernière caisse payée -----------------
+                try:
+                        last_paid = get_last_caisse_paid_dates(ch_filter)
+                except Exception:
+                        last_paid = {}
+
+                if last_paid:
+                        df_cash["_date_iso"] = pd.to_datetime(df_cash["DATE_ISO"], errors="coerce")
+
+                        def _after_last_paid(row):
+                                ch_norm = normalize_ch_code(str(row.get("CH", "")))
+                                lp = last_paid.get(ch_norm)
+                                if not lp:
+                                        return True
+                                try:
+                                        return row["_date_iso"].date() > datetime.fromisoformat(lp).date()
+                                except Exception:
+                                        return True
+
+                        df_cash = df_cash[df_cash.apply(_after_last_paid, axis=1)]
+                        df_cash = df_cash.drop(columns=["_date_iso"], errors="ignore")
+
+                # ----------------- Non payées uniquement -----------------
+                if "CAISSE_PAYEE" in df_cash.columns:
+                        df_cash = df_cash[df_cash["CAISSE_PAYEE"].fillna(0).astype(int) == 0]
+
+                if df_cash.empty:
+                        st.success("✅ Aucune caisse à rentrer")
+                        st.stop()
+
+                # ==================================================
+                # 📋 TABLE ÉDITABLE
+                # ==================================================
+                df_out = df_cash[["id", "DATE", "CH", "NOM", "Caisse"]].copy()
+
+                df_out.rename(
+                        columns={
+                                "NOM": "Client",
+                                "Caisse": "Montant €",
+                        },
+                        inplace=True,
+                )
+
+                df_out["Valider"] = False
+
+                edited = st.data_editor(
+                        df_out,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                                "Valider": st.column_config.CheckboxColumn("Payé"),
+                        },
+                )
+
+                total_due = float(edited["Montant €"].sum())
+                st.metric("💶 Total à rentrer", f"{total_due:.2f} €")
+
+                # ==================================================
+                # 📝 COMMENTAIRE
+                # ==================================================
+                comment = st.text_input(
+                        "📝 Commentaire (ex : finalement paiement bancontact)",
+                        "",
+                )
+
+                # ==================================================
+                # ✅ VALIDATION
+                # ==================================================
+                colv1, colv2 = st.columns(2)
+
+                with colv1:
+                        if st.button("✅ Valider la sélection"):
+                                ids = edited[edited["Valider"] == True]["id"].tolist()
+
+                                if not ids:
+                                        st.warning("Aucune ligne sélectionnée.")
+                                else:
+                                        now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                        for rid in ids:
+                                                apply_row_update(
+                                                        int(rid),
+                                                        {
+                                                                "CAISSE_PAYEE": 1,
+                                                                "CAISSE_PAYEE_AT": now_iso,
+                                                                "CAISSE_COMMENT": comment or "Validé manuellement",
+                                                        },
+                                                        lock_row=True,
+                                                        touch_is_new=True,
+                                                )
+
+                                        # 📤 Export DB -> Excel (sans conflit) : uniquement la sélection
+                                        try:
+                                                export_db_changes_to_excel_dropbox(row_ids=[int(x) for x in ids])
+                                        except Exception:
+                                                pass
+
+                                        st.success("Caisse validée ✅")
+                                        request_soft_refresh("caisse")
+
+
+                with colv2:
+                        if ch_filter and st.button("✅ Tout valider pour ce chauffeur"):
+                                ch_norm = normalize_ch_code(ch_filter)
+                                now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                                # IDs concernés (caisse non payée)
+                                with get_connection() as conn:
+                                        rows = conn.execute(
+                                                """
+                                                SELECT id
+                                                FROM planning
+                                                WHERE UPPER(REPLACE(REPLACE(CH,'*',''),' ','')) LIKE ?
+                                                  AND LOWER(COALESCE(PAIEMENT,'')) = 'caisse'
+                                                  AND COALESCE(CAISSE_PAYEE,0) = 0
+                                                  AND DATE_ISO >= ?
+                                                """,
+                                                (f"{ch_norm}%", d1.isoformat()),
+                                        ).fetchall()
+
+                                ids2 = [int(r[0]) for r in rows] if rows else []
+
+                                if not ids2:
+                                        st.info("Aucune ligne à valider pour ce chauffeur.")
+                                else:
+                                        for rid in ids2:
+                                                apply_row_update(
+                                                        rid,
+                                                        {
+                                                                "CAISSE_PAYEE": 1,
+                                                                "CAISSE_PAYEE_AT": now_iso,
+                                                                "CAISSE_COMMENT": comment or "Validé globalement",
+                                                        },
+                                                        lock_row=True,
+                                                        touch_is_new=True,
+                                                )
+
+                                        try:
+                                                export_db_changes_to_excel_dropbox(row_ids=ids2)
+                                        except Exception:
+                                                pass
+
+                                        st.success(f"Toute la caisse de {ch_filter} est validée ✅")
+                                        request_soft_refresh("caisse")
 
 
 
@@ -7100,6 +8872,12 @@ def main():
     init_session_state()
     init_db_once()
     init_all_db_once()
+    # 🔄 DEBUG rerun
+    if "RUN_COUNTER" not in st.session_state:
+        st.session_state.RUN_COUNTER = 0
+
+    st.session_state.RUN_COUNTER += 1
+    debug_print(f"🔄 MAIN RUN COUNT = {st.session_state.RUN_COUNTER}")
 
     # ======================================
     # 2️⃣ LOGIN
@@ -7115,7 +8893,7 @@ def main():
     role = st.session_state.role
 
     # 🔄 Synchro silencieuse (uniquement si Excel modifié)
-    auto_sync_planning_if_needed()
+    # auto_sync_planning_if_needed()  # ⛔ DISABLED DEBUG
 
     # ====================== ADMIN ===========================
     if role == "admin":
