@@ -44,6 +44,7 @@ from database import mark_navette_confirmed
 from database import ensure_ack_columns
 from pathlib import Path
 
+import uuid
 import streamlit.components.v1 as components
 import math
 import smtplib
@@ -343,7 +344,27 @@ CH_CODES = [
     "OM", "AD", "CB", "CF", "CM", "EM", "GE", "HM", "JF", "KM", "LILLO",
     "MF", "WS", "PO"
 ]
+# ============================================================
+# 🔐 SESSION PERSISTANTE (COOKIE)
+# ============================================================
+import uuid
+import streamlit.components.v1 as components
 
+def set_login_cookie(token: str):
+    components.html(
+        f"""
+        <script>
+        document.cookie = "al_session={token}; path=/; max-age=28800";
+        </script>
+        """,
+        height=0,
+    )
+
+def get_login_cookie():
+    try:
+        return st.query_params.get("al_session")
+    except Exception:
+        return None
 # ============================================================
 #   LOGIN SCREEN
 # ============================================================
@@ -365,13 +386,15 @@ def login_screen():
         user = USERS.get(login)
 
         if user and user["password"] == pwd:
+            token = str(uuid.uuid4())
+
             st.session_state.logged_in = True
             st.session_state.username = login
-            st.session_state.role = user["role"]
-            st.session_state.chauffeur_code = user.get("chauffeur_code")
+            st.session_state.role = user['role']
+            st.session_state.chauffeur_code = user.get('chauffeur_code')
+            st.session_state.session_token = token
 
-            # 🧠 uniquement en mémoire
-            st.session_state["login_time"] = datetime.now()
+            set_login_cookie(token)
 
             st.success(f"Connecté en tant que **{login}** – rôle : {user['role']}")
             st.rerun()
@@ -379,11 +402,6 @@ def login_screen():
             st.error("Identifiants incorrects.")
 
 
-    st.caption(
-        "Admins : fab/fab, oli/oli — "
-        "Utilisateur restreint : leon/leon — "
-        "Chauffeur (GSM) : gg/gg, fa/fa, np/np"
-    )
 
 FLIGHT_ALERT_DELAY_MIN = 30  # seuil d’alerte retard (modifiable)
 
@@ -628,6 +646,10 @@ import requests
 import streamlit as st
 
 DROPBOX_FILE_PATH = "/Goldenlines/Planning 2026.xlsx"
+
+# 🔗 Lien public Dropbox (édition Excel Online)
+PLANNING_ONLINE_URL = "https://www.dropbox.com/scl/fi/3s712xzr85tijl3mcw5sy/Planning-2022.xlsx?rlkey=6zl8px1zzjz6lhcp9dutz25n3&st=sqs73z3s&dl=0"
+
 
 import os
 import requests
@@ -880,7 +902,16 @@ def export_db_changes_to_excel_dropbox(row_ids: list[int] | None = None) -> bool
         pass
 
     return bool(ok)
-
+def _extract_flight_number(text: str) -> str:
+    """
+    Extrait un numéro de vol type KL1703, QR193, SN1234
+    """
+    if not text:
+        return ""
+    m = re.search(r"\b([A-Z]{2}\s?\d{3,4})\b", text.upper())
+    if m:
+        return m.group(1).replace(" ", "")
+    return ""
 # ============================================================
 #   DB — COLONNES FLAGS COULEURS (AUTO)
 # ============================================================
@@ -1115,230 +1146,8 @@ def count_pending_confirmations():
     return int(df["ACK_AT"].notna().sum())
 
 
-def render_tab_confirmation_chauffeur():
-    st.subheader("✅ Confirmation chauffeur")
-    st.caption("Vue par chauffeur — réponses et validations")
 
-    # 🔁 rerun contrôlé (UNE fois)
-    if st.session_state.pop("force_reload_confirm", False):
-        pass
-
-    df = get_planning(source="7j")
-
-    if df is None or df.empty:
-        st.info("Aucune navette à afficher.")
-        return
-
-    # Navettes actives uniquement
-    df = df[
-        (df["IS_INDISPO"] == 0)
-        & (df["CONFIRMED"] != 1)
-    ].copy()
-
-    if df.empty:
-        st.success("🎉 Toutes les navettes sont confirmées.")
-        return
-
-    # ===================================================
-    # 🔧 Normalisation chauffeur
-    # ===================================================
-    df["CH_ROOT"] = df["CH"].apply(normalize_ch_code)
-
-    # ===================================================
-    # 👨‍✈️ Vue par chauffeur
-    # ===================================================
-    for ch_root, df_ch in df.groupby("CH_ROOT"):
-
-        has_reply = df_ch["ACK_AT"].notna().any()
-        has_problem = df_ch["ACK_TEXT"].fillna("").str.contains(
-            "problème|probleme|retard|impossible|⚠️",
-            case=False,
-            regex=True,
-        ).any()
-
-        if has_problem:
-            badge = "🔴"
-        elif has_reply:
-            badge = "🟠"
-        else:
-            badge = "🟡"
-
-        title = f"{badge} Chauffeur {ch_root} — {len(df_ch)} navette(s)"
-
-        with st.expander(title, expanded=has_reply or has_problem):
-
-            if has_problem:
-                st.error("🚨 Problème signalé par le chauffeur — vérification requise")
-
-            # --------------------------------------------------
-            # 🟢 Confirmation globale
-            # --------------------------------------------------
-            if has_reply and not has_problem:
-                if st.button(
-                    f"🟢 Tout confirmer pour {ch_root}",
-                    key=f"confirm_all_{ch_root}",
-                ):
-                    now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                    for _, r in df_ch.iterrows():
-                        update_planning_row(
-                            r["id"],
-                            {
-                                "CONFIRMED": 1,
-                                "CONFIRMED_AT": now_iso,
-                            },
-                        )
-
-                        with get_connection() as conn:
-                            conn.execute(
-                                """
-                                INSERT INTO planning_audit
-                                (ts, user, action, row_key, details)
-                                VALUES (?, ?, ?, ?, ?)
-                                """,
-                                (
-                                    now_iso,
-                                    st.session_state.get("username"),
-                                    "CONFIRM_OK_GLOBAL",
-                                    r.get("row_key"),
-                                    f"CH={ch_root}",
-                                ),
-                            )
-                            conn.commit()
-
-                    st.toast(f"🟢 Toutes les navettes de {ch_root} confirmées", icon="✅")
-                    st.session_state["force_reload_confirm"] = True
-                    st.rerun()
-
-            st.markdown("---")
-
-            # --------------------------------------------------
-            # 🚖 Navettes
-            # --------------------------------------------------
-            for _, row in df_ch.sort_values(by=["DATE_ISO", "HEURE"]).iterrows():
-
-                adresse = build_full_address_from_row(row)
-
-                st.markdown(
-                    f"""
-                    **📅 {row.get('DATE')} ⏰ {row.get('HEURE')}**  
-                    👤 **Client :** {row.get('NOM','')}  
-                    🏠 **Adresse :** {adresse if adresse else "—"}
-                    """
-                )
-
-                # ------------------------------
-                # Réponse chauffeur
-                # ------------------------------
-                ack_txt = row.get("ACK_TEXT")
-                ack_at = row.get("ACK_AT")
-
-                if ack_at:
-                    st.caption(f"🕒 Réponse reçue le {ack_at}")
-
-                if ack_txt:
-                    if any(k in ack_txt.lower() for k in ["problème", "probleme", "⚠️", "retard"]):
-                        st.error(ack_txt)
-                    else:
-                        st.info(ack_txt)
-                else:
-                    st.warning("⏳ Pas encore de réponse chauffeur")
-
-                # ------------------------------
-                # 💬 Réponse admin → chauffeur
-                # ------------------------------
-                st.markdown("**💬 Réponse admin**")
-                admin_key = f"admin_reply_{row['id']}"
-
-                admin_reply = st.text_area(
-                    "Message au chauffeur",
-                    value=st.session_state.get(admin_key, row.get("ADMIN_REPLY") or ""),
-                    key=admin_key,
-                    height=80,
-                    placeholder="Ex : OK merci / Peux-tu me rappeler ?",
-                )
-
-                if st.button("📤 Envoyer au chauffeur", key=f"send_{row['id']}"):
-                    if not admin_reply.strip():
-                        st.warning("Message vide.")
-                    else:
-                        now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                        update_planning_row(
-                            row["id"],
-                            {
-                                "ADMIN_REPLY": admin_reply.strip(),
-                                "ADMIN_REPLY_AT": now_iso,
-                                "ADMIN_REPLY_READ": 0,
-                            },
-                        )
-
-                        # 🔒 Persistance UI
-                        st.session_state[admin_key] = admin_reply.strip()
-
-                        with get_connection() as conn:
-                            conn.execute(
-                                """
-                                INSERT INTO planning_audit
-                                (ts, user, action, row_key, details)
-                                VALUES (?, ?, ?, ?, ?)
-                                """,
-                                (
-                                    now_iso,
-                                    st.session_state.get("username"),
-                                    "ADMIN_REPLY",
-                                    row.get("row_key"),
-                                    admin_reply.strip()[:200],
-                                ),
-                            )
-                            conn.commit()
-
-                        st.toast("💬 Message envoyé", icon="📨")
-                        st.session_state["force_reload_confirm"] = True
-                        st.rerun()
-
-                # ------------------------------
-                # Confirmation navette
-                # ------------------------------
-                col_ok, col_ko = st.columns(2)
-
-                with col_ok:
-                    if st.button("✅ Confirmer cette navette", key=f"ok_{row['id']}"):
-                        update_planning_row(
-                            row["id"],
-                            {
-                                "CONFIRMED": 1,
-                                "CONFIRMED_AT": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            },
-                        )
-
-                        with get_connection() as conn:
-                            conn.execute(
-                                """
-                                INSERT INTO planning_audit
-                                (ts, user, action, row_key, details)
-                                VALUES (?, ?, ?, ?, ?)
-                                """,
-                                (
-                                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                    st.session_state.get("username"),
-                                    "CONFIRM_OK",
-                                    row.get("row_key"),
-                                    f"CH={ch_root}",
-                                ),
-                            )
-                            conn.commit()
-
-                        st.toast("🟢 Navette confirmée", icon="✅")
-                        st.session_state["force_reload_confirm"] = True
-                        st.rerun()
-
-                with col_ko:
-                    st.button("❌ Laisser en attente", key=f"ko_{row['id']}")
-
-                st.markdown("---")
-
-
+# (render_tab_confirmation_chauffeur supprimé: doublon)
 
 
 def format_navette_ack(row, ch_selected, trajet, probleme):
@@ -1514,7 +1323,7 @@ def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = Tru
         print(f"⚠️ ensure ROW_KEY Excel failed: {e}", flush=True)
 
 
-    from datetime import date, datetime
+    from datetime import date, datetime, timedelta
     import pandas as pd
     import re
 
@@ -1679,9 +1488,11 @@ def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = Tru
         )
     else:
         df_excel["_HEURE_FIN"] = ""
-
-    if "CH" in df_excel.columns:
-        df_excel["CH"] = df_excel["CH"].astype(str).str.strip()
+    try:
+        if "CH" in df_excel.columns:
+            df_excel["CH"] = df_excel["CH"].astype(str).str.strip()
+    except Exception:
+        pass
     # ======================================================
     # 4️⃣ BIS — INTERPRÉTATION ROBUSTE DE ²²²² (STATUT vs HEURE_FIN)
     # ======================================================
@@ -1919,13 +1730,32 @@ def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = Tru
     # 👉 même les confirmées sont remplacées si modifiées
     # ======================================================
 
+    # ✅ Sécurise DATE_ISO (sinon le reset ne touche rien si DB ancienne)
+    try:
+        from database import ensure_date_iso_populated
+        ensure_date_iso_populated()
+    except Exception:
+        pass
+
+    # ======================================================
+    # 9️⃣ RESET COMPLET DES NAVETTES À PARTIR D’AUJOURD’HUI
+    # 👉 Excel = SOURCE DE VÉRITÉ
+    # 👉 filtre date robuste (DATE_ISO ou DATE dd/mm)
+    # ======================================================
     with get_connection() as conn:
         conn.execute(
-            """
+            '''
             DELETE FROM planning
-            WHERE DATE_ISO >= ?
+            WHERE date(
+                CASE
+                    WHEN COALESCE(DATE_ISO,'') != '' THEN DATE_ISO
+                    WHEN LENGTH(DATE) = 10 AND substr(DATE,3,1)='/' THEN
+                        substr(DATE,7,4)||'-'||substr(DATE,4,2)||'-'||substr(DATE,1,2)
+                    ELSE DATE
+                END
+            ) >= date(?)
               AND (LOCKED_BY_APP IS NULL OR LOCKED_BY_APP=0)
-            """,
+            ''',
             (today_iso,),
         )
         conn.commit()
@@ -2018,12 +1848,27 @@ def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = Tru
             values = [data[c] for c in cols_ins]
 
             try:
-                cur.execute(
-                    f"INSERT OR IGNORE INTO planning ({col_sql}) VALUES ({placeholders})",
-                    values,
-                )
-                if cur.rowcount and cur.rowcount > 0:
-                    inserts += 1
+                # ✅ UPSERT SAFE : met à jour si row_key existe, sinon insère
+                cur.execute("SELECT id FROM planning WHERE row_key = ?", (rk,))
+                existing = cur.fetchone()
+
+                if existing:
+                    # UPDATE (sans toucher row_key)
+                    cols_up = [c for c in cols_ins if c != "row_key"]
+                    if cols_up:
+                        set_sql = ", ".join([f'"{c}" = ?' for c in cols_up])
+                        vals_up = [data[c] for c in cols_up] + [rk]
+                        cur.execute(
+                            f"UPDATE planning SET {set_sql} WHERE row_key = ?",
+                            vals_up,
+                        )
+                else:
+                    cur.execute(
+                        f"INSERT INTO planning ({col_sql}) VALUES ({placeholders})",
+                        values,
+                    )
+                    if cur.rowcount and cur.rowcount > 0:
+                        inserts += 1
             except Exception:
                 pass
 
@@ -2373,7 +2218,7 @@ AVIATIONSTACK_KEY = "e5cb6733f9d69693e880c982795ba27d"
 import requests
 import streamlit as st
 
-@st.cache_data
+@st.cache_data(ttl=600, show_spinner=False)
 def get_flight_status_cached(flight_number: str):
     """
     Retourne TOUJOURS un tuple :
@@ -2424,6 +2269,61 @@ def get_flight_status_cached(flight_number: str):
 
     except Exception:
         return "", 0, None, None
+
+def _parse_ddmmyyyy_date(val):
+    try:
+        s = str(val or "").strip()
+        if not s:
+            return None
+        # support YYYY-MM-DD too
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+            return datetime.strptime(s, "%Y-%m-%d").date()
+        return datetime.strptime(s, "%d/%m/%Y").date()
+    except Exception:
+        return None
+
+def _parse_hhmm_time(val):
+    try:
+        t = normalize_time_string(val)
+        if not t:
+            return None
+        return datetime.strptime(t, "%H:%M").time()
+    except Exception:
+        return None
+
+def should_query_flight_status(row) -> bool:
+    """Limite les requêtes vol pour éviter de brûler l'API.
+    Règle : on vérifie surtout à partir de J-1 (24h avant) et jusqu'à quelques heures après.
+    """
+    try:
+        d = _parse_ddmmyyyy_date(row.get("DATE"))
+        if not d:
+            return False
+
+        # Time de vol prioritaire : Décollage (si présent), sinon H South, sinon heure navette
+        t = _parse_hhmm_time(row.get("Décollage")) or _parse_hhmm_time(row.get("H South")) or _parse_hhmm_time(row.get("HEURE"))
+        if t:
+            planned = datetime.combine(d, t)
+        else:
+            # pas d'heure → on fait simple : seulement si aujourd'hui / demain
+            planned = datetime.combine(d, datetime.min.time())
+
+        now = datetime.now()
+
+        # fenêtre : de 24h avant à +6h après
+        delta_h = (planned - now).total_seconds() / 3600.0
+
+        if -6 <= delta_h <= 24:
+            return True
+
+        # fallback : si DATE = aujourd'hui ou demain, on autorise
+        if d in {now.date(), (now.date() + timedelta(days=1))}:
+            return True
+
+        return False
+    except Exception:
+        return False
+
 
 # ============================================================
 #   MAPPING ABRÉVIATIONS CLIENTS / SITES
@@ -2752,29 +2652,46 @@ def normalize_time_string(val):
 
 def format_sens_ar(val: str) -> str:
     """
-    Normalise la colonne Unnamed: 8 :
-    - DE / VERS
-    - + A/R si présent
+    Normalise la colonne Unnamed: 8 SANS écraser un texte libre.
+
+    - Si la cellule contient UNIQUEMENT un sens (DE / VERS) et éventuellement A/R → on normalise.
+    - Si la cellule contient autre chose (ex: 'BUREAU', 'COURSE', 'RDV ...') → on renvoie le texte tel quel.
     """
-    if not val:
+    if val is None:
         return ""
 
-    txt = str(val).upper().strip()
+    raw = str(val).strip()
+    if not raw or raw.lower() == "nan":
+        return ""
 
-    has_ar = "A/R" in txt or txt.replace("/", "") == "AR"
+    txt = raw.upper().strip().replace("—", "-").replace("–", "-")
 
-    if "DE" in txt:
-        sens = "DE"
-    elif "VERS" in txt:
-        sens = "VERS"
-    else:
-        sens = ""
+    # Si ça ressemble à un "sens" simple, on normalise
+    # Exemples acceptés :
+    #   DE
+    #   VERS
+    #   A/R
+    #   DE A/R
+    #   VERS A/R
+    simple = txt.replace(" ", "")
+    simple = simple.replace("-", "")
+    if simple in {"DE", "VERS", "AR", "A/R", "DEA/R", "VERSA/R", "DEAR", "VERSAR"}:
+        has_ar = "A/R" in txt or txt.replace("/", "").replace(" ", "") == "AR" or "AR" == simple[-2:]
+        if "DE" in txt:
+            sens = "DE"
+        elif "VERS" in txt:
+            sens = "VERS"
+        else:
+            sens = ""
+        if has_ar and sens:
+            return f"{sens} – A/R"
+        if has_ar:
+            return "A/R"
+        return sens
 
-    if has_ar and sens:
-        return f"{sens} – A/R"
-    if has_ar:
-        return "A/R"
-    return sens
+    # Sinon : texte libre → on garde
+    return raw
+
 
 def build_printable_html_planning(df: pd.DataFrame, ch: str):
     html_table = df.to_html(index=False)
@@ -2910,6 +2827,7 @@ def is_indispo_row(row, columns):
 
 def print_html_popup(html: str):
     # Ouvre une nouvelle fenêtre et lance l'impression
+    html_safe = (html or "").replace("`", "\\`")
     popup = f"""
     <script>
       (function() {{
@@ -2919,7 +2837,7 @@ def print_html_popup(html: str):
           return;
         }}
         w.document.open();
-        w.document.write(`{html.replace("`", "\\`")}`);
+        w.document.write(`{html_safe}`);
         w.document.close();
         w.focus();
         setTimeout(function() {{
@@ -3150,10 +3068,13 @@ def build_planning_mail_body(
         vol = extract_vol_val(row, cols)
         if vol:
             lines.append(f"✈️ Vol {vol}")
-            status, delay_min, *_ = get_flight_status_cached(vol)
-            badge = flight_badge(status, delay_min)
-            if badge:
-                lines.append(f"📡 {badge}")
+            if should_query_flight_status(row):
+                status, delay_min, *_ = get_flight_status_cached(vol)
+                badge = flight_badge(status, delay_min)
+                if badge:
+                    lines.append(f"📡 {badge}")
+            else:
+                lines.append("📡 Statut vol : vérif J-1 / J")
 
         # ------------------
         # GO
@@ -3453,6 +3374,24 @@ def send_email_smtp(to_email: str, subject: str, body: str) -> bool:
     if not to_email:
         return False
 
+    try:
+        msg = MIMEText(body or "", "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = FROM_EMAIL
+        msg["To"] = to_email
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+
+        return True
+
+    except Exception as e:
+        st.error(f"Erreur en envoyant le mail à {to_email} : {e}")
+        return False
+
+
 def send_email_smtp_with_attachments(
     to_email: str,
     subject: str,
@@ -3491,25 +3430,10 @@ def send_email_smtp_with_attachments(
     except Exception as e:
         st.error(f"Erreur en envoyant le mail à {to_email} : {e}")
         return False
-    try:
-        msg = MIMEText(body, "plain", "utf-8")
-        msg["Subject"] = subject
-        msg["From"] = FROM_EMAIL
-        msg["To"] = to_email
-
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.send_message(msg)
-
-        return True
-
-    except Exception as e:
-        st.error(f"Erreur en envoyant le mail à {to_email} : {e}")
-        return False
 
 
 import urllib.parse
+
 
 def build_outlook_mailto(to, subject, body):
     subject = urllib.parse.quote(subject, safe="")
@@ -3555,18 +3479,215 @@ def logout():
     st.rerun()
 
 # ============================================================
+
+def _send_planning_next_3_days_to_all(*, want_pdf: bool = True) -> dict:
+    """
+    Envoie le planning des 3 prochains jours (J à J+2) à tous les chauffeurs actifs sur la période.
+    Retourne un petit récap {sent, skipped_empty, missing_email, errors}.
+    """
+    from datetime import date, timedelta
+
+    recap = {"sent": 0, "skipped_empty": 0, "missing_email": 0, "errors": 0}
+
+    # 🔐 sécurité: réservé admin
+    if st.session_state.get("role") != "admin":
+        st.warning("⛔ Envoi planning réservé au bureau (admin).")
+        return recap
+
+    today = date.today()
+    d_start = today
+    d_end = today + timedelta(days=2)
+
+    # init table log si dispo
+    try:
+        ensure_send_log_table()
+    except Exception:
+        pass
+
+    # chauffeurs actifs sur période (SQL direct comme l’onglet Bureau)
+    active_chauffeurs = set()
+    try:
+        with get_connection() as conn:
+            df_chcol = pd.read_sql_query(
+                """
+                SELECT CH
+                FROM planning
+                WHERE COALESCE(IS_INDISPO,0)=0
+                  AND COALESCE(IS_SUPERSEDED,0)=0
+                  AND DATE_ISO BETWEEN ? AND ?
+                  AND COALESCE(CH,'') <> ''
+                """,
+                conn,
+                params=(d_start.isoformat(), d_end.isoformat()),
+            )
+        if not df_chcol.empty:
+            for raw in df_chcol["CH"].dropna().astype(str):
+                for c in split_chauffeurs(raw):
+                    if c:
+                        active_chauffeurs.add(c)
+    except Exception:
+        active_chauffeurs = set()
+
+    chauffeurs = sorted(active_chauffeurs)
+    if not chauffeurs:
+        st.info("Aucun chauffeur trouvé sur les 3 prochains jours.")
+        return recap
+
+    periode_label = "3 prochains jours"
+    for ch in dict.fromkeys(chauffeurs):
+        try:
+            _tel, mail = get_chauffeur_contact(ch)
+            if not mail:
+                recap["missing_email"] += 1
+                try:
+                    log_send(ch, "MAIL", periode_label, "KO", "Email manquant")
+                except Exception:
+                    pass
+                continue
+
+            df_ch = get_chauffeur_planning(
+                chauffeur=ch,
+                from_date=d_start,
+                to_date=d_end,
+            )
+
+            if df_ch is None or df_ch.empty:
+                recap["skipped_empty"] += 1
+                try:
+                    log_send(ch, "MAIL", periode_label, "OK", "Aucune navette (pas d'envoi)")
+                except Exception:
+                    pass
+                continue
+
+            # corps mail (identique)
+            try:
+                body = build_planning_mail_body(
+                    df_ch=df_ch,
+                    ch=ch,
+                    from_date=d_start,
+                    to_date=d_end,
+                )
+            except Exception:
+                body = f"Planning {ch} — {periode_label}."
+
+            subject = f"[PLANNING] {ch} — {periode_label}"
+
+            if want_pdf:
+                planning_cols_driver = [
+                    "DATE","HEURE","CH","²²²²","IMMAT","PAX","Reh","Siège",
+                    "Unnamed: 8","DESIGNATION","H South","Décollage","N° Vol","Origine",
+                    "GO","Num BDC","NOM","ADRESSE","CP","Localité","Tél",
+                    "Type Nav","PAIEMENT","Caisse"
+                ]
+                df_table = df_ch.copy()
+                for c in planning_cols_driver:
+                    if c not in df_table.columns:
+                        df_table[c] = ""
+                df_table = df_table[planning_cols_driver]
+
+                # ✅ Affichage plage horaire (HEURE début + ²²²² = fin) quand ²²²² contient une vraie heure
+                def _looks_like_time_local(v):
+                    try:
+                        t = normalize_time_string(v)
+                        return t if t else ""
+                    except Exception:
+                        return ""
+
+                if "HEURE" in df_table.columns and "²²²²" in df_table.columns:
+                    h_deb = df_table["HEURE"].astype(str).map(lambda x: normalize_time_string(x) or str(x))
+                    h_fin = df_table["²²²²"].astype(str).map(_looks_like_time_local)
+
+                    # Si fin valide et différente → on affiche HEURE sous forme "HH:MM–HH:MM"
+                    df_table["HEURE"] = [
+                        (f"{a}–{b}" if (a and b and a != b) else a)
+                        for a, b in zip(h_deb, h_fin)
+                    ]
+
+                # ✅ IMPORTANT : on ne normalise PAS Unnamed: 8 ici (texte libre = on garde)
+
+
+                pdf_buf = export_chauffeur_planning_table_pdf(df_table, ch)
+                pdf_bytes = pdf_buf.getvalue() if hasattr(pdf_buf, "getvalue") else bytes(pdf_buf)
+
+                fname = f"Planning_{ch}_{d_start.isoformat()}_{d_end.isoformat()}.pdf"
+
+                ok = send_email_smtp_with_attachments(
+                    to_email=mail,
+                    subject=subject,
+                    body=body,
+                    attachments=[(fname, pdf_bytes, "pdf")],
+                )
+            else:
+                ok = send_email_smtp(
+                    to_email=mail,
+                    subject=subject,
+                    body=body,
+                )
+
+            if not ok:
+                raise RuntimeError("SMTP : envoi échoué")
+
+            recap["sent"] += 1
+            try:
+                log_send(ch, "MAIL", periode_label, "OK", "Envoyé")
+            except Exception:
+                pass
+
+        except Exception as e:
+            recap["errors"] += 1
+            try:
+                log_send(ch, "MAIL", periode_label, "KO", str(e))
+            except Exception:
+                pass
+
+    return recap
+
+
+def _topbar_sync_db_and_refresh(*, also_send_next3: bool = False):
+    """Bouton top-bar : MAJ DB depuis Dropbox puis rafraîchit l'UI.
+    Option: envoi aussi le planning des 3 prochains jours.
+    """
+    from datetime import datetime
+
+    try:
+        with st.spinner("🔄 Synchronisation Dropbox → DB…"):
+            # force un refresh même si Dropbox n’a pas changé : on passe un ts unique
+            try:
+                sync_planning_from_today(excel_sync_ts=datetime.now().isoformat(), ui=True)
+            except TypeError:
+                sync_planning_from_today(ui=True)
+
+        if also_send_next3:
+            with st.spinner("📧 Envoi planning (3 prochains jours)…"):
+                recap = _send_planning_next_3_days_to_all(want_pdf=True)
+                st.success(
+                    f"📧 Envoi terminé — envoyés: {recap['sent']} | vides: {recap['skipped_empty']} | emails manquants: {recap['missing_email']} | erreurs: {recap['errors']}"
+                )
+
+        # refresh UI
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        st.rerun()
+    except Exception as e:
+        st.error(f"❌ Erreur MAJ DB Dropbox: {e}")
+
 #   TOP BAR (INFORMATIONS UTILISATEUR + DECONNEXION)
 # ============================================================
 
+
 def render_top_bar():
-    col1, col2 = st.columns([5, 1])
+    # 4 colonnes : user | maj db | maj+envoi | déconnexion
+    col1, col2, col3, col4 = st.columns([5, 2, 2, 1])
+
+    role = st.session_state.get("role")
 
     # -------------------------------
     # 👤 Utilisateur connecté
     # -------------------------------
     with col1:
         user = st.session_state.get("username")
-        role = st.session_state.get("role")
 
         if user:
             if role == "admin":
@@ -3582,14 +3703,35 @@ def render_top_bar():
             st.markdown(f"👤 **{user}** — {label}")
 
     # -------------------------------
-    # 🔓 Déconnexion
+    # 🔄 MAJ DB Dropbox + Vue (ADMIN ONLY)
     # -------------------------------
     with col2:
-        if st.button("🔓 Déconnexion"):
+        if role == "admin":
+            if st.button("🔄 Maj DB (Dropbox) + vue", use_container_width=True, key="topbar_sync_db"):
+                _topbar_sync_db_and_refresh(also_send_next3=False)
+        else:
+            st.empty()
+
+    # -------------------------------
+    # 📧 MAJ + Envoi planning 3 jours (ADMIN ONLY, PDF joint)
+    # -------------------------------
+    with col3:
+        if role == "admin":
+            if st.button("📧 Maj + envoyer planning (3j)", use_container_width=True, key="topbar_sync_send_3j"):
+                _topbar_sync_db_and_refresh(also_send_next3=True)
+        else:
+            st.empty()
+
+    # -------------------------------
+    # 🔓 Déconnexion
+    # -------------------------------
+    with col4:
+        if st.button("🔓 Déconnexion", use_container_width=True, key="topbar_logout"):
             logout()
 
 
-# ============================================================
+#   STYLE PLANNING
+
 #   STYLE PLANNING — TOUTES LES COULEURS (FINAL SAFE)
 # ============================================================
 
@@ -3860,8 +4002,13 @@ def create_chauffeur_pdf(df_ch: pd.DataFrame, ch_selected: str, day_label: str) 
                     break
         
         if vol_val:
-            status, delay_min, sched_dt, est_dt = get_flight_status_cached(vol_val)
-            badge = flight_badge(status, delay_min)
+            if should_query_flight_status(row):
+                status, delay_min, sched_dt, est_dt = get_flight_status_cached(vol_val)
+                badge = flight_badge(status, delay_min)
+            else:
+                status, delay_min, sched_dt, est_dt = "", 0, None, None
+                badge = ""
+
 
 
 
@@ -7295,14 +7442,15 @@ def render_tab_admin_transferts():
 
     st.subheader("📦 Tous les transferts — vue admin")
 
-    # ✅ 5 onglets
-    tab_transferts, tab_excel, tab_heures, tab_mail, tab_urgences = st.tabs(
+    # ✅ 6 onglets
+    tab_transferts, tab_excel, tab_heures, tab_mail, tab_urgences, tab_whatsapp = st.tabs(
         [
             "📋 Transferts / SMS",
             "🟡 À reporter dans Excel",
             "⏱️ Calcul d’heures",
             "📥 Mail → Navette",
             "🚨 Urgences",
+            "💬 WhatsApp",
         ]
     )
 
@@ -7323,236 +7471,506 @@ def render_tab_admin_transferts():
         except Exception:
             return s
     # ======================================================
-    # 📥 ONGLET MAIL → NAVETTE (PRO – AUTO / MÉTIER)
+    # 📥 ONGLET MAIL → NAVETTE (ASSISTANT MÉTIER + PDF + APPRENTISSAGE)
     # ======================================================
-    with tab_mail:
-        st.subheader("📥 Mail → Navette")
-        st.caption(
-            "Colle une demande → pré-création automatique → ajustement → validation."
-        )
+    st.subheader("📥 Mail → Navette")
+    st.caption("Colle un mail / WhatsApp / texte PDF → propositions → tu corriges → tu valides (apprentissage).")
 
-        consume_soft_refresh("admin_tab_mail")
+    consume_soft_refresh("admin_tab_mail")
 
-        # ================= OPTIONS =================
-        col_opt1, col_opt2, col_opt3 = st.columns([1, 1, 2])
-        with col_opt1:
-            urgence_mode = st.checkbox("🚨 Mode urgence", value=False, key="mail_urgence_mode")
-        with col_opt2:
-            notify_now = st.checkbox("🔔 Notifier chauffeur", value=False, key="mail_notify_now")
-        with col_opt3:
-            auto_retour = st.checkbox("🔁 Créer retour automatiquement", value=True, key="mail_auto_retour")
+    # ================= OPTIONS =================
+    col_opt1, col_opt2, col_opt3, col_opt4 = st.columns([1, 1, 1, 2])
+    with col_opt1:
+        urgence_mode = st.checkbox("🚨 Mode urgence", value=False, key="mail_urgence_mode")
+    with col_opt2:
+        notify_now = st.checkbox("🔔 Notifier chauffeur", value=False, key="mail_notify_now")
+    with col_opt3:
+        add_retour = st.button("➕ Dupliquer / retour manuel", key="mail_add_retour")
+    with col_opt4:
+        learn_enabled = st.checkbox("🧠 Apprentissage activé", value=True, key="mail_learn_enabled")
 
-        raw_mail = st.text_area(
-            "📋 Mail / message client",
-            height=260,
-            key="mail_raw_input",
-        )
+    # ================= PDF =================
+    st.markdown("### 📎 Pièce jointe (optionnel)")
+    up = st.file_uploader("Dépose un PDF", type=["pdf"], key="mail_pdf_uploader")
 
-        # ================= HELPERS =================
-        import re
-        from datetime import date
+    import io
+    import re
+    from datetime import date, datetime
 
-        def _normalize_time_txt(s):
-            s = str(s or "").upper().replace(":", "H")
-            m = re.search(r"(\d{1,2})\s*H\s*(\d{2})?", s)
-            if not m:
-                return ""
-            return f"{int(m.group(1)):02d}:{int(m.group(2) or 0):02d}"
-
-        def _parse_sens_from_text(txt):
-            t = (txt or "").upper()
-            if "EX " in t or "ARRIV" in t:
-                return "DE"
-            if "DEVRA ETRE A" in t or "POUR" in t or "DEPART" in t:
-                return "VERS"
-            if "RETOUR" in t or "ALLER-RETOUR" in t or "A/R" in t:
-                return "A/R"
+    def _extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+        if not pdf_bytes:
+            return ""
+        try:
+            import pdfplumber
+            out = []
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                for p in pdf.pages[:20]:
+                    t = p.extract_text() or ""
+                    if t.strip():
+                        out.append(t)
+            return "\n".join(out).strip()
+        except Exception:
+            pass
+        try:
+            from PyPDF2 import PdfReader
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            out = []
+            for p in reader.pages[:20]:
+                t = p.extract_text() or ""
+                if t.strip():
+                    out.append(t)
+            return "\n".join(out).strip()
+        except Exception:
             return ""
 
-        def _flex_parse_mail(text):
-            lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
-            year = date.today().year
+    if up is not None:
+        pdf_bytes = up.read()
+        st.download_button(
+            "⬇️ Télécharger le PDF",
+            data=pdf_bytes,
+            file_name=up.name or "piece_jointe.pdf",
+            mime="application/pdf",
+        )
+        if st.button("📄 Extraire texte du PDF → coller", key="mail_pdf_extract_btn"):
+            txt = _extract_text_from_pdf_bytes(pdf_bytes)
+            if txt:
+                st.session_state["mail_raw_input"] = txt
+                st.toast("✅ Texte extrait et injecté", icon="📄")
+            else:
+                st.warning("⚠️ PDF non extractible (scan). Colle le texte manuellement.")
+
+    # ================= TEXTE =================
+    raw_mail = st.text_area(
+        "📋 Texte à analyser",
+        height=260,
+        key="mail_raw_input",
+    )
+
+    # ======================================================
+    # 🧠 UTILITAIRES
+    # ======================================================
+    def _norm(x):
+        return re.sub(r"\s+", " ", str(x or "").upper().strip())
+
+    def _norm_tel(x):
+        t = re.sub(r"[^\d+]", "", str(x or ""))
+        if t.startswith("00"):
+            t = "+" + t[2:]
+        return t
+
+    def _normalize_time_txt(s):
+        s = str(s or "").upper().replace(":", "H")
+        m = re.search(r"(\d{1,2})\s*H\s*(\d{2})?", s)
+        if not m:
+            return ""
+        return f"{int(m.group(1)):02d}:{int(m.group(2) or 0):02d}"
+
+    def _to_date_iso_any(raw):
+        s = str(raw or "").strip()
+        m = re.search(r"(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})", s)
+        if m:
+            d = int(m.group(1))
+            mo = int(m.group(2))
+            y = int(m.group(3))
+            if y < 100:
+                y += 2000
+            try:
+                return date(y, mo, d).isoformat()
+            except Exception:
+                return ""
+        return ""
+
+    def _next_non_empty(lines, start):
+        for k in range(start, len(lines)):
+            if str(lines[k]).strip():
+                return str(lines[k]).strip()
+        return ""
+
+    def _label_value_or_next(lines, i):
+        """
+        Gère:
+        - "Date : 23/02/2026"
+        - "Date :" puis valeur à la ligne suivante
+        """
+        line = str(lines[i]).strip()
+        parts = line.split(":", 1)
+        if len(parts) == 2 and parts[1].strip():
+            return parts[1].strip()
+        return _next_non_empty(lines, i + 1)
+
+    # ======================================================
+    # 🧠 MAPPING DESIGNATION (TA RÈGLE)
+    # ======================================================
+    def _designation_from_place(txt: str) -> str:
+        u = _norm(txt)
+        if "ZAVENTEM" in u or "BRU" in u or "BRUSSEL" in u or "BRUX" in u:
+            return "BRU"
+        if "CHARLEROI" in u or "CRL" in u:
+            return "CRL"
+        if "LUX" in u or "LUXEMBOURG" in u:
+            return "LUX"
+        if "DUSS" in u or "DUSSELDORF" in u:
+            return "DUSS"
+        if "MIDI" in u:
+            return "MIDI"
+        # John Cockerill sites
+        if "JOHN COCKERILL" in u and "SERAING" in u:
+            return "JCO"
+        if "JOHN COCKERILL" in u and "DEFENSE" in u:
+            return "JCD"
+        if "JOHN COCKERILL" in u and "CHATEAU" in u:
+            return "JCC"
+        # fallback: garde brut si pas reconnu
+        return str(txt or "").strip()
+
+    def _sens_from_pick_drop(pickup: str, dropoff: str) -> str:
+        """
+        Ton besoin: sens pas vide.
+        - Si pickup est aéroport -> DE
+        - Sinon si dropoff est un "site société" (ex John Cockerill Seraing) -> VERS
+        - Sinon: si dropoff aéroport -> VERS
+        """
+        pu = _norm(pickup)
+        do = _norm(dropoff)
+        aeroport = ["AEROPORT", "AIRPORT", "ZAVENTEM", "BRU", "CRL", "CHARLEROI", "LUX", "MAASTRICHT"]
+        if any(k in pu for k in aeroport):
+            return "DE"
+        if ("JOHN COCKERILL" in do) or ("KNAUF" in do) or ("FN HERSTAL" in do) or ("BT TOUR" in do):
+            return "VERS"
+        if any(k in do for k in aeroport):
+            return "VERS"
+        return "VERS"  # par défaut, jamais vide
+
+    def _company_prefix_from_text(txt: str) -> str:
+        u = _norm(txt)
+        if ("JOHN COCKERILL" in u) or ("JCO" in u) or ("JCD" in u) or ("JCC" in u) or ("JCSA" in u):
+            return "JC"
+        if ("KNAUF" in u) or ("INSULATION" in u) or ("KI " in u):
+            return "KI"
+        if ("FN HERSTAL" in u) or ("FNH" in u):
+            return "FNH"
+        if ("BT TOUR" in u) or ("BT " in u):
+            return "BT"
+        return ""
+
+    # ======================================================
+    # 🧠 PARSE MAIL "CORPORATE" (robuste lignes)
+    # ======================================================
+    def _parse_mail_corporate(text: str):
+        lines = [l.rstrip() for l in (text or "").splitlines()]
+        uall = _norm(text)
+
+        nom = ""
+        tel = ""
+        demandeur = ""
+        imputation = ""
+        prefix = _company_prefix_from_text(text)
+
+        # champs simples (valeur sur même ligne ou ligne suivante)
+        for i in range(len(lines)):
+            ul = _norm(lines[i])
+            if ul.startswith("VOYAGEUR") or "TRAVELER" in ul:
+                nom = _label_value_or_next(lines, i)
+            elif ul.startswith("N° GSM") or ul == "GSM" or "N° GSM" in ul:
+                tel = _norm_tel(_label_value_or_next(lines, i))
+            elif ul.startswith("DEMANDEUR") or "REQUEST SEND BY" in ul:
+                demandeur = _label_value_or_next(lines, i)
+            elif ul.startswith("IMPUTATION") or "COST CENTER" in ul:
+                imputation = _label_value_or_next(lines, i)
+
+        # blocs trajet
+        blocks = []
+        i = 0
+        while i < len(lines):
+            ul = _norm(lines[i])
+            if ul.startswith("DATE"):
+                d_raw = _label_value_or_next(lines, i)
+                d_iso = _to_date_iso_any(d_raw)
+                heure = ""
+                pickup = ""
+                dropoff = ""
+
+                j = i + 1
+                while j < len(lines):
+                    uj = _norm(lines[j])
+
+                    if uj.startswith("DATE"):
+                        break
+
+                    if ("HEURE DE PRISE" in uj) or uj.startswith("HEURE"):
+                        heure = _normalize_time_txt(_label_value_or_next(lines, j))
+
+                    if ("LIEU DE PRISE" in uj) or ("LIEU DE PICK" in uj):
+                        pickup = _label_value_or_next(lines, j)
+
+                    if ("TRANSFERT A" in uj) or ("TRANSFERT À" in uj) or uj.startswith("TRANSFERT"):
+                        dropoff = _label_value_or_next(lines, j)
+
+                    j += 1
+
+                if d_iso:
+                    blocks.append({
+                        "DATE": d_iso,
+                        "HEURE": heure,
+                        "pickup": pickup,
+                        "dropoff": dropoff,
+                    })
+
+                i = j
+                continue
+
+            i += 1
+
+        return {
+            "NOM": str(nom or "").strip(),
+            "Tél": _norm_tel(tel),
+            "DEMANDEUR": str(demandeur or "").strip(),
+            "IMPUTATION": str(imputation or "").strip(),
+            "PREFIX": prefix,
+            "BLOCKS": blocks,
+        }
+
+    # ======================================================
+    # 🧠 DB: dernier Num BDC du passager (si dispo) + lookup prix trajet
+    # ======================================================
+    def _db_last_bdc_for_passenger(nom: str, tel: str, prefix: str) -> str:
+        n = _norm(nom)
+        t = _norm_tel(tel)
+
+        if not n and not t:
+            return ""
+
+        where = []
+        params = []
+
+        if n:
+            toks = [x for x in re.split(r"\s+", n) if len(x) >= 3]
+            if toks:
+                where.append("(" + " AND ".join(["UPPER(TRIM(NOM)) LIKE ?"] * len(toks)) + ")")
+                params.extend([f"%{tok}%" for tok in toks])
+            else:
+                where.append("UPPER(TRIM(NOM)) LIKE ?")
+                params.append(f"%{n}%")
+
+        if t:
+            where.append("REPLACE(REPLACE(REPLACE(REPLACE(TRIM(Tél),' ',''),'/',''),'.',''),'-','') LIKE ?")
+            params.append(f"%{re.sub(r'[^0-9+]', '', t)}%")
+
+        if prefix:
+            where.append("UPPER(TRIM(\"Num BDC\")) LIKE ?")
+            params.append(f"{prefix}%")
+
+        sql = f"""
+            SELECT TRIM("Num BDC")
+            FROM planning
+            WHERE {" AND ".join(where)}
+            ORDER BY DATE_ISO DESC
+            LIMIT 1
+        """
+
+        with get_connection() as conn:
+            r = conn.execute(sql, params).fetchone()
+        return (r[0] if r and r[0] else "")
+
+    def _db_lookup_price_for_route(adresse: str, designation: str, sens: str):
+        adr = _norm(adresse)
+        des = _norm(designation)
+        se = _norm(sens)
+
+        if not adr or not des or not se:
+            return None
+
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT KM, "H TVA", TTC, "Type Nav", PAIEMENT
+                FROM planning
+                WHERE
+                    UPPER(TRIM(ADRESSE)) = ?
+                    AND UPPER(TRIM(DESIGNATION)) = ?
+                    AND TRIM("Unnamed: 8") = ?
+                ORDER BY DATE_ISO DESC
+                LIMIT 1
+                """,
+                (adr, des, se),
+            ).fetchone()
+        return row
+
+    # ======================================================
+    # 🧠 Construire les lignes “comme tu veux”
+    # ======================================================
+    def _build_rows_business(parsed_mail: dict):
+        nom = parsed_mail.get("NOM", "")
+        tel = parsed_mail.get("Tél", "")
+        demandeur = parsed_mail.get("DEMANDEUR", "")
+        imputation = parsed_mail.get("IMPUTATION", "")
+        prefix = parsed_mail.get("PREFIX", "")
+
+        last_bdc = _db_last_bdc_for_passenger(nom, tel, prefix) or prefix
+
+        rows = []
+        for b in (parsed_mail.get("BLOCKS") or []):
+            pickup = b.get("pickup", "")
+            dropoff = b.get("dropoff", "")
+
+            sens = _sens_from_pick_drop(pickup, dropoff)
+
+            # ✅ TA RÈGLE:
+            # - adresse = pickup (YUST Liège)
+            # - designation = destination code (JCO si "John Cockerill Seraing")
+            if sens == "VERS":
+                adresse = pickup
+                designation = _designation_from_place(dropoff)  # -> JCO
+            else:
+                # DE: adresse = destination client/hôtel, designation = aéroport code
+                adresse = dropoff
+                designation = _designation_from_place(pickup)
+
+            # prix depuis DB (ignore CP/localité)
+            price = _db_lookup_price_for_route(adresse, designation, sens)
+            km = h_tva = ttc = typ = pay = ""
+            if price:
+                km, h_tva, ttc, typ, pay = price
+
+            rows.append({
+                "DATE": b.get("DATE", ""),
+                "HEURE": b.get("HEURE", ""),
+                "CH": "",
+                "²²²²": "",
+                "IMMAT": "",
+                "PAX": "",
+                "Reh": "",
+                "Siège": "",
+                "Unnamed: 8": sens,
+                "DESIGNATION": designation,
+                "H South": "",
+                "Décollage": "",
+                "N° Vol": "",
+                "Origine": "",
+                "GO": "",
+                "Num BDC": last_bdc,
+                "NOM": nom,
+                "ADRESSE": adresse,
+                "CP": "",
+                "Localité": "",
+                "Tél": tel,
+                "Type Nav": typ or "",
+                "PAIEMENT": pay or "",
+                "Caisse": "",
+                "KM": km or "",
+                "H TVA": h_tva or "",
+                "TTC": ttc or "",
+                "PARKING": "",
+                "ATTENTE": "",
+                "PEAGE": "",
+                "ADM": "",
+                "REMARQUE": "",
+                "DEMANDEUR": demandeur,
+                "IMPUTATION": imputation,
+            })
+
+        if not rows:
+            rows = [{"REMARQUE": (raw_mail or "")[:200]}]
+        return rows
+
+    # ================= ACTIONS =================
+    colA, colB = st.columns(2)
+
+    with colA:
+        if st.button("🧠 Analyser", key="mail_analyse_btn"):
             rows = []
-            buf = {
-                "DATE":"", "HEURE":"", "DESIGNATION":"", "Unnamed: 8":"",
-                "NOM":"", "ADRESSE":"", "CP":"", "Localité":"",
-                "Tél":"", "N° Vol":"", "Origine":"", "REMARQUE":""
-            }
 
-            def flush():
-                if any(buf.get(k) for k in ["DATE","HEURE","DESIGNATION","ADRESSE","Tél"]):
-                    rows.append(dict(buf))
+            # 1) métier corporate (robuste)
+            try:
+                parsed_mail = _parse_mail_corporate(raw_mail)
+                rows = _build_rows_business(parsed_mail)
+            except Exception:
+                rows = []
 
-            for l in lines:
-                m = re.search(r"(\d{1,2})[/-](\d{1,2})", l)
-                if m:
-                    flush()
-                    buf = dict(buf)
-                    buf["DATE"] = f"{year:04d}-{int(m.group(2)):02d}-{int(m.group(1)):02d}"
-                    buf["HEURE"] = ""
-                    continue
-
-                sens = _parse_sens_from_text(l)
-                if sens:
-                    buf["Unnamed: 8"] = sens
-
-                ht = _normalize_time_txt(l)
-                if ht:
-                    buf["HEURE"] = ht
-
-                m = re.search(r"(\+?\d[\d\s]{7,})", l)
-                if m:
-                    buf["Tél"] = re.sub(r"\D", "", m.group(1))
-
-                if any(k in l.upper() for k in ["ZAV","BRU","CRL","CHARLEROI","LUX"]):
-                    buf["DESIGNATION"] = l.upper()
-
-                if "–" in l or "-" in l:
-                    p = re.split(r"\s+[–-]\s+", l)
-                    if len(p) == 2:
-                        buf["ADRESSE"] = p[0]
-                        m = re.search(r"(\d{4})\s+(.+)", p[1])
-                        if m:
-                            buf["CP"], buf["Localité"] = m.group(1), m.group(2)
-
-            flush()
-            return rows
-
-        # ================= ACTIONS =================
-        colA, colB = st.columns(2)
-        with colA:
-            if st.button("🧠 Analyser"):
+            # 2) IA existante si besoin
+            if not rows or (len(rows) == 1 and rows[0].get("REMARQUE")):
                 try:
                     parsed = parse_mail_to_navette_v2_cached(raw_mail) or {}
-                    rows = parsed.get("ROWS") or []
+                    rows2 = parsed.get("ROWS") or []
+                    if rows2:
+                        rows = rows2
                 except Exception:
-                    rows = []
+                    pass
 
-                if not rows:
-                    rows = _flex_parse_mail(raw_mail)
+            if not rows:
+                rows = [{"REMARQUE": raw_mail[:200]}]
 
-                if not rows:
-                    rows = [{"REMARQUE": raw_mail[:200]}]
+            st.session_state.mail_parsed = {"ROWS": rows}
 
-                st.session_state.mail_parsed = {"ROWS": rows}
+    with colB:
+        if st.button("🧹 Réinitialiser", key="mail_reset_btn"):
+            st.session_state.pop("mail_parsed", None)
 
-        with colB:
-            if st.button("🧹 Réinitialiser"):
-                st.session_state.pop("mail_parsed", None)
+    parsed = st.session_state.get("mail_parsed")
 
-        parsed = st.session_state.get("mail_parsed")
+    # ================= ÉDITION =================
+    if parsed:
+        df = pd.DataFrame(parsed["ROWS"]).fillna("")
 
-        # ================= ÉDITION =================
-        if parsed:
-            df = pd.DataFrame(parsed["ROWS"]).fillna("")
+        planning_cols = [
+            "DATE","HEURE","CH","²²²²","IMMAT","PAX","Reh","Siège",
+            "Unnamed: 8",
+            "DESIGNATION","H South","Décollage","N° Vol","Origine","GO","Num BDC",
+            "NOM","ADRESSE","CP","Localité","Tél",
+            "Type Nav","PAIEMENT","Caisse","KM","H TVA","TTC",
+            "PARKING","ATTENTE","PEAGE","ADM","REMARQUE","DEMANDEUR","IMPUTATION"
+        ]
+        for c in planning_cols:
+            if c not in df.columns:
+                df[c] = ""
+        df = df[planning_cols]
 
-            planning_cols = [
-                "DATE","HEURE","CH","IMMAT","PAX","Reh","Siège",
-                "Unnamed: 8","DESIGNATION",
-                "NOM","ADRESSE","CP","Localité","Tél",
-                "Type Nav","PAIEMENT","KM","H TVA","TTC",
-                "REMARQUE","DEMANDEUR","IMPUTATION"
-            ]
+        # ===== DUPLICATION / RETOUR =====
+        if add_retour and len(df) == 1:
+            r2 = df.iloc[0].to_dict()
+            r2["DATE"], r2["HEURE"] = "", ""
+            s = str(r2.get("Unnamed: 8", "")).upper().strip()
+            r2["Unnamed: 8"] = "DE" if s == "VERS" else "VERS"
+            r2["REMARQUE"] = (str(r2.get("REMARQUE", "")) + " | RETOUR MANUEL").strip()
+            df = pd.concat([df, pd.DataFrame([r2])], ignore_index=True)
 
-            for c in planning_cols:
-                if c not in df.columns:
-                    df[c] = ""
+        # ===== URGENT =====
+        if urgence_mode:
+            df["REMARQUE"] = df["REMARQUE"].astype(str).apply(
+                lambda x: x if "URGENT" in str(x) else f"{x} | URGENT"
+            )
 
-            df = df[planning_cols]
+        st.markdown("### ✏️ Prévisualisation")
+        st.dataframe(df, use_container_width=True)
 
-            # 🔁 RETOUR AUTO
-            if auto_retour and len(df) == 1:
-                s = df.iloc[0]["Unnamed: 8"]
-                if s in ("A/R","DE","VERS"):
-                    r2 = df.iloc[0].to_dict()
-                    r2["DATE"], r2["HEURE"] = "", ""
-                    r2["Unnamed: 8"] = "DE" if s == "VERS" else "VERS"
-                    r2["REMARQUE"] += " | RETOUR auto"
-                    df = pd.concat([df, pd.DataFrame([r2])], ignore_index=True)
+        df_edit = st.data_editor(df, use_container_width=True, hide_index=True)
 
-            # 🟡 GROUPAGE SIMPLE
-            if len(df) > 1:
-                for i in range(len(df)):
-                    for j in range(i+1, len(df)):
-                        if (
-                            df.at[i,"DATE"] == df.at[j,"DATE"]
-                            and df.at[i,"CP"] == df.at[j,"CP"]
-                        ):
-                            df.at[i,"REMARQUE"] += " | GROUPAGE AUTO"
-                            df.at[j,"REMARQUE"] += " | GROUPAGE AUTO"
+        # ===== COPIE EXCEL =====
+        def _clean(v):
+            return str(v or "").replace(".0", "")
 
-            # 🧠 AUTO-REMPLISSAGE DB
-            from database import find_similar_transfer_in_db
-            for i in range(len(df)):
-                sim = find_similar_transfer_in_db(df.iloc[i].to_dict()) or {}
-                if sim.get("_SIMILAR_INFO"):
-                    st.success(f"🧠 Trajet reconnu : {sim['_SIMILAR_INFO']}")
-                for k in ["KM","H TVA","TTC","PAIEMENT","Type Nav","DEMANDEUR","IMPUTATION"]:
-                    if not df.at[i,k]:
-                        df.at[i,k] = sim.get(k,"")
+        st.markdown("### 📋 Lignes Excel prêtes à coller")
+        st.code(
+            "\n".join(
+                "\t".join(_clean(rr.get(c, "")) for c in planning_cols)
+                for _, rr in df_edit.iterrows()
+            ),
+            language="tsv"
+        )
 
-            # 🚨 URGENT FLAG
-            if urgence_mode:
-                df["REMARQUE"] = df["REMARQUE"] + " | URGENT"
+        # ===== VALIDATION =====
+        if st.button("✅ Valider et envoyer", key="mail_validate_btn"):
+            payload = df_edit.fillna("").to_dict(orient="records")
+            for r in payload:
+                r["_URGENT"] = bool(urgence_mode)
+                r["_NOTIFY"] = bool(notify_now)
 
-            # 🎨 PRÉVISUALISATION COULEUR
-            def _row_style(r):
-                if "GROUPAGE AUTO" in r.get("REMARQUE",""):
-                    return ["background-color:#FFF3CD"]*len(r)
-                if "URGENT" in r.get("REMARQUE",""):
-                    return ["background-color:#F8D7DA"]*len(r)
-                return [""]*len(r)
+            from database import insert_planning_rows_from_table
+            insert_planning_rows_from_table(payload, ignore_conflict=True)
 
-            st.markdown("### ✏️ Prévisualisation planning")
-            st.dataframe(df.style.apply(_row_style, axis=1), use_container_width=True)
-
-            df_edit = st.data_editor(df, use_container_width=True, hide_index=True)
-
-            # ================= LIGNES COPIABLES =================
-            def build_planning_lines(df_edit):
-                cols_excel = [
-                    "DATE","HEURE","CH","IMMAT","PAX","Reh","Siège",
-                    "", "DESIGNATION",
-                    "NOM","ADRESSE","CP","Localité","Tél",
-                    "Type Nav","PAIEMENT","KM","H TVA","TTC",
-                    "REMARQUE","DEMANDEUR","IMPUTATION"
-                ]
-
-                def getv(r,c):
-                    if c == "":
-                        return ""
-                    if c == "AL-GL":
-                        return r.get("Unnamed: 8","")
-                    return r.get(c,"")
-
-                lines = []
-                for _, r in df_edit.iterrows():
-                    lines.append("\t".join(str(getv(r,c) or "") for c in cols_excel))
-                return "\n".join(lines)
-
-            tsv_lines = build_planning_lines(df_edit)
-
-            st.markdown("### 📋 Lignes planning prêtes à coller")
-            st.code(tsv_lines, language="tsv")
-            st.caption("Utilise l’icône 📋 pour copier")
-
-            # ================= VALIDATION =================
-            if st.button("✅ Valider et envoyer"):
-                payload = df_edit.fillna("").to_dict(orient="records")
-                for r in payload:
-                    r["_URGENT"] = bool(urgence_mode)
-                    r["_NOTIFY"] = bool(notify_now)
-
-                from database import insert_planning_rows_from_table
-                insert_planning_rows_from_table(payload, ignore_conflict=True)
-
-                request_soft_refresh("planning", clear_cache=True, mute_autosync_sec=10)
-                request_soft_refresh("admin_tab_mail")
-                st.success("✅ Navette(s) ajoutée(s)")
-
-
-
-
+            request_soft_refresh("planning", clear_cache=True, mute_autosync_sec=10)
+            request_soft_refresh("admin_tab_mail")
+            st.success("✅ Navette(s) ajoutée(s)")
     # ======================================================
     # 🟡 ONGLET À REPORTER DANS EXCEL
     # ======================================================
@@ -7629,6 +8047,13 @@ def render_tab_admin_transferts():
         start_iso = _to_iso(start_date)
         end_iso = _to_iso(end_date)
 
+        # ======================================================
+        # 📱 WHATSAPP CLIENT — J+1 / J+3 (AUTO, GROUPÉ)
+        # ======================================================
+        # ======================================================
+        # 📋 VUE TRANSFERTS
+        # ======================================================
+
         # ✅ charge FULL (puis fallback si ton get_planning ne supporte pas source="full")
         df = get_planning(
             start_date=start_iso,
@@ -7654,6 +8079,13 @@ def render_tab_admin_transferts():
 
         if df is None:
             df = pd.DataFrame()
+
+        # 🔒 SÉCURITÉ DATE_ISO (évite incohérences UI / WhatsApp)
+        if not df.empty and "DATE_ISO" in df.columns:
+            try:
+                df["DATE_ISO"] = pd.to_datetime(df["DATE_ISO"], errors="coerce").dt.date
+            except Exception:
+                pass
 
         st.caption(f"DEBUG admin transferts — lignes chargées : {len(df)}")
 
@@ -7708,65 +8140,10 @@ def render_tab_admin_transferts():
                     except Exception:
                         df["Badges"] = ""
 
-                # ✅ WhatsApp client (remis)
-                def _clean_gsm(x: str) -> str:
-                    s = str(x or "").strip()
-                    s = s.replace(" ", "").replace("/", "").replace(".", "").replace("-", "")
-                    s = s.replace("+", "")
-                    if s.startswith("00"):
-                        s = s[2:]
-                    return s
-
-                def _wa_link(gsm: str, msg: str) -> str:
-                    gsm2 = _clean_gsm(gsm)
-                    if not gsm2:
-                        return ""
-                    try:
-                        return build_whatsapp_link(gsm2, msg)
-                    except Exception:
-                        return f"https://wa.me/{gsm2}"
-
-                gsm_col = None
-                for c in ["Tél", "TEL", "GSM", "Tel", "Téléphone"]:
-                    if c in df.columns:
-                        gsm_col = c
-                        break
-
-                if gsm_col:
-                    # message simple client
-                    def _mk_msg(r):
-                        d = str(r.get("DATE", "") or "")
-                        h = str(r.get("HEURE", "") or "")
-                        dest = str(r.get("DESIGNATION", "") or r.get("Unnamed: 8", "") or "")
-                        nom = str(r.get("NOM", "") or "")
-                        return (
-                            f"Bonjour {nom},\n"
-                            f"Votre transfert est bien noté.\n"
-                            f"📆 {d} à {h}\n"
-                            f"🚐 Destination : {dest}\n"
-                            f"Merci, Airports Lines"
-                        )
-
-                    df = df.copy()
-                    df["WA client"] = df.apply(
-                        lambda r: _wa_link(r.get(gsm_col, ""), _mk_msg(r)),
-                        axis=1,
-                    )
-
-                # affichage : on garde les liens cliquables via st.data_editor (link column)
-                if "WA client" in df.columns:
-                    st.data_editor(
-                        df,
-                        width="stretch",
-                        hide_index=True,
-                        disabled=True,
-                        column_config={
-                            "WA client": st.column_config.LinkColumn("💬 WA client"),
-                        },
-                        height=520,
-                    )
-                else:
-                    st.dataframe(df, width="stretch", height=520)
+                # ======================================================
+                # 📋 AFFICHAGE (sans WhatsApp ici)
+                # ======================================================
+                st.dataframe(df, width="stretch", height=520)
 
     # ======================================================
     # 🚨 ONGLET URGENCES (✅ déplacé ici)
@@ -7819,12 +8196,224 @@ def render_tab_admin_transferts():
                             )
                     except Exception:
                         st.warning("⚠️ PDF introuvable")
-
     # ======================================================
     # ⏱️ ONGLET CALCUL D’HEURES
     # ======================================================
     with tab_heures:
         render_tab_calcul_heures()
+  
+
+    # ======================================================
+    # 💬 ONGLET WHATSAPP (CLIENTS) — J+1 / J+3
+    # ======================================================
+    with tab_whatsapp:
+        st.subheader("💬 WhatsApp — confirmations clients")
+        st.caption("Envoi manuel • 1 message par client et par jour • basé sur planning 7 jours (aujourd’hui → J+7).")
+
+        # --------------------------------------------------
+        # Helpers
+        # --------------------------------------------------
+        def _norm_gsm(x: str) -> str:
+            s = str(x or "").strip()
+            s = s.replace(" ", "").replace("/", "").replace(".", "").replace("-", "")
+            s = s.replace("+", "")
+            if s.startswith("00"):
+                s = s[2:]
+            return s
+
+        def _split_chauffeurs_codes(ch_value: str) -> list:
+            raw = str(ch_value or "").upper().replace("*", "").replace(" ", "")
+            codes, buf = [], ""
+            for c in raw:
+                buf += c
+                if len(buf) == 2:
+                    codes.append(buf)
+                    buf = ""
+            return [c for c in codes if c]
+
+
+
+
+        def _resolve_dest(x: str) -> str:
+            try:
+                from database import resolve_location_alias
+                return str(resolve_location_alias(x))
+            except Exception:
+                return str(x or "")
+
+        def _build_client_message(client_name: str, date_txt: str, rows: list) -> str:
+            lines = [
+                "*🚐 Airports Lines*",
+                "",
+                f"Bonjour {client_name or ''},",
+                "",
+                "Voici votre(vos) transfert(s) prévu(s) :",
+                "",
+                f"📅 {date_txt}",
+                "",
+            ]
+
+            for r in rows:
+                sens = str(r.get("Unnamed: 8", "") or "").strip()
+                dest = str(r.get("DESIGNATION", "") or "").strip()
+                adr = str(r.get("ADRESSE", "") or "").strip()
+                cp = str(r.get("CP", "") or "").strip()
+                loc = str(r.get("Localité", "") or "").strip()
+                h = str(r.get("HEURE", "") or "").strip()
+
+                ch = str(r.get("CH", "") or "").replace("*", "").strip()
+                ch_gsms = r.get("_CH_GSMS") or []
+
+                lines.append(f"⏰ {h}")
+                lines.append(f"➡️ {sens} {dest}")
+
+                if adr or cp or loc:
+                    lines.append(f"📍 {adr}, {cp} {loc}".replace(".0 ", " ").strip())
+
+                # Chauffeur + téléphone(s)
+                if ch:
+                    if ch_gsms:
+                        lines.append(
+                            f"👨‍✈️ Chauffeur : {ch} — 📞 " + " / ".join(ch_gsms)
+                        )
+                    else:
+                        lines.append(f"👨‍✈️ Chauffeur : {ch}")
+
+                lines.append("")
+
+            lines.append("Merci de votre confiance.")
+            return "\n".join(lines)
+
+
+        def _get_client_gsm_col(df_in: pd.DataFrame):
+            for c in ["Tél", "TEL", "GSM", "Tel", "Téléphone"]:
+                if c in df_in.columns:
+                    return c
+            return None
+
+        def _load_whatsapp_source_df():
+            # Source fixée: aujourd’hui -> J+7, planning 7j
+            d0 = date.today()
+            d7 = date.today() + timedelta(days=7)
+            dfw = get_planning(
+                start_date=d0.isoformat(),
+                end_date=d7.isoformat(),
+                chauffeur=None,
+                type_filter=None,
+                search="",
+                max_rows=5000,
+                source="7j",
+            )
+            if dfw is None:
+                dfw = pd.DataFrame()
+            return dfw
+
+        def _render_send_links(df_src: pd.DataFrame, target_from: date, target_to: date):
+            if df_src is None or df_src.empty:
+                st.info("Aucun transfert sur la période source.")
+                return
+
+            df_src = df_src.copy()
+
+            # Filtre dates cible (par DATE_ISO en priorité)
+            t_from = target_from.isoformat()
+            t_to = target_to.isoformat()
+
+            if "DATE_ISO" in df_src.columns:
+                df_src["_DATE_ISO"] = df_src["DATE_ISO"].astype(str)
+                df_src = df_src[(df_src["_DATE_ISO"] >= t_from) & (df_src["_DATE_ISO"] <= t_to)]
+            else:
+                # fallback sur DATE (moins fiable)
+                df_src["_DATE_TXT"] = df_src.get("DATE", "").astype(str)
+                df_src = df_src[df_src["_DATE_TXT"].astype(str).str.contains(str(target_from.year), na=False)]
+
+            if df_src.empty:
+                st.info("Aucun transfert pour cette période.")
+                return
+
+            # Destination alias + GSM chauffeurs
+            if "DESIGNATION" in df_src.columns:
+                df_src["DESIGNATION"] = df_src["DESIGNATION"].apply(_resolve_dest)
+
+            def _get_chauffeur_gsms_from_db(ch_value: str) -> list:
+                if not ch_value:
+                    return []
+
+                gsms = []
+                for ch in split_chauffeurs(ch_value):
+                    try:
+                        tel, _mail = get_chauffeur_contact(ch)
+                        if tel:
+                            gsms.append(clean_phone(tel))
+                    except Exception:
+                        pass
+                return gsms
+
+            df_src["_CH_GSMS"] = df_src["CH"].apply(_get_chauffeur_gsms_from_db)
+
+            # GSM client
+            gsm_col = _get_client_gsm_col(df_src)
+            if not gsm_col:
+                st.warning("Colonne téléphone client introuvable (Tél/TEL/GSM).")
+                return
+            df_src["_CLIENT_GSM"] = df_src[gsm_col].apply(_norm_gsm)
+
+            # Groupement 1 message par client et par jour
+            if "DATE" in df_src.columns:
+                date_group = "DATE"
+            elif "DATE_ISO" in df_src.columns:
+                date_group = "DATE_ISO"
+            else:
+                date_group = gsm_col  # fallback (moche mais safe)
+
+            groups = df_src.groupby(["_CLIENT_GSM", date_group], dropna=True)
+
+            sent = 0
+            for (gsm, dval), g in groups:
+                if not gsm:
+                    continue
+                client_name = str(g.iloc[0].get("NOM", "") or "").strip()
+                date_txt = str(dval or "").strip()
+                msg = _build_client_message(client_name, date_txt, g.to_dict(orient="records"))
+                try:
+                    link = build_whatsapp_link(gsm, msg)
+                except Exception:
+                    link = f"https://wa.me/{gsm}"
+                st.markdown(f"[💬 Envoyer WhatsApp — {client_name or gsm} ({date_txt})]({link})")
+                sent += 1
+
+            st.success(f"✅ Messages prêts : {sent}")
+
+        # --------------------------------------------------
+        # UI
+        # --------------------------------------------------
+        df_source = _load_whatsapp_source_df()
+
+        st.caption(
+            f"Source : planning 7j • Aujourd’hui : {date.today().strftime('%d/%m/%Y')} • "
+            f"Fenêtre source : {date.today().strftime('%d/%m/%Y')} → {(date.today()+timedelta(days=7)).strftime('%d/%m/%Y')}"
+        )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("📅 Préparer WhatsApp J+1 (demain)", key="wa_btn_j1"):
+                d1 = date.today() + timedelta(days=1)
+                _render_send_links(df_source, d1, d1)
+
+        with c2:
+            if st.button("📅 Préparer WhatsApp J+3 (3 prochains jours)", key="wa_btn_j3"):
+                d1 = date.today() + timedelta(days=1)
+                d3 = date.today() + timedelta(days=3)
+                _render_send_links(df_source, d1, d3)
+
+        with st.expander("🧪 Debug WhatsApp (source)", expanded=False):
+            st.caption(f"Lignes source chargées : {len(df_source)}")
+            try:
+                st.dataframe(df_source.head(50), use_container_width=True, hide_index=True)
+            except Exception:
+                pass
+
+
 
 
 # ============================================================
@@ -7910,14 +8499,70 @@ def _rules_prepare(df_rules: pd.DataFrame) -> pd.DataFrame:
     df = df[df["minutes_norm"] > 0]
 
     return df
-
-
 def render_tab_confirmation_chauffeur():
     st.subheader("✅ Confirmation chauffeur")
     st.caption(
         "Validation définitive des navettes après réponse chauffeur. "
         "Les confirmations sont traçables dans l’historique."
     )
+
+    # ======================================================
+    # 🧪 TEST DB (ADMIN)
+    # ======================================================
+    with st.expander("🧪 TEST DB (ADMIN)"):
+
+        from database import get_connection
+        import pandas as pd
+
+        with get_connection() as conn:
+
+            total = conn.execute(
+                "SELECT COUNT(*) FROM planning"
+            ).fetchone()[0]
+            st.write("Total lignes planning :", total)
+
+            ack_count = conn.execute(
+                "SELECT COUNT(*) FROM planning WHERE ACK_AT IS NOT NULL AND ACK_AT != ''"
+            ).fetchone()[0]
+            st.write("Lignes avec ACK_AT :", ack_count)
+
+            non_conf = conn.execute(
+                "SELECT COUNT(*) FROM planning WHERE COALESCE(CONFIRMED,0) != 1"
+            ).fetchone()[0]
+            st.write("Non confirmées :", non_conf)
+
+            try:
+                count_7j = conn.execute(
+                    "SELECT COUNT(*) FROM planning_7j"
+                ).fetchone()[0]
+                st.write("Lignes planning_7j :", count_7j)
+            except Exception as e:
+                st.write("Erreur planning_7j :", e)
+
+            df_debug = pd.read_sql(
+                """
+                SELECT DATE, CH, NOM, ACK_AT, CONFIRMED, DATE_ISO
+                FROM planning
+                ORDER BY DATE DESC
+                LIMIT 20
+                """,
+                conn,
+            )
+
+            st.dataframe(df_debug, use_container_width=True)
+
+            df_ack = pd.read_sql(
+                """
+                SELECT DATE, DATE_ISO, ACK_AT
+                FROM planning
+                WHERE ACK_AT IS NOT NULL AND ACK_AT != ''
+                ORDER BY DATE DESC
+                """,
+                conn,
+            )
+
+            st.write("🔎 Vérif DATE_ISO des ACK :")
+            st.dataframe(df_ack, use_container_width=True)
 
     # ======================================================
     # SOUS-ONGLETS
@@ -7927,13 +8572,10 @@ def render_tab_confirmation_chauffeur():
     )
 
     # ======================================================
-    # 🟢 SOUS-ONGLET : À CONFIRMER (VUE PAR CHAUFFEUR)
+    # 🟢 À CONFIRMER
     # ======================================================
     with tab_confirm:
 
-        # ===================================================
-        # 📅 PÉRIODE À CONFIRMER
-        # ===================================================
         if "confirm_periode" not in st.session_state:
             st.session_state.confirm_periode = "Aujourd’hui"
 
@@ -7944,27 +8586,46 @@ def render_tab_confirmation_chauffeur():
             key="confirm_periode",
         )
 
-        today = date.today()
-        start_date = today if periode == "Aujourd’hui" else today + timedelta(days=1)
+        from database import get_connection
+        import pandas as pd
 
-        df = get_planning(
-            start_date=start_date,
-            end_date=None,
-            source="full",
-        )
+        with get_connection() as conn:
+            df = pd.read_sql("SELECT * FROM planning", conn)
 
         if df is None or df.empty:
             st.info("Aucune navette à afficher.")
             return
 
-        # Exclure indispos / congés
-        df = df[df["IS_INDISPO"] == 0]
+        # --------------------------------------------------
+        # Nettoyage fort DATE_ISO
+        # --------------------------------------------------
+        df["DATE_ISO"] = (
+            df["DATE_ISO"]
+            .astype(str)
+            .str.strip()
+        )
 
-        # Uniquement les navettes NON confirmées
-        df = df[df["CONFIRMED"] != 1]
+        df["DATE_ISO_DT"] = pd.to_datetime(
+            df["DATE_ISO"],
+            errors="coerce"
+        )
+
+        today_dt = pd.to_datetime(date.today())
+
+        if periode == "Aujourd’hui":
+            df = df[df["DATE_ISO_DT"] >= today_dt]
+        else:
+            df = df[df["DATE_ISO_DT"] > today_dt]
+
+        # --------------------------------------------------
+        # Filtres métier
+        # --------------------------------------------------
+        df["CH"] = df["CH"].fillna("NON_ATTRIBUE")
+        df = df[df.get("IS_INDISPO", 0) == 0]
+        df = df[df.get("CONFIRMED", 0) != 1]
 
         if df.empty:
-            st.success("🎉 Toutes les navettes sont confirmées.")
+            st.info("Aucune navette à confirmer pour cette période.")
             return
 
         # --------------------------------------------------
@@ -7972,9 +8633,6 @@ def render_tab_confirmation_chauffeur():
         # --------------------------------------------------
         df["CH_ROOT"] = df["CH"].apply(normalize_ch_code)
 
-        # --------------------------------------------------
-        # Groupement par chauffeur réel
-        # --------------------------------------------------
         chauffeurs = (
             df.groupby("CH_ROOT")
             .size()
@@ -7986,8 +8644,6 @@ def render_tab_confirmation_chauffeur():
         for ch_root in chauffeurs:
 
             df_ch = df[df["CH_ROOT"] == ch_root].copy()
-
-            # Détection réponse chauffeur
             has_reply = df_ch["ACK_AT"].notna().any()
 
             badge = "🟠🆕" if has_reply else "🟠"
@@ -7996,15 +8652,12 @@ def render_tab_confirmation_chauffeur():
             with st.expander(title, expanded=has_reply):
 
                 df_ch = df_ch.sort_values(
-                    by=["DATE_ISO", "HEURE"],
+                    by=["DATE_ISO_DT", "HEURE"],
                     ascending=[True, True],
                 )
 
                 for _, row in df_ch.iterrows():
 
-                    # ===================================================
-                    # 📋 CONTEXTE NAVETTE (ADMIN)
-                    # ===================================================
                     date_txt = row.get("DATE", "—")
                     heure_txt = row.get("HEURE", "—")
                     client = row.get("NOM", "—")
@@ -8015,7 +8668,6 @@ def render_tab_confirmation_chauffeur():
                         row.get("DESIGNATION", row.get("DESTINATION", "—"))
                     )
 
-                    # 📍 Adresse complète (CRITIQUE)
                     adresse_complete = build_full_address_from_row(row)
 
                     st.markdown(
@@ -8046,64 +8698,18 @@ def render_tab_confirmation_chauffeur():
                     # -----------------------------
                     admin_reply_key = f"admin_reply_{row['id']}"
                     admin_reply = st.text_area(
-                        "💬 Message à envoyer au chauffeur (optionnel)",
-                        placeholder=(
-                            "Ex : Bien reçu, merci.\n"
-                            "Tout est OK pour cette navette 👍"
-                        ),
+                        "💬 Message pour le chauffeur",
                         key=admin_reply_key,
-                        height=120,
+                        height=90,
+                        placeholder="Ex : OK pour cette navette 👍 / ou indique le problème à corriger…",
                     )
 
-                    # -----------------------------
-                    # 💬 Envoyer message (sans confirmer)
-                    # -----------------------------
-                    if st.button(
-                        "💬 Envoyer un message au chauffeur",
-                        key=f"msg_{row['id']}",
-                        use_container_width=True,
-                    ):
-                        if not admin_reply.strip():
-                            st.warning("Le message est vide.")
-                        else:
-                            now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                            update_planning_row(
-                                row["id"],
-                                {
-                                    "ADMIN_REPLY": admin_reply.strip(),
-                                    "ADMIN_REPLY_AT": now_iso,
-                                    "ADMIN_REPLY_READ": 0,
-                                },
-                            )
-
-                            with get_connection() as conn:
-                                conn.execute(
-                                    """
-                                    INSERT INTO planning_audit
-                                    (ts, user, action, row_key, details)
-                                    VALUES (?, ?, ?, ?, ?)
-                                    """,
-                                    (
-                                        now_iso,
-                                        st.session_state.get("username"),
-                                        "ADMIN_MSG",
-                                        row.get("row_key"),
-                                        admin_reply.strip()[:200],
-                                    ),
-                                )
-                                conn.commit()
-
-                            st.toast("📨 Message envoyé au chauffeur", icon="💬")
-
-                    # -----------------------------
-                    # Actions admin
-                    # -----------------------------
                     col_ok, col_ko = st.columns(2)
 
+                    # ✅ OK → Confirme + message chauffeur
                     with col_ok:
                         if st.button(
-                            "✅ Confirmer cette navette",
+                            "✅ C’est OK",
                             key=f"ok_{row['id']}",
                             use_container_width=True,
                         ):
@@ -8114,9 +8720,9 @@ def render_tab_confirmation_chauffeur():
                                 {
                                     "CONFIRMED": 1,
                                     "CONFIRMED_AT": now_iso,
-                                    "ADMIN_REPLY": admin_reply.strip() if admin_reply else None,
-                                    "ADMIN_REPLY_AT": now_iso if admin_reply else None,
-                                    "ADMIN_REPLY_READ": 0 if admin_reply else 1,
+                                    "ADMIN_REPLY": admin_reply.strip() if admin_reply and admin_reply.strip() else "OK",
+                                    "ADMIN_REPLY_AT": now_iso,
+                                    "ADMIN_REPLY_READ": 0,
                                 },
                             )
 
@@ -8137,46 +8743,70 @@ def render_tab_confirmation_chauffeur():
                                 )
                                 conn.commit()
 
-                            st.toast("🟢 Navette confirmée et chauffeur informé", icon="✅")
+                            st.toast("🟢 Validé — le chauffeur est informé", icon="✅")
                             st.rerun()
 
+                    # ❌ Pas OK → Message chauffeur, pas confirmé
                     with col_ko:
                         if st.button(
-                            "❌ Laisser en attente",
+                            "❌ Pas OK / Problème",
                             key=f"ko_{row['id']}",
                             use_container_width=True,
                         ):
-                            if admin_reply.strip():
+                            if not admin_reply or not admin_reply.strip():
+                                st.warning("Merci d’indiquer le problème dans le message.")
+                            else:
+                                now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
                                 update_planning_row(
                                     row["id"],
                                     {
                                         "ADMIN_REPLY": admin_reply.strip(),
-                                        "ADMIN_REPLY_AT": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                        "ADMIN_REPLY_AT": now_iso,
                                         "ADMIN_REPLY_READ": 0,
                                     },
                                 )
 
-                            st.toast("⏳ Navette laissée en attente", icon="⏳")
+                                with get_connection() as conn:
+                                    conn.execute(
+                                        """
+                                        INSERT INTO planning_audit
+                                        (ts, user, action, row_key, details)
+                                        VALUES (?, ?, ?, ?, ?)
+                                        """,
+                                        (
+                                            now_iso,
+                                            st.session_state.get("username"),
+                                            "CONFIRM_KO",
+                                            row.get("row_key"),
+                                            admin_reply.strip()[:200],
+                                        ),
+                                    )
+                                    conn.commit()
+
+                                st.toast("⚠️ Problème envoyé au chauffeur", icon="📩")
+                                st.rerun()
 
                     st.divider()
 
     # ======================================================
-    # 🧾 SOUS-ONGLET : HISTORIQUE
+    # HISTORIQUE
     # ======================================================
     with tab_history:
 
         st.markdown("### 🧾 Historique des confirmations")
-        st.caption("Journal des validations administrateur (lecture seule).")
+
+        from database import get_connection
+        import pandas as pd
 
         with get_connection() as conn:
             df_hist = pd.read_sql(
                 """
-                SELECT
-                    ts AS "Date",
-                    user AS "Admin",
-                    action AS "Action",
-                    row_key AS "Navette",
-                    details AS "Détails"
+                SELECT ts AS "Date",
+                       user AS "Admin",
+                       action AS "Action",
+                       row_key AS "Navette",
+                       details AS "Détails"
                 FROM planning_audit
                 ORDER BY ts DESC
                 LIMIT 500
@@ -8188,18 +8818,13 @@ def render_tab_confirmation_chauffeur():
             st.info("Aucune confirmation enregistrée.")
             return
 
-        st.dataframe(
-            df_hist,
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(df_hist, use_container_width=True, hide_index=True)
 
     # ======================================================
-    # 📩 SOUS-ONGLET : MESSAGES CHAUFFEURS
+    # MESSAGES
     # ======================================================
     with tab_messages:
         st.info("📩 Vue messages chauffeurs — à venir")
-
 
 def _match_rule_minutes(rules_norm, ch, sens, dest):
     """
@@ -8379,35 +9004,61 @@ def render_tab_calcul_heures():
             if not ch_list:
                 continue
 
-            ch_main = str(ch_list[0]).strip().upper()
-            if not ch_main:
-                continue
+            sens = r.get("SENS")
+            dest = r.get("DEST")
 
-            minutes = _match_rule_minutes(
-                rules_norm,
-                ch_main,
-                r.get("SENS"),
-                r.get("DEST"),
+            # Normalisation destination via alias si dispo
+            try:
+                from database import resolve_location_alias
+                dest = resolve_location_alias(dest)
+            except Exception:
+                pass
+
+            # Attente éventuelle (minutes)
+            attente_raw = (
+                r.get("ATTENTE")
+                or r.get("Attente")
+                or r.get("ATTENTE_MIN")
+                or r.get("MIN_ATTENTE")
+                or 0
             )
+            attente_min = _coerce_minutes(attente_raw)
 
-            debug_rows.append({
-                "DATE": r.get("DATE_ISO"),
-                "CH": ch_main,
-                "SENS": r.get("SENS"),
-                "DEST": r.get("DEST"),
-                "MINUTES": minutes,
-            })
+            for ch in ch_list:
+                ch_u = str(ch or "").strip().upper()
+                if not ch_u:
+                    continue
 
-            if minutes <= 0:
-                rows_not_matched.append({
+                minutes_base = _match_rule_minutes(
+                    rules_norm,
+                    ch_u,
+                    sens,
+                    dest,
+                )
+
+                total_minutes = int(minutes_base or 0) + int(attente_min or 0)
+
+                debug_rows.append({
                     "DATE": r.get("DATE_ISO"),
-                    "CH": ch_main,
-                    "SENS": r.get("SENS"),
-                    "DEST": r.get("DEST"),
+                    "CH": ch_u,
+                    "SENS": sens,
+                    "DEST": dest,
+                    "BASE_MIN": int(minutes_base or 0),
+                    "ATTENTE_MIN": int(attente_min or 0),
+                    "MINUTES": int(total_minutes or 0),
                 })
-                continue
 
-            totals[ch_main] = totals.get(ch_main, 0) + minutes
+                if minutes_base <= 0 and attente_min <= 0:
+                    rows_not_matched.append({
+                        "DATE": r.get("DATE_ISO"),
+                        "CH": ch_u,
+                        "SENS": sens,
+                        "DEST": dest,
+                    })
+                    continue
+
+                if total_minutes > 0:
+                    totals[ch_u] = totals.get(ch_u, 0) + total_minutes
 
         if totals:
             df_tot = pd.DataFrame([
@@ -9410,3 +10061,10 @@ def build_printable_html(df):
     </body>
     </html>
     """
+
+
+# 🔁 Auto-login via cookie
+if not st.session_state.get("logged_in"):
+    tok = _get_login_cookie()
+    if tok and st.session_state.get("session_token") == tok:
+        st.session_state.logged_in = True
