@@ -1,3 +1,4 @@
+from utils_mail_universal import parse_mail_to_navette_universal
 # ============================================================
 # 🐞 DEBUG GLOBAL (console) — activable via env AL_DEBUG=1
 # ============================================================
@@ -7442,6 +7443,10 @@ def render_tab_admin_transferts():
 
     st.subheader("📦 Tous les transferts — vue admin")
 
+    # 🔒 Sécurité anti-UnboundLocalError
+    df = pd.DataFrame()
+
+
     # ✅ 6 onglets
     tab_transferts, tab_excel, tab_heures, tab_mail, tab_urgences, tab_whatsapp = st.tabs(
         [
@@ -7474,6 +7479,39 @@ def render_tab_admin_transferts():
     # 📥 ONGLET MAIL → NAVETTE (ASSISTANT MÉTIER + PDF + APPRENTISSAGE)
     # ======================================================
     st.subheader("📥 Mail → Navette")
+
+    # 📎 Import fichier Word (.docx) — BT Tours / formats variés
+    docx_file = st.file_uploader(
+        "📎 Importer un fichier Word (.docx) (BT Tours, etc.)",
+        type=["docx"],
+        key="mail_docx_upload"
+    )
+
+    def _extract_text_from_docx(uploaded):
+        try:
+            from docx import Document
+            doc = Document(uploaded)
+            chunks = []
+
+            # Paragraphes
+            for p in doc.paragraphs:
+                if p.text.strip():
+                    chunks.append(p.text.strip())
+
+            # Tableaux
+            for table in doc.tables:
+                for row in table.rows:
+                    cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                    if cells:
+                        chunks.append(" | ".join(cells))
+
+            txt = "\n".join(chunks)
+            txt = txt.replace("\r", "\n")
+            txt = re.sub(r"[ \t]+", " ", txt)
+            return txt.strip()
+        except Exception:
+            return ""
+
     st.caption("Colle un mail / WhatsApp / texte PDF → propositions → tu corriges → tu valides (apprentissage).")
 
     consume_soft_refresh("admin_tab_mail")
@@ -7566,7 +7604,17 @@ def render_tab_admin_transferts():
         return f"{int(m.group(1)):02d}:{int(m.group(2) or 0):02d}"
 
     def _to_date_iso_any(raw):
+        """
+        Convertit une date vers ISO 'YYYY-MM-DD'.
+        Supporte:
+          - 12/03/26, 12-03-2026
+          - 12 mars 26, 12 mars 2026
+        """
         s = str(raw or "").strip()
+        if not s:
+            return ""
+
+        # 1) formats numériques
         m = re.search(r"(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})", s)
         if m:
             d = int(m.group(1))
@@ -7578,7 +7626,46 @@ def render_tab_admin_transferts():
                 return date(y, mo, d).isoformat()
             except Exception:
                 return ""
+
+        # 2) formats "12 mars 26"
+        months = {
+            "JANVIER": 1, "JANV": 1,
+            "FEVRIER": 2, "FÉVRIER": 2, "FEVR": 2, "FÉVR": 2,
+            "MARS": 3,
+            "AVRIL": 4, "AVR": 4,
+            "MAI": 5,
+            "JUIN": 6,
+            "JUILLET": 7, "JUIL": 7,
+            "AOUT": 8, "AOÛT": 8,
+            "SEPTEMBRE": 9, "SEPT": 9,
+            "OCTOBRE": 10, "OCT": 10,
+            "NOVEMBRE": 11, "NOV": 11,
+            "DECEMBRE": 12, "DÉCEMBRE": 12, "DEC": 12, "DÉC": 12,
+        }
+
+        m2 = re.search(r"(\d{1,2})\s+([A-Za-zÉÈÊËÀÂÄÔÖÛÜÙÇéèêëàâäôöûüùç]+)\s+(\d{2,4})", s, re.IGNORECASE)
+        if m2:
+            d, mon, y = m2.groups()
+            mon_u = mon.strip().upper()
+            mon_u = (mon_u
+                     .replace("É","E").replace("È","E").replace("Ê","E").replace("Ë","E")
+                     .replace("À","A").replace("Â","A").replace("Ä","A")
+                     .replace("Ô","O").replace("Ö","O")
+                     .replace("Û","U").replace("Ü","U").replace("Ù","U")
+                     .replace("Ç","C"))
+            mo = months.get(mon_u) or months.get(mon_u[:4]) or months.get(mon_u[:3])
+            y = int(y)
+            if y < 100:
+                y += 2000
+            if mo:
+                try:
+                    return date(y, int(mo), int(d)).isoformat()
+                except Exception:
+                    return ""
+
         return ""
+
+
 
     def _next_non_empty(lines, start):
         for k in range(start, len(lines)):
@@ -7598,11 +7685,50 @@ def render_tab_admin_transferts():
             return parts[1].strip()
         return _next_non_empty(lines, i + 1)
 
+    def _label_value_or_next_multiline(lines, i, max_lines=6):
+        """Valeur sur la même ligne ou concatène les lignes suivantes (utile pour 'Transfert à')."""
+        first = _label_value_or_next(lines, i)
+        # Si la valeur est déjà sur la même ligne, on peut quand même ajouter les lignes suivantes
+        parts = []
+        if first:
+            parts.append(first)
+
+        # Concatène les lignes suivantes tant qu'on ne retombe pas sur un autre label
+        stop_prefixes = (
+            "SECTEUR", "S.B.U", "SBU", "DEMANDEUR", "IMPUTATION",
+            "DATE", "HEURE", "LIEU", "TRANSFERT", "VOYAGEUR", "N° GSM", "GSM", "IMPUTATION"
+        )
+        j = i + 1
+        taken = 0
+        while j < len(lines) and taken < max_lines:
+            ln = str(lines[j]).strip()
+            if not ln:
+                j += 1
+                continue
+            ul = _norm(ln)
+            # stop si c'est un label du genre "XXX :"
+            if any(ul.startswith(p) for p in stop_prefixes) and ul.endswith(":"):
+                break
+            # stop si ligne ressemble à "Label :" (même si pas dans stop_prefixes)
+            if re.match(r"^[A-ZÉÈÊËÀÂÄÔÖÛÜÙÇ0-9 ()'\"./-]+\s*:\s*$", ln):
+                break
+
+            # éviter de dupliquer first si ln == first
+            if (not parts) or (_norm(parts[-1]) != _norm(ln)):
+                parts.append(ln)
+                taken += 1
+            j += 1
+
+        return " ".join([p for p in parts if p]).strip()
+
     # ======================================================
     # 🧠 MAPPING DESIGNATION (TA RÈGLE)
     # ======================================================
     def _designation_from_place(txt: str) -> str:
         u = _norm(txt)
+        # ✅ Spécifique : Gare de Bruxelles Midi
+        if "MIDI" in u or "BRUXELLES MIDI" in u or "BRUSSELS MIDI" in u:
+            return "MIDI"
         if "ZAVENTEM" in u or "BRU" in u or "BRUSSEL" in u or "BRUX" in u:
             return "BRU"
         if "CHARLEROI" in u or "CRL" in u:
@@ -7704,7 +7830,7 @@ def render_tab_admin_transferts():
                         pickup = _label_value_or_next(lines, j)
 
                     if ("TRANSFERT A" in uj) or ("TRANSFERT À" in uj) or uj.startswith("TRANSFERT"):
-                        dropoff = _label_value_or_next(lines, j)
+                        dropoff = _label_value_or_next_multiline(lines, j, max_lines=8)
 
                     j += 1
 
@@ -7799,6 +7925,31 @@ def render_tab_admin_transferts():
     # ======================================================
     # 🧠 Construire les lignes “comme tu veux”
     # ======================================================
+    def _clean_dest_prefix(s: str) -> str:
+        t = str(s or "").strip()
+        if not t:
+            return ""
+        # retire préfixes fréquents
+        for pref in ["DOMICILE :", "DOMICILE:", "Domicile :", "Domicile:", "Adresse :", "Adresse:"]:
+            if t.startswith(pref):
+                t = t[len(pref):].strip()
+        return t
+
+    def _split_addr_cp_city(full: str):
+        """Retourne (adresse, cp, localite) depuis 'Route ..., 71 4050 Chaudfontaine'."""
+        s = _clean_dest_prefix(full)
+        s = re.sub(r"\s+", " ", s).strip()
+        if not s:
+            return "", "", ""
+        # cas: '... 4050 Chaudfontaine' ou '... 4050  Chaudfontaine'
+        m = re.search(r"\b(\d{4,5})\s+([A-Za-zÀ-ÿ\-\' ]+)$", s)
+        if m:
+            cp = m.group(1).strip()
+            city = m.group(2).strip()
+            adr = s[:m.start()].strip(" ,")
+            return adr, cp, city
+        return s, "", ""
+
     def _build_rows_business(parsed_mail: dict):
         nom = parsed_mail.get("NOM", "")
         tel = parsed_mail.get("Tél", "")
@@ -7823,14 +7974,18 @@ def render_tab_admin_transferts():
                 designation = _designation_from_place(dropoff)  # -> JCO
             else:
                 # DE: adresse = destination client/hôtel, designation = aéroport code
-                adresse = dropoff
+                adresse_full = dropoff
                 designation = _designation_from_place(pickup)
+                adresse, cp, loc = _split_addr_cp_city(adresse_full)
 
             # prix depuis DB (ignore CP/localité)
             price = _db_lookup_price_for_route(adresse, designation, sens)
             km = h_tva = ttc = typ = pay = ""
             if price:
                 km, h_tva, ttc, typ, pay = price
+
+            cp = locals().get("cp", "")
+            loc = locals().get("loc", "")
 
             rows.append({
                 "DATE": b.get("DATE", ""),
@@ -7851,11 +8006,11 @@ def render_tab_admin_transferts():
                 "Num BDC": last_bdc,
                 "NOM": nom,
                 "ADRESSE": adresse,
-                "CP": "",
-                "Localité": "",
+                "CP": cp or "",
+                "Localité": loc or "",
                 "Tél": tel,
                 "Type Nav": typ or "",
-                "PAIEMENT": pay or "",
+                "PAIEMENT": (pay or "Facture"),
                 "Caisse": "",
                 "KM": km or "",
                 "H TVA": h_tva or "",
