@@ -367,63 +367,22 @@ def _js_quote(val: str) -> str:
 
 def bootstrap_login_persistence():
     """
-    Important pour Streamlit App/Desktop :
-    - crée un client_id unique PAR appareil / navigateur
-    - restaure al_session + al_client_id depuis localStorage vers l'URL
-      si l'app redémarre sans query params
-    Ainsi chaque utilisateur garde SA propre session.
+    Pont JS minimal pour Streamlit App/Desktop.
+    - ne redirige jamais l'application
+    - synchronise simplement localStorage -> cookie navigateur
+    - évite tout blocage / boucle de replace()
     """
     components.html(
         f"""
         <script>
         (function() {{
             const sessionKey = {_js_quote(LOGIN_PERSIST_KEY)};
-            const clientKey = {_js_quote(LOGIN_CLIENT_KEY)};
-            const clientStorageKey = {_js_quote(LOGIN_CLIENT_STORAGE_KEY)};
-
-            function makeId() {{
-                try {{
-                    if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID();
-                }} catch (e) {{}}
-                return "cid-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
-            }}
-
-            let clientId = "";
-            let sessionValue = "";
-
-            try {{ clientId = window.localStorage.getItem(clientStorageKey) || ""; }} catch (e) {{}}
-            if (!clientId) {{
-                clientId = makeId();
-                try {{ window.localStorage.setItem(clientStorageKey, clientId); }} catch (e) {{}}
-            }}
-
-            try {{ sessionValue = window.localStorage.getItem(sessionKey) || ""; }} catch (e) {{}}
-
-            function syncUrl(baseUrl) {{
-                try {{
-                    const url = new URL(baseUrl);
-                    let changed = false;
-                    if (clientId && url.searchParams.get(clientKey) !== clientId) {{
-                        url.searchParams.set(clientKey, clientId);
-                        changed = true;
-                    }}
-                    if (sessionValue && url.searchParams.get(sessionKey) !== sessionValue) {{
-                        url.searchParams.set(sessionKey, sessionValue);
-                        changed = true;
-                    }}
-                    if (changed) {{
-                        window.location.replace(url.toString());
-                    }}
-                }} catch (e) {{}}
-            }}
-
             try {{
-                syncUrl(window.parent.location.href);
-            }} catch (e) {{
-                try {{
-                    syncUrl(window.location.href);
-                }} catch (e2) {{}}
-            }}
+                const sessionValue = window.localStorage.getItem(sessionKey) || "";
+                if (sessionValue) {{
+                    document.cookie = sessionKey + "=" + encodeURIComponent(sessionValue) + "; path=/; max-age={int(LOGIN_PERSIST_HOURS * 3600)}; SameSite=Lax";
+                }}
+            }} catch (e) {{}}
         }})();
         </script>
         """,
@@ -432,21 +391,13 @@ def bootstrap_login_persistence():
 
 
 def _get_client_id():
-    try:
-        val = st.query_params.get(LOGIN_CLIENT_KEY)
-        if isinstance(val, list):
-            val = val[0] if val else None
-        val = str(val or "").strip()
-        return val or None
-    except Exception:
-        return None
+    return None
 
 
 def set_login_cookie(token: str):
     """
     Persistance login par appareil/utilisateur.
-    IMPORTANT: en Streamlit App, il ne faut pas déclencher st.rerun juste après,
-    sinon le JS n'a pas le temps d'écrire le localStorage / query params.
+    Écrit dans cookie + localStorage puis recharge UNE fois la page côté client.
     """
     token = str(token or "").strip()
     if not token:
@@ -460,47 +411,19 @@ def set_login_cookie(token: str):
         <script>
         (function() {{
             const sessionKey = {_js_quote(LOGIN_PERSIST_KEY)};
-            const clientKey = {_js_quote(LOGIN_CLIENT_KEY)};
-            const clientStorageKey = {_js_quote(LOGIN_CLIENT_STORAGE_KEY)};
             const sessionValue = {token_js};
             const maxAge = {max_age};
-
-            function makeId() {{
-                try {{
-                    if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID();
-                }} catch (e) {{}}
-                return "cid-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
-            }}
-
-            let clientId = "";
-            try {{ clientId = window.localStorage.getItem(clientStorageKey) || ""; }} catch (e) {{}}
-            if (!clientId) {{
-                clientId = makeId();
-                try {{ window.localStorage.setItem(clientStorageKey, clientId); }} catch (e) {{}}
-            }}
-
             try {{
                 document.cookie = sessionKey + "=" + encodeURIComponent(sessionValue) + "; path=/; max-age=" + maxAge + "; SameSite=Lax";
             }} catch (e) {{}}
-
-            try {{ window.localStorage.setItem(sessionKey, sessionValue); }} catch (e) {{}}
-
-            function go(baseUrl, replaceTarget) {{
-                try {{
-                    const url = new URL(baseUrl);
-                    url.searchParams.set(sessionKey, sessionValue);
-                    if (clientId) url.searchParams.set(clientKey, clientId);
-                    setTimeout(() => replaceTarget(url.toString()), 150);
-                }} catch (e) {{}}
-            }}
-
             try {{
-                go(window.parent.location.href, (u) => window.parent.location.replace(u));
-            }} catch (e) {{
-                try {{
-                    go(window.location.href, (u) => window.location.replace(u));
-                }} catch (e2) {{}}
-            }}
+                window.localStorage.setItem(sessionKey, sessionValue);
+            }} catch (e) {{}}
+            setTimeout(function() {{
+                try {{ window.parent.location.reload(); }} catch (e) {{
+                    try {{ window.location.reload(); }} catch (e2) {{}}
+                }}
+            }}, 250);
         }})();
         </script>
         """,
@@ -509,7 +432,7 @@ def set_login_cookie(token: str):
 
 
 def clear_login_cookie():
-    """Supprime la persistance login côté client, sans toucher au client_id appareil."""
+    """Supprime la persistance login côté client puis recharge la page."""
     components.html(
         f"""
         <script>
@@ -521,22 +444,11 @@ def clear_login_cookie():
             try {{
                 window.localStorage.removeItem(sessionKey);
             }} catch (e) {{}}
-
-            function go(baseUrl, replaceTarget) {{
-                try {{
-                    const url = new URL(baseUrl);
-                    url.searchParams.delete(sessionKey);
-                    setTimeout(() => replaceTarget(url.toString()), 150);
-                }} catch (e) {{}}
-            }}
-
-            try {{
-                go(window.parent.location.href, (u) => window.parent.location.replace(u));
-            }} catch (e) {{
-                try {{
-                    go(window.location.href, (u) => window.location.replace(u));
-                }} catch (e2) {{}}
-            }}
+            setTimeout(function() {{
+                try {{ window.parent.location.reload(); }} catch (e) {{
+                    try {{ window.location.reload(); }} catch (e2) {{}}
+                }}
+            }}, 150);
         }})();
         </script>
         """,
@@ -545,17 +457,7 @@ def clear_login_cookie():
 
 
 def get_login_cookie():
-    # 1) query params (pont JS -> Python)
-    try:
-        val = st.query_params.get(LOGIN_PERSIST_KEY)
-        if isinstance(val, list):
-            val = val[0] if val else None
-        if val:
-            return str(val).strip()
-    except Exception:
-        pass
-
-    # 2) cookie direct si dispo dans la version de Streamlit
+    # 1) cookie direct si dispo dans la version de Streamlit
     try:
         ctx = getattr(st, "context", None)
         cookies = getattr(ctx, "cookies", None)
@@ -563,6 +465,16 @@ def get_login_cookie():
             val = cookies.get(LOGIN_PERSIST_KEY)
             if val:
                 return str(val).strip()
+    except Exception:
+        pass
+
+    # 2) query params (fallback de compatibilité)
+    try:
+        val = st.query_params.get(LOGIN_PERSIST_KEY)
+        if isinstance(val, list):
+            val = val[0] if val else None
+        if val:
+            return str(val).strip()
     except Exception:
         pass
 
