@@ -542,6 +542,8 @@ def login_screen():
         pwd = st.text_input("Mot de passe", type="password", key="login_pass")
 
     if st.button("Se connecter"):
+        login = str(login or "").strip().lower()
+        pwd = str(pwd or "")
         user = USERS.get(login)
 
         if user and user["password"] == pwd:
@@ -556,9 +558,9 @@ def login_screen():
 
             set_login_cookie(f"{login}|{token}")
 
-            st.success(f"Connecté en tant que **{login}** – rôle : {user['role']}")
-            st.info("Restauration automatique activée sur cet appareil.")
-            return
+            # ⚠️ important : sans rerun immédiat, main() exécute encore st.stop()
+            # du bloc login et l'app peut rester bloquée sur l'écran de connexion.
+            st.rerun()
         else:
             st.error("Identifiants incorrects.")
 
@@ -10275,7 +10277,9 @@ def main():
     # ======================================
     if not st.session_state.logged_in:
         login_screen()
-        st.stop()
+        if not st.session_state.get("logged_in"):
+            st.stop()
+        st.rerun()
 
     # ======================================
     # 3️⃣ UI MINIMALE
