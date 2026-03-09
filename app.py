@@ -397,7 +397,8 @@ def _get_client_id():
 def set_login_cookie(token: str):
     """
     Persistance login par appareil/utilisateur.
-    Écrit dans cookie + localStorage puis recharge UNE fois la page côté client.
+    Écrit dans cookie + localStorage + query param SANS forcer de reload.
+    Important pour éviter de bloquer l'app Streamlit/Desktop.
     """
     token = str(token or "").strip()
     if not token:
@@ -419,11 +420,17 @@ def set_login_cookie(token: str):
             try {{
                 window.localStorage.setItem(sessionKey, sessionValue);
             }} catch (e) {{}}
-            setTimeout(function() {{
-                try {{ window.parent.location.reload(); }} catch (e) {{
-                    try {{ window.location.reload(); }} catch (e2) {{}}
-                }}
-            }}, 250);
+            try {{
+                const url = new URL(window.parent.location.href);
+                url.searchParams.set(sessionKey, sessionValue);
+                window.parent.history.replaceState({{}}, "", url.toString());
+            }} catch (e) {{
+                try {{
+                    const url = new URL(window.location.href);
+                    url.searchParams.set(sessionKey, sessionValue);
+                    window.history.replaceState({{}}, "", url.toString());
+                }} catch (e2) {{}}
+            }}
         }})();
         </script>
         """,
@@ -432,7 +439,7 @@ def set_login_cookie(token: str):
 
 
 def clear_login_cookie():
-    """Supprime la persistance login côté client puis recharge la page."""
+    """Supprime la persistance login côté client sans boucle de reload."""
     components.html(
         f"""
         <script>
@@ -444,11 +451,17 @@ def clear_login_cookie():
             try {{
                 window.localStorage.removeItem(sessionKey);
             }} catch (e) {{}}
-            setTimeout(function() {{
-                try {{ window.parent.location.reload(); }} catch (e) {{
-                    try {{ window.location.reload(); }} catch (e2) {{}}
-                }}
-            }}, 150);
+            try {{
+                const url = new URL(window.parent.location.href);
+                url.searchParams.delete(sessionKey);
+                window.parent.history.replaceState({{}}, "", url.toString());
+            }} catch (e) {{
+                try {{
+                    const url = new URL(window.location.href);
+                    url.searchParams.delete(sessionKey);
+                    window.history.replaceState({{}}, "", url.toString());
+                }} catch (e2) {{}}
+            }}
         }})();
         </script>
         """,
@@ -545,7 +558,7 @@ def login_screen():
 
             st.success(f"Connecté en tant que **{login}** – rôle : {user['role']}")
             st.info("Restauration automatique activée sur cet appareil.")
-            st.stop()
+            return
         else:
             st.error("Identifiants incorrects.")
 
@@ -3688,8 +3701,8 @@ def logout():
     except Exception:
         pass
 
-    st.info("Déconnexion en cours...")
-    st.stop()
+    st.info("Déconnecté.")
+    st.rerun()
 
 # ============================================================
 
