@@ -358,8 +358,7 @@ import streamlit.components.v1 as components
 LOGIN_PERSIST_KEY = "al_session"
 LOGIN_CLIENT_KEY = "al_client_id"
 LOGIN_CLIENT_STORAGE_KEY = "al_client_id_local"
-LOGIN_PERSIST_HOURS = 24 * 30  # 30 jours
-LOGIN_REMEMBER_KEY = "al_remember_me"
+LOGIN_PERSIST_HOURS = 8
 
 
 def _js_quote(val: str) -> str:
@@ -369,68 +368,20 @@ def _js_quote(val: str) -> str:
 
 def bootstrap_login_persistence():
     """
-    Pont JS robuste pour Streamlit App/Desktop/GSM.
-    - relit la session stockée dans localStorage
-    - resynchronise cookie + query param
-    - force UNE seule réouverture silencieuse si nécessaire
-    - chaque appareil garde SA session jusqu'à déconnexion volontaire
+    Pont JS minimal pour Streamlit App/Desktop.
+    - ne redirige jamais l'application
+    - synchronise simplement localStorage -> cookie navigateur
+    - évite tout blocage / boucle de replace()
     """
-    max_age = int(LOGIN_PERSIST_HOURS * 3600)
     components.html(
         f"""
         <script>
         (function() {{
             const sessionKey = {_js_quote(LOGIN_PERSIST_KEY)};
-            const rememberKey = {_js_quote(LOGIN_REMEMBER_KEY)};
-            const bootKey = sessionKey + "_boot_once";
-            const maxAge = {max_age};
-
-            function getUrl() {{
-                try {{
-                    return new URL(window.parent.location.href);
-                }} catch (e) {{
-                    return new URL(window.location.href);
-                }}
-            }}
-
-            function doReload(urlObj) {{
-                try {{
-                    window.parent.location.replace(urlObj.toString());
-                    return;
-                }} catch (e) {{}}
-                try {{
-                    window.location.replace(urlObj.toString());
-                }} catch (e2) {{}}
-            }}
-
             try {{
-                const remember = (window.localStorage.getItem(rememberKey) || "1") === "1";
-                const sessionValue = remember ? (window.localStorage.getItem(sessionKey) || "") : "";
-
+                const sessionValue = window.localStorage.getItem(sessionKey) || "";
                 if (sessionValue) {{
-                    document.cookie = sessionKey + "=" + encodeURIComponent(sessionValue) + "; path=/; max-age=" + maxAge + "; SameSite=Lax";
-                }}
-
-                const url = getUrl();
-                const current = url.searchParams.get(sessionKey) || "";
-                const bootSig = sessionValue ? (sessionValue + "|" + url.pathname) : "";
-                const alreadyBooted = window.sessionStorage.getItem(bootKey) || "";
-
-                if (sessionValue && current !== sessionValue && alreadyBooted !== bootSig) {{
-                    window.sessionStorage.setItem(bootKey, bootSig);
-                    url.searchParams.set(sessionKey, sessionValue);
-                    doReload(url);
-                    return;
-                }}
-
-                if (!sessionValue && current) {{
-                    url.searchParams.delete(sessionKey);
-                    doReload(url);
-                    return;
-                }}
-
-                if (sessionValue && current === sessionValue) {{
-                    window.sessionStorage.removeItem(bootKey);
+                    document.cookie = sessionKey + "=" + encodeURIComponent(sessionValue) + "; path=/; max-age={int(LOGIN_PERSIST_HOURS * 3600)}; SameSite=Lax";
                 }}
             }} catch (e) {{}}
         }})();
@@ -444,18 +395,17 @@ def _get_client_id():
     return None
 
 
-def set_login_cookie(token: str, remember: bool = True):
+def set_login_cookie(token: str):
     """
     Persistance login par appareil/utilisateur.
-    - remember=True  : conserve la session sur CET appareil jusqu'à déconnexion
-    - remember=False : session uniquement pour l'onglet courant
+    Écrit dans cookie + localStorage + query param SANS forcer de reload.
+    Important pour éviter de bloquer l'app Streamlit/Desktop.
     """
     token = str(token or "").strip()
     if not token:
         return
 
     token_js = _js_quote(token)
-    remember_js = "true" if remember else "false"
     max_age = int(LOGIN_PERSIST_HOURS * 3600)
 
     components.html(
@@ -463,23 +413,14 @@ def set_login_cookie(token: str, remember: bool = True):
         <script>
         (function() {{
             const sessionKey = {_js_quote(LOGIN_PERSIST_KEY)};
-            const rememberKey = {_js_quote(LOGIN_REMEMBER_KEY)};
             const sessionValue = {token_js};
             const maxAge = {max_age};
-            const remember = {remember_js};
-
             try {{
-                if (remember) {{
-                    document.cookie = sessionKey + "=" + encodeURIComponent(sessionValue) + "; path=/; max-age=" + maxAge + "; SameSite=Lax";
-                    window.localStorage.setItem(sessionKey, sessionValue);
-                    window.localStorage.setItem(rememberKey, "1");
-                }} else {{
-                    document.cookie = sessionKey + "=" + encodeURIComponent(sessionValue) + "; path=/; SameSite=Lax";
-                    window.localStorage.removeItem(sessionKey);
-                    window.localStorage.setItem(rememberKey, "0");
-                }}
+                document.cookie = sessionKey + "=" + encodeURIComponent(sessionValue) + "; path=/; max-age=" + maxAge + "; SameSite=Lax";
             }} catch (e) {{}}
-
+            try {{
+                window.localStorage.setItem(sessionKey, sessionValue);
+            }} catch (e) {{}}
             try {{
                 const url = new URL(window.parent.location.href);
                 url.searchParams.set(sessionKey, sessionValue);
@@ -499,20 +440,17 @@ def set_login_cookie(token: str, remember: bool = True):
 
 
 def clear_login_cookie():
-    """Supprime toute persistance login côté client."""
+    """Supprime la persistance login côté client sans boucle de reload."""
     components.html(
         f"""
         <script>
         (function() {{
             const sessionKey = {_js_quote(LOGIN_PERSIST_KEY)};
-            const rememberKey = {_js_quote(LOGIN_REMEMBER_KEY)};
             try {{
                 document.cookie = sessionKey + "=; path=/; max-age=0; SameSite=Lax";
             }} catch (e) {{}}
             try {{
                 window.localStorage.removeItem(sessionKey);
-                window.localStorage.removeItem(rememberKey);
-                window.sessionStorage.removeItem(sessionKey + "_boot_once");
             }} catch (e) {{}}
             try {{
                 const url = new URL(window.parent.location.href);
@@ -598,14 +536,6 @@ def login_screen():
     st.title("🚐 Airports-Lines — Planning chauffeurs (DB)")
     st.subheader("Connexion")
 
-    # IMPORTANT:
-    # - la checkbox a son propre state widget (remember_me_widget)
-    # - la préférence applicative reste dans remember_me
-    # Cela évite l'erreur StreamlitAPIException quand on modifie
-    # session_state["remember_me"] après la création du widget.
-    if "remember_me_widget" not in st.session_state:
-        st.session_state["remember_me_widget"] = bool(st.session_state.get("remember_me", True))
-
     col1, col2 = st.columns(2)
 
     with col1:
@@ -613,10 +543,12 @@ def login_screen():
     with col2:
         pwd = st.text_input("Mot de passe", type="password", key="login_pass")
 
-    remember_me = st.checkbox(
+    remember_default = bool(st.session_state.get("remember_me", True))
+    remember_choice = st.checkbox(
         "Se rappeler de moi sur cet appareil",
+        value=remember_default,
         key="remember_me_widget",
-        help="Chaque téléphone garde uniquement SA session jusqu'à la déconnexion.",
+        help="Garde uniquement la session de cet appareil jusqu’à Déconnexion.",
     )
 
     if st.button("Se connecter"):
@@ -626,25 +558,23 @@ def login_screen():
 
         if user and user["password"] == pwd:
             token = str(uuid.uuid4())
-            remember_choice = bool(remember_me)
 
             st.session_state.logged_in = True
             st.session_state.username = login
             st.session_state.role = user['role']
             st.session_state.chauffeur_code = user.get('chauffeur_code')
             st.session_state.session_token = token
+            st.session_state["remember_me"] = bool(remember_choice)
             st.session_state["_persist_state_saved"] = False
-            st.session_state["remember_me"] = remember_choice
-            st.session_state["remember_me_widget"] = remember_choice
 
-            set_login_cookie(f"{login}|{token}", remember=remember_choice)
+            if remember_choice:
+                set_login_cookie(f"{login}|{token}")
+                st.info("Restauration automatique activée sur cet appareil.")
+            else:
+                clear_login_cookie()
+                st.info("Connexion temporaire : la session ne sera pas restaurée automatiquement.")
 
             st.success(f"Connecté en tant que **{login}** – rôle : {user['role']}")
-            if remember_choice:
-                st.info("Connexion persistante activée sur cet appareil.")
-            else:
-                st.info("Connexion active uniquement pour cette session.")
-
             st.rerun()
         else:
             st.error("Identifiants incorrects.")
@@ -10362,8 +10292,9 @@ def main():
     # ======================================
     if not st.session_state.logged_in:
         login_screen()
-        if not st.session_state.get("logged_in"):
+        if not st.session_state.logged_in:
             st.stop()
+        st.rerun()
 
     # ======================================
     # 3️⃣ UI MINIMALE
