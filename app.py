@@ -358,7 +358,7 @@ import streamlit.components.v1 as components
 LOGIN_PERSIST_KEY = "al_session"
 LOGIN_CLIENT_KEY = "al_client_id"
 LOGIN_CLIENT_STORAGE_KEY = "al_client_id_local"
-LOGIN_PERSIST_HOURS = 8
+LOGIN_PERSIST_HOURS = 24 * 30  # 30 jours
 
 
 def _js_quote(val: str) -> str:
@@ -368,20 +368,63 @@ def _js_quote(val: str) -> str:
 
 def bootstrap_login_persistence():
     """
-    Pont JS minimal pour Streamlit App/Desktop.
-    - ne redirige jamais l'application
-    - synchronise simplement localStorage -> cookie navigateur
-    - évite tout blocage / boucle de replace()
+    Pont JS robuste pour Streamlit mobile / desktop.
+    - recharge UNE seule fois si une session locale existe mais n'est pas encore visible côté serveur
+    - synchronise localStorage -> cookie + query param
+    - évite les boucles infinies
     """
     components.html(
         f"""
         <script>
         (function() {{
             const sessionKey = {_js_quote(LOGIN_PERSIST_KEY)};
+            const bootKey = "_al_boot";
+            const maxAge = {int(LOGIN_PERSIST_HOURS * 3600)};
+
+            function getCurrentUrl() {{
+                try {{
+                    return new URL(window.parent.location.href);
+                }} catch (e) {{
+                    try {{
+                        return new URL(window.location.href);
+                    }} catch (e2) {{
+                        return null;
+                    }}
+                }}
+            }}
+
+            function replaceUrl(url) {{
+                try {{
+                    window.parent.location.replace(url.toString());
+                }} catch (e) {{
+                    try {{
+                        window.location.replace(url.toString());
+                    }} catch (e2) {{}}
+                }}
+            }}
+
             try {{
                 const sessionValue = window.localStorage.getItem(sessionKey) || "";
-                if (sessionValue) {{
-                    document.cookie = sessionKey + "=" + encodeURIComponent(sessionValue) + "; path=/; max-age={int(LOGIN_PERSIST_HOURS * 3600)}; SameSite=Lax";
+                if (!sessionValue) {{
+                    return;
+                }}
+
+                try {{
+                    document.cookie = sessionKey + "=" + encodeURIComponent(sessionValue) + "; path=/; max-age=" + maxAge + "; SameSite=Lax";
+                }} catch (e) {{}}
+
+                const url = getCurrentUrl();
+                if (!url) {{
+                    return;
+                }}
+
+                const currentToken = url.searchParams.get(sessionKey) || "";
+                const alreadyBooted = url.searchParams.get(bootKey) || "";
+
+                if (currentToken !== sessionValue || alreadyBooted !== "1") {{
+                    url.searchParams.set(sessionKey, sessionValue);
+                    url.searchParams.set(bootKey, "1");
+                    replaceUrl(url);
                 }}
             }} catch (e) {{}}
         }})();
@@ -398,8 +441,7 @@ def _get_client_id():
 def set_login_cookie(token: str):
     """
     Persistance login par appareil/utilisateur.
-    Écrit dans cookie + localStorage + query param SANS forcer de reload.
-    Important pour éviter de bloquer l'app Streamlit/Desktop.
+    Écrit dans cookie + localStorage + query param.
     """
     token = str(token or "").strip()
     if not token:
@@ -424,11 +466,13 @@ def set_login_cookie(token: str):
             try {{
                 const url = new URL(window.parent.location.href);
                 url.searchParams.set(sessionKey, sessionValue);
+                url.searchParams.set("_al_boot", "1");
                 window.parent.history.replaceState({{}}, "", url.toString());
             }} catch (e) {{
                 try {{
                     const url = new URL(window.location.href);
                     url.searchParams.set(sessionKey, sessionValue);
+                    url.searchParams.set("_al_boot", "1");
                     window.history.replaceState({{}}, "", url.toString());
                 }} catch (e2) {{}}
             }}
@@ -455,11 +499,13 @@ def clear_login_cookie():
             try {{
                 const url = new URL(window.parent.location.href);
                 url.searchParams.delete(sessionKey);
+                url.searchParams.delete("_al_boot");
                 window.parent.history.replaceState({{}}, "", url.toString());
             }} catch (e) {{
                 try {{
                     const url = new URL(window.location.href);
                     url.searchParams.delete(sessionKey);
+                    url.searchParams.delete("_al_boot");
                     window.history.replaceState({{}}, "", url.toString());
                 }} catch (e2) {{}}
             }}
