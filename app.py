@@ -346,26 +346,166 @@ CH_CODES = [
     "MF", "WS", "PO"
 ]
 # ============================================================
-# 🔐 SESSION PERSISTANTE (COOKIE)
+# 🔐 SESSION PERSISTANTE (TOKEN SIGNÉ + URL + STORAGE NAVIGATEUR)
 # ============================================================
 import uuid
+import json
+import hmac
+import hashlib
+import base64
 import streamlit.components.v1 as components
 
+LOGIN_TOKEN_SECRET = "airports-lines-login-v1"
+LOGIN_TOKEN_TTL_SEC = 60 * 60 * 24 * 30  # 30 jours
+
+
+def _b64u_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
+
+
+def _b64u_decode(data: str) -> bytes:
+    data = str(data or "")
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
+
+
+def _make_login_token(username: str, role: str, chauffeur_code: str | None) -> str:
+    payload = {
+        "u": str(username or "").strip(),
+        "r": str(role or "").strip(),
+        "c": str(chauffeur_code or "").strip(),
+        "exp": int(time.time()) + LOGIN_TOKEN_TTL_SEC,
+    }
+    payload_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    payload_b64 = _b64u_encode(payload_bytes)
+    sig = hmac.new(
+        LOGIN_TOKEN_SECRET.encode("utf-8"),
+        payload_b64.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    return f"{payload_b64}.{_b64u_encode(sig)}"
+
+
+def _parse_login_token(token: str) -> dict | None:
+    try:
+        payload_b64, sig_b64 = str(token or "").split(".", 1)
+        expected_sig = hmac.new(
+            LOGIN_TOKEN_SECRET.encode("utf-8"),
+            payload_b64.encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+        if not hmac.compare_digest(_b64u_encode(expected_sig), sig_b64):
+            return None
+        payload = json.loads(_b64u_decode(payload_b64).decode("utf-8"))
+        if int(payload.get("exp", 0)) < int(time.time()):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
 def set_login_cookie(token: str):
+    try:
+        st.query_params["al_session"] = token
+    except Exception:
+        pass
+
+    safe_token = json.dumps(str(token or ""))
     components.html(
         f"""
         <script>
-        document.cookie = "al_session={token}; path=/; max-age=28800";
+        (function() {{
+            const token = {safe_token};
+            try {{
+                document.cookie = "al_session=" + encodeURIComponent(token) + "; path=/; max-age={LOGIN_TOKEN_TTL_SEC}; SameSite=Lax";
+            }} catch (e) {{}}
+            try {{
+                window.localStorage.setItem("al_session", token);
+            }} catch (e) {{}}
+            try {{
+                const url = new URL(window.location.href);
+                url.searchParams.set("al_session", token);
+                window.history.replaceState({{}}, "", url.toString());
+            }} catch (e) {{}}
+        }})();
         </script>
         """,
         height=0,
     )
 
+
+def clear_login_cookie():
+    try:
+        if "al_session" in st.query_params:
+            del st.query_params["al_session"]
+    except Exception:
+        pass
+
+    components.html(
+        """
+        <script>
+        (function() {
+            try {
+                document.cookie = "al_session=; path=/; max-age=0; SameSite=Lax";
+            } catch (e) {}
+            try {
+                window.localStorage.removeItem("al_session");
+            } catch (e) {}
+            try {
+                const url = new URL(window.location.href);
+                url.searchParams.delete("al_session");
+                window.history.replaceState({}, "", url.toString());
+            } catch (e) {}
+        })();
+        </script>
+        """,
+        height=0,
+    )
+
+
 def get_login_cookie():
     try:
-        return st.query_params.get("al_session")
+        tok = st.query_params.get("al_session")
+        return str(tok).strip() if tok else None
     except Exception:
         return None
+
+
+def restore_login_from_token() -> bool:
+    if st.session_state.get("logged_in"):
+        return True
+
+    tok = get_login_cookie()
+    if not tok:
+        return False
+
+    payload = _parse_login_token(tok)
+    if not payload:
+        return False
+
+    username = str(payload.get("u", "")).strip()
+    role = str(payload.get("r", "")).strip()
+    chauffeur_code = str(payload.get("c", "")).strip() or None
+
+    if not username or username not in USERS:
+        return False
+
+    user = USERS.get(username, {})
+    expected_role = str(user.get("role") or "").strip()
+    expected_ch = str(user.get("chauffeur_code") or "").strip() or None
+
+    if expected_role != role:
+        return False
+    if (expected_ch or None) != chauffeur_code:
+        return False
+
+    st.session_state.logged_in = True
+    st.session_state.username = username
+    st.session_state.role = role
+    st.session_state.chauffeur_code = chauffeur_code
+    st.session_state.session_token = tok
+    return True
+
 # ============================================================
 #   LOGIN SCREEN
 # ============================================================
@@ -387,7 +527,7 @@ def login_screen():
         user = USERS.get(login)
 
         if user and user["password"] == pwd:
-            token = str(uuid.uuid4())
+            token = _make_login_token(login, user["role"], user.get("chauffeur_code"))
 
             st.session_state.logged_in = True
             st.session_state.username = login
@@ -3476,6 +3616,7 @@ def logout():
     ):
         st.session_state.pop(k, None)
 
+    clear_login_cookie()
     st.cache_data.clear()
     st.rerun()
 
@@ -3483,7 +3624,7 @@ def logout():
 
 def _send_planning_next_3_days_to_all(*, want_pdf: bool = True) -> dict:
     """
-    Envoie le planning des 3 prochains jours (J à J+2) à tous les chauffeurs actifs sur la période.
+    Envoie le planning de demain à J+3 à tous les chauffeurs actifs sur la période.
     Retourne un petit récap {sent, skipped_empty, missing_email, errors}.
     """
     from datetime import date, timedelta
@@ -3496,8 +3637,8 @@ def _send_planning_next_3_days_to_all(*, want_pdf: bool = True) -> dict:
         return recap
 
     today = date.today()
-    d_start = today
-    d_end = today + timedelta(days=2)
+    d_start = today + timedelta(days=1)
+    d_end = today + timedelta(days=3)
 
     # init table log si dispo
     try:
@@ -3531,10 +3672,10 @@ def _send_planning_next_3_days_to_all(*, want_pdf: bool = True) -> dict:
 
     chauffeurs = sorted(active_chauffeurs)
     if not chauffeurs:
-        st.info("Aucun chauffeur trouvé sur les 3 prochains jours.")
+        st.info("Aucun chauffeur trouvé sur la période demain → J+3.")
         return recap
 
-    periode_label = "3 prochains jours"
+    periode_label = "de demain à J+3"
     for ch in dict.fromkeys(chauffeurs):
         try:
             _tel, mail = get_chauffeur_contact(ch)
@@ -3560,7 +3701,6 @@ def _send_planning_next_3_days_to_all(*, want_pdf: bool = True) -> dict:
                     pass
                 continue
 
-            # corps mail (identique)
             try:
                 body = build_planning_mail_body(
                     df_ch=df_ch,
@@ -3586,7 +3726,6 @@ def _send_planning_next_3_days_to_all(*, want_pdf: bool = True) -> dict:
                         df_table[c] = ""
                 df_table = df_table[planning_cols_driver]
 
-                # ✅ Affichage plage horaire (HEURE début + ²²²² = fin) quand ²²²² contient une vraie heure
                 def _looks_like_time_local(v):
                     try:
                         t = normalize_time_string(v)
@@ -3597,19 +3736,13 @@ def _send_planning_next_3_days_to_all(*, want_pdf: bool = True) -> dict:
                 if "HEURE" in df_table.columns and "²²²²" in df_table.columns:
                     h_deb = df_table["HEURE"].astype(str).map(lambda x: normalize_time_string(x) or str(x))
                     h_fin = df_table["²²²²"].astype(str).map(_looks_like_time_local)
-
-                    # Si fin valide et différente → on affiche HEURE sous forme "HH:MM–HH:MM"
                     df_table["HEURE"] = [
                         (f"{a}–{b}" if (a and b and a != b) else a)
                         for a, b in zip(h_deb, h_fin)
                     ]
 
-                # ✅ IMPORTANT : on ne normalise PAS Unnamed: 8 ici (texte libre = on garde)
-
-
                 pdf_buf = export_chauffeur_planning_table_pdf(df_table, ch)
                 pdf_bytes = pdf_buf.getvalue() if hasattr(pdf_buf, "getvalue") else bytes(pdf_buf)
-
                 fname = f"Planning_{ch}_{d_start.isoformat()}_{d_end.isoformat()}.pdf"
 
                 ok = send_email_smtp_with_attachments(
@@ -3646,7 +3779,7 @@ def _send_planning_next_3_days_to_all(*, want_pdf: bool = True) -> dict:
 
 def _topbar_sync_db_and_refresh(*, also_send_next3: bool = False):
     """Bouton top-bar : MAJ DB depuis Dropbox puis rafraîchit l'UI.
-    Option: envoi aussi le planning des 3 prochains jours.
+    Option: envoi aussi le planning de demain à J+3.
     """
     from datetime import datetime
 
@@ -3659,7 +3792,7 @@ def _topbar_sync_db_and_refresh(*, also_send_next3: bool = False):
                 sync_planning_from_today(ui=True)
 
         if also_send_next3:
-            with st.spinner("📧 Envoi planning (3 prochains jours)…"):
+            with st.spinner("📧 Envoi planning (demain → J+3)…"):
                 recap = _send_planning_next_3_days_to_all(want_pdf=True)
                 st.success(
                     f"📧 Envoi terminé — envoyés: {recap['sent']} | vides: {recap['skipped_empty']} | emails manquants: {recap['missing_email']} | erreurs: {recap['errors']}"
@@ -3714,11 +3847,11 @@ def render_top_bar():
             st.empty()
 
     # -------------------------------
-    # 📧 MAJ + Envoi planning 3 jours (ADMIN ONLY, PDF joint)
+    # 📧 MAJ + Envoi planning demain → J+3 (ADMIN ONLY, PDF joint)
     # -------------------------------
     with col3:
         if role == "admin":
-            if st.button("📧 Maj + envoyer planning (3j)", use_container_width=True, key="topbar_sync_send_3j"):
+            if st.button("📧 Maj + envoyer planning (demain → J+3)", use_container_width=True, key="topbar_sync_send_3j"):
                 _topbar_sync_db_and_refresh(also_send_next3=True)
         else:
             st.empty()
@@ -9975,6 +10108,7 @@ def main():
     # ======================================
     # 2️⃣ LOGIN
     # ======================================
+    restore_login_from_token()
     if not st.session_state.logged_in:
         login_screen()
         st.stop()
@@ -10218,8 +10352,3 @@ def build_printable_html(df):
     """
 
 
-# 🔁 Auto-login via cookie
-if not st.session_state.get("logged_in"):
-    tok = _get_login_cookie()
-    if tok and st.session_state.get("session_token") == tok:
-        st.session_state.logged_in = True
