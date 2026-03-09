@@ -358,6 +358,7 @@ import streamlit.components.v1 as components
 
 AL_SESSION_SECRET = os.environ.get("AL_SESSION_SECRET", "airports-lines-session-secret-2026")
 AL_SESSION_MAX_AGE = 60 * 60 * 24 * 30  # 30 jours
+AL_TRUSTED_DEVICES_FILE = str((Path(__file__).resolve().parent / ".al_trusted_devices.json"))
 
 
 def _b64u_encode(raw: bytes) -> str:
@@ -407,6 +408,131 @@ def parse_login_token(token: str) -> dict | None:
             "role": role,
             "chauffeur_code": chauffeur_code or None,
         }
+    except Exception:
+        return None
+
+
+def _device_fingerprint() -> str:
+    """
+    Empreinte "appareil" côté serveur pour restaurer la session
+    même si le conteneur Streamlit n'a pas gardé le cookie/localStorage.
+    Ce n'est pas une mesure de sécurité forte : c'est un mécanisme de confort.
+    """
+    try:
+        headers = getattr(st.context, "headers", None)
+    except Exception:
+        headers = None
+
+    def _h(name: str) -> str:
+        try:
+            if not headers:
+                return ""
+            val = headers.get(name)
+            if isinstance(val, list):
+                val = val[-1] if val else ""
+            return str(val or "").strip()
+        except Exception:
+            return ""
+
+    bits = [
+        _h("user-agent"),
+        _h("sec-ch-ua"),
+        _h("sec-ch-ua-platform"),
+        _h("accept-language"),
+        str(getattr(st.context, "timezone", "") or ""),
+        str(getattr(st.context, "locale", "") or ""),
+        str(getattr(st.context, "url", "") or ""),
+        str(getattr(st.context, "is_embedded", "") or ""),
+        str(getattr(st.context, "ip_address", "") or ""),
+    ]
+    raw = "|".join(bits)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+
+def _load_trusted_devices() -> dict:
+    try:
+        fp = Path(AL_TRUSTED_DEVICES_FILE)
+        if not fp.exists():
+            return {}
+        data = json.loads(fp.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+
+def _save_trusted_devices(data: dict):
+    try:
+        fp = Path(AL_TRUSTED_DEVICES_FILE)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        tmp = fp.with_suffix(fp.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(fp)
+    except Exception:
+        pass
+
+
+
+def remember_trusted_device(token: str, username: str, role: str, chauffeur_code: str | None = None):
+    try:
+        device_key = _device_fingerprint()
+        if not device_key:
+            return
+        data = _load_trusted_devices()
+        data[device_key] = {
+            "token": str(token or "").strip(),
+            "username": str(username or "").strip(),
+            "role": str(role or "").strip(),
+            "chauffeur_code": str(chauffeur_code or "").strip(),
+            "exp": int(time.time()) + int(AL_SESSION_MAX_AGE),
+            "updated_at": int(time.time()),
+        }
+        # nettoyage des entrées expirées
+        now_ts = int(time.time())
+        data = {
+            k: v for k, v in data.items()
+            if isinstance(v, dict) and int(v.get("exp", 0) or 0) >= now_ts and str(v.get("token", "")).strip()
+        }
+        _save_trusted_devices(data)
+    except Exception:
+        pass
+
+
+
+def forget_trusted_device():
+    try:
+        device_key = _device_fingerprint()
+        if not device_key:
+            return
+        data = _load_trusted_devices()
+        if device_key in data:
+            data.pop(device_key, None)
+            _save_trusted_devices(data)
+    except Exception:
+        pass
+
+
+
+def get_trusted_device_token() -> str | None:
+    try:
+        device_key = _device_fingerprint()
+        if not device_key:
+            return None
+        data = _load_trusted_devices()
+        row = data.get(device_key) if isinstance(data, dict) else None
+        if not isinstance(row, dict):
+            return None
+        if int(row.get("exp", 0) or 0) < int(time.time()):
+            data.pop(device_key, None)
+            _save_trusted_devices(data)
+            return None
+        tok = str(row.get("token", "") or "").strip()
+        if not parse_login_token(tok):
+            data.pop(device_key, None)
+            _save_trusted_devices(data)
+            return None
+        return tok
     except Exception:
         return None
 
@@ -499,8 +625,10 @@ def clear_login_cookie():
 
 def get_login_cookie():
     """
-    Lit d'abord le vrai cookie navigateur envoyé à Streamlit.
-    Fallback éventuel sur le query param pour compatibilité arrière.
+    Ordre de priorité:
+    1) vrai cookie navigateur
+    2) query param (compatibilité)
+    3) appareil de confiance côté serveur (fallback Streamlit app)
     """
     # 1) vrai cookie navigateur (persistant après fermeture/réouverture)
     try:
@@ -526,6 +654,11 @@ def get_login_cookie():
     except Exception:
         pass
 
+    # 3) fallback robuste: appareil de confiance mémorisé côté serveur
+    tok = get_trusted_device_token()
+    if tok:
+        return tok
+
     return None
 
 
@@ -543,6 +676,7 @@ def restore_session_from_token() -> bool:
     st.session_state.role = data["role"]
     st.session_state.chauffeur_code = data.get("chauffeur_code")
     st.session_state.session_token = token
+    remember_trusted_device(token, data["username"], data["role"], data.get("chauffeur_code"))
     return True
 
 
@@ -635,6 +769,7 @@ def login_screen():
                 pass
 
             set_login_cookie(token)
+            remember_trusted_device(token, login, user["role"], user.get("chauffeur_code"))
 
             st.success(f"Connecté en tant que **{login}** – rôle : {user['role']}")
             st.rerun()
@@ -3708,6 +3843,7 @@ def logout():
     Ne casse pas la session Streamlit interne.
     """
     clear_login_cookie()
+    forget_trusted_device()
     try:
         if "al_session" in st.query_params:
             del st.query_params["al_session"]
