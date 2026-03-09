@@ -346,9 +346,12 @@ CH_CODES = [
     "OM", "AD", "CB", "CF", "CM", "EM", "GE", "HM", "JF", "KM", "LILLO",
     "MF", "WS", "PO"
 ]
+
 # ============================================================
-# 🔐 SESSION PERSISTANTE (COOKIE / QUERY PARAMS / LOCALSTORAGE)
-#    + FALLBACK SERVEUR PAR CLIENT_ID (spécial Streamlit App)
+# 🔐 SESSION PERSISTANTE ROBUSTE (GSM / Streamlit App)
+#    - client_id stable par appareil
+#    - session stockée côté serveur (SQLite)
+#    - relance URL une seule fois pour remonter client_id/session à Python
 # ============================================================
 import uuid
 import json
@@ -356,9 +359,10 @@ import threading
 import streamlit.components.v1 as components
 
 LOGIN_PERSIST_KEY = "al_session"
-LOGIN_CLIENT_KEY = "al_client_id"
-LOGIN_CLIENT_STORAGE_KEY = "al_client_id_local"
-LOGIN_PERSIST_HOURS = 8
+LOGIN_CLIENT_KEY = "al_cid"
+LOGIN_CLIENT_STORAGE_KEY = "al_cid_local"
+LOGIN_BOOTSTRAP_FLAG = "al_bootstrap_done"
+LOGIN_PERSIST_HOURS = 24 * 30  # 30 jours
 
 
 def _js_quote(val: str) -> str:
@@ -366,68 +370,113 @@ def _js_quote(val: str) -> str:
     return _json.dumps(str(val or ""))
 
 
+def ensure_persistent_sessions_table():
+    try:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS persistent_sessions (
+                    client_id TEXT PRIMARY KEY,
+                    login TEXT NOT NULL,
+                    token TEXT NOT NULL,
+                    remember_me INTEGER DEFAULT 1,
+                    active INTEGER DEFAULT 1,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    expires_at TEXT
+                )
+                """
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"⚠️ ensure_persistent_sessions_table error: {e}", flush=True)
+
+
+def get_client_id():
+    try:
+        v = st.query_params.get(LOGIN_CLIENT_KEY)
+        if isinstance(v, list):
+            v = v[0] if v else None
+        if v:
+            return str(v).strip()
+    except Exception:
+        pass
+    return ""
+
+
 def bootstrap_login_persistence():
     """
-    Pont JS robuste pour Streamlit App/Desktop/mobile.
-    - remet le token localStorage dans le cookie navigateur
-    - si l'app redémarre sans query param, le réinjecte UNE fois
-    - évite les boucles infinies via sessionStorage
+    1) crée un client_id stable dans localStorage si absent
+    2) remonte client_id + session token dans l'URL parent
+    3) force AU PLUS un rechargement complet si l'URL parent n'a pas encore ces infos
     """
     components.html(
         f"""
         <script>
         (function() {{
             const sessionKey = {_js_quote(LOGIN_PERSIST_KEY)};
-            const restoreOnceKey = sessionKey + "_restore_once";
+            const clientKey = {_js_quote(LOGIN_CLIENT_STORAGE_KEY)};
+            const clientParam = {_js_quote(LOGIN_CLIENT_KEY)};
+            const bootFlag = {_js_quote(LOGIN_BOOTSTRAP_FLAG)};
             const maxAge = {int(LOGIN_PERSIST_HOURS * 3600)};
 
-            function getCurrentUrl() {{
-                try {{
-                    return new URL(window.parent.location.href);
-                }} catch (e) {{
-                    return new URL(window.location.href);
-                }}
+            function getTopWin() {{
+                try {{ return window.parent || window; }} catch (e) {{ return window; }}
             }}
 
-            function hardReplace(url) {{
+            function ensureCid(w) {{
+                let cid = "";
+                try {{ cid = w.localStorage.getItem(clientKey) || ""; }} catch (e) {{}}
+                if (!cid) {{
+                    cid = "cid-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+                    try {{ w.localStorage.setItem(clientKey, cid); }} catch (e) {{}}
+                }}
+                return cid;
+            }}
+
+            function getStoredSession(w) {{
+                try {{ return w.localStorage.getItem(sessionKey) || ""; }} catch (e) {{ return ""; }}
+            }}
+
+            function setCookie(w, key, val) {{
                 try {{
-                    window.parent.location.replace(url.toString());
-                    return;
-                }} catch (e) {{}}
-                try {{
-                    window.location.replace(url.toString());
+                    w.document.cookie = key + "=" + encodeURIComponent(val) + "; path=/; max-age=" + maxAge + "; SameSite=Lax";
                 }} catch (e) {{}}
             }}
 
-            try {{
-                const sessionValue = window.localStorage.getItem(sessionKey) || "";
-                if (!sessionValue) {{
-                    try {{ window.sessionStorage.removeItem(restoreOnceKey); }} catch (e) {{}}
-                    return;
-                }}
+            const w = getTopWin();
+            const cid = ensureCid(w);
+            const sess = getStoredSession(w);
+            if (sess) {{ setCookie(w, sessionKey, sess); }}
+            if (cid)  {{ setCookie(w, clientParam, cid); }}
 
-                try {{
-                    document.cookie = sessionKey + "=" + encodeURIComponent(sessionValue) + "; path=/; max-age=" + maxAge + "; SameSite=Lax";
-                }} catch (e) {{}}
+            let url;
+            try {{ url = new URL(w.location.href); }} catch (e) {{
+                try {{ url = new URL(window.location.href); }} catch (e2) {{ return; }}
+            }}
 
-                const url = getCurrentUrl();
-                const currentParam = url.searchParams.get(sessionKey) || "";
+            let changed = false;
+            if (cid && url.searchParams.get(clientParam) !== cid) {{
+                url.searchParams.set(clientParam, cid);
+                changed = true;
+            }}
+            if (sess && url.searchParams.get(sessionKey) !== sess) {{
+                url.searchParams.set(sessionKey, sess);
+                changed = true;
+            }}
 
-                if (currentParam === sessionValue) {{
-                    try {{ window.sessionStorage.removeItem(restoreOnceKey); }} catch (e) {{}}
-                    return;
-                }}
+            const guardKey = bootFlag + ":" + (cid || "none");
+            let already = false;
+            try {{ already = w.sessionStorage.getItem(guardKey) === "1"; }} catch (e) {{}}
 
-                const alreadyTried = (() => {{
-                    try {{ return window.sessionStorage.getItem(restoreOnceKey) === "1"; }} catch (e) {{ return false; }}
-                }})();
+            if (changed && !already) {{
+                try {{ w.sessionStorage.setItem(guardKey, "1"); }} catch (e) {{}}
+                try {{ w.location.replace(url.toString()); return; }} catch (e) {{}}
+            }}
 
-                if (!alreadyTried) {{
-                    try {{ window.sessionStorage.setItem(restoreOnceKey, "1"); }} catch (e) {{}}
-                    url.searchParams.set(sessionKey, sessionValue);
-                    hardReplace(url);
-                }}
-            }} catch (e) {{}}
+            if (!changed) {{
+                try {{ w.sessionStorage.removeItem(guardKey); }} catch (e) {{}}
+            }}
         }})();
         </script>
         """,
@@ -435,93 +484,72 @@ def bootstrap_login_persistence():
     )
 
 
-def _get_client_id():
-    return None
+def save_persistent_session(login: str, token: str, remember_me: bool = True):
+    client_id = get_client_id()
+    if not client_id or not login or not token or not remember_me:
+        return False
+
+    ensure_persistent_sessions_table()
+    now = datetime.now()
+    exp = now + timedelta(hours=LOGIN_PERSIST_HOURS)
+
+    try:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO persistent_sessions (client_id, login, token, remember_me, active, created_at, updated_at, expires_at)
+                VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                ON CONFLICT(client_id) DO UPDATE SET
+                    login=excluded.login,
+                    token=excluded.token,
+                    remember_me=excluded.remember_me,
+                    active=1,
+                    updated_at=excluded.updated_at,
+                    expires_at=excluded.expires_at
+                """,
+                (
+                    client_id,
+                    str(login).strip().lower(),
+                    str(token).strip(),
+                    1 if remember_me else 0,
+                    now.isoformat(timespec='seconds'),
+                    now.isoformat(timespec='seconds'),
+                    exp.isoformat(timespec='seconds'),
+                ),
+            )
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"⚠️ save_persistent_session error: {e}", flush=True)
+        return False
 
 
-def set_login_cookie(token: str):
-    """
-    Persistance login par appareil/utilisateur.
-    Écrit dans cookie + localStorage + query param SANS forcer de reload.
-    Important pour éviter de bloquer l'app Streamlit/Desktop.
-    """
-    token = str(token or "").strip()
-    if not token:
+def clear_persistent_session():
+    client_id = get_client_id()
+    if not client_id:
         return
-
-    token_js = _js_quote(token)
-    max_age = int(LOGIN_PERSIST_HOURS * 3600)
-
-    components.html(
-        f"""
-        <script>
-        (function() {{
-            const sessionKey = {_js_quote(LOGIN_PERSIST_KEY)};
-            const sessionValue = {token_js};
-            const maxAge = {max_age};
-            try {{
-                document.cookie = sessionKey + "=" + encodeURIComponent(sessionValue) + "; path=/; max-age=" + maxAge + "; SameSite=Lax";
-            }} catch (e) {{}}
-            try {{
-                window.localStorage.setItem(sessionKey, sessionValue);
-            }} catch (e) {{}}
-            try {{
-                window.sessionStorage.removeItem(sessionKey + "_restore_once");
-            }} catch (e) {{}}
-            try {{
-                const url = new URL(window.parent.location.href);
-                url.searchParams.set(sessionKey, sessionValue);
-                window.parent.history.replaceState({{}}, "", url.toString());
-            }} catch (e) {{
-                try {{
-                    const url = new URL(window.location.href);
-                    url.searchParams.set(sessionKey, sessionValue);
-                    window.history.replaceState({{}}, "", url.toString());
-                }} catch (e2) {{}}
-            }}
-        }})();
-        </script>
-        """,
-        height=0,
-    )
-
-
-def clear_login_cookie():
-    """Supprime la persistance login côté client sans boucle de reload."""
-    components.html(
-        f"""
-        <script>
-        (function() {{
-            const sessionKey = {_js_quote(LOGIN_PERSIST_KEY)};
-            try {{
-                document.cookie = sessionKey + "=; path=/; max-age=0; SameSite=Lax";
-            }} catch (e) {{}}
-            try {{
-                window.localStorage.removeItem(sessionKey);
-            }} catch (e) {{}}
-            try {{
-                window.sessionStorage.removeItem(sessionKey + "_restore_once");
-            }} catch (e) {{}}
-            try {{
-                const url = new URL(window.parent.location.href);
-                url.searchParams.delete(sessionKey);
-                window.parent.history.replaceState({{}}, "", url.toString());
-            }} catch (e) {{
-                try {{
-                    const url = new URL(window.location.href);
-                    url.searchParams.delete(sessionKey);
-                    window.history.replaceState({{}}, "", url.toString());
-                }} catch (e2) {{}}
-            }}
-        }})();
-        </script>
-        """,
-        height=0,
-    )
+    try:
+        ensure_persistent_sessions_table()
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE persistent_sessions SET active=0, updated_at=? WHERE client_id=?",
+                (datetime.now().isoformat(timespec='seconds'), client_id),
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"⚠️ clear_persistent_session error: {e}", flush=True)
 
 
 def get_login_cookie():
-    # 1) cookie direct si dispo dans la version de Streamlit
+    try:
+        val = st.query_params.get(LOGIN_PERSIST_KEY)
+        if isinstance(val, list):
+            val = val[0] if val else None
+        if val:
+            return str(val).strip()
+    except Exception:
+        pass
+
     try:
         ctx = getattr(st, "context", None)
         cookies = getattr(ctx, "cookies", None)
@@ -532,29 +560,116 @@ def get_login_cookie():
     except Exception:
         pass
 
-    # 2) query params (fallback de compatibilité)
-    try:
-        val = st.query_params.get(LOGIN_PERSIST_KEY)
-        if isinstance(val, list):
-            val = val[0] if val else None
-        if val:
-            return str(val).strip()
-    except Exception:
-        pass
-
     return None
 
 
+def load_persistent_session_from_server():
+    client_id = get_client_id()
+    if not client_id:
+        return None
+
+    ensure_persistent_sessions_table()
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT login, token, expires_at
+                FROM persistent_sessions
+                WHERE client_id = ?
+                  AND active = 1
+                  AND remember_me = 1
+                """,
+                (client_id,),
+            ).fetchone()
+    except Exception as e:
+        print(f"⚠️ load_persistent_session_from_server error: {e}", flush=True)
+        return None
+
+    if not row:
+        return None
+
+    login, token, expires_at = row
+    try:
+        if expires_at and datetime.fromisoformat(str(expires_at)) < datetime.now():
+            clear_persistent_session()
+            return None
+    except Exception:
+        pass
+
+    if not login or not token:
+        return None
+
+    return f"{str(login).strip().lower()}|{str(token).strip()}"
+
+
+def set_login_cookie(token: str):
+    token = str(token or "").strip()
+    client_id = get_client_id()
+    if not token:
+        return
+
+    token_js = _js_quote(token)
+    client_js = _js_quote(client_id)
+    max_age = int(LOGIN_PERSIST_HOURS * 3600)
+
+    components.html(
+        f"""
+        <script>
+        (function() {{
+            const sessionKey = {_js_quote(LOGIN_PERSIST_KEY)};
+            const clientStorageKey = {_js_quote(LOGIN_CLIENT_STORAGE_KEY)};
+            const clientParam = {_js_quote(LOGIN_CLIENT_KEY)};
+            const sessionValue = {token_js};
+            const clientId = {client_js};
+            const maxAge = {max_age};
+            const w = (function() {{ try {{ return window.parent || window; }} catch(e) {{ return window; }} }})();
+            try {{ w.document.cookie = sessionKey + "=" + encodeURIComponent(sessionValue) + "; path=/; max-age=" + maxAge + "; SameSite=Lax"; }} catch (e) {{}}
+            try {{ w.localStorage.setItem(sessionKey, sessionValue); }} catch (e) {{}}
+            if (clientId) {{
+                try {{ w.localStorage.setItem(clientStorageKey, clientId); }} catch (e) {{}}
+                try {{ w.document.cookie = clientParam + "=" + encodeURIComponent(clientId) + "; path=/; max-age=" + maxAge + "; SameSite=Lax"; }} catch (e) {{}}
+            }}
+            try {{
+                const url = new URL(w.location.href);
+                url.searchParams.set(sessionKey, sessionValue);
+                if (clientId) url.searchParams.set(clientParam, clientId);
+                w.history.replaceState({{}}, "", url.toString());
+            }} catch (e) {{}}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+
+def clear_login_cookie():
+    components.html(
+        f"""
+        <script>
+        (function() {{
+            const sessionKey = {_js_quote(LOGIN_PERSIST_KEY)};
+            const w = (function() {{ try {{ return window.parent || window; }} catch(e) {{ return window; }} }})();
+            try {{ w.document.cookie = sessionKey + "=; path=/; max-age=0; SameSite=Lax"; }} catch (e) {{}}
+            try {{ w.localStorage.removeItem(sessionKey); }} catch (e) {{}}
+            try {{
+                const url = new URL(w.location.href);
+                url.searchParams.delete(sessionKey);
+                w.history.replaceState({{}}, "", url.toString());
+            }} catch (e) {{}}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+
 def restore_login_from_cookie():
-    """
-    Restaure automatiquement la session à partir du token persistant
-    stocké côté appareil.
-    Format attendu: 'login|uuid'.
-    """
     if st.session_state.get("logged_in"):
         return False
 
     raw = get_login_cookie()
+    if not raw:
+        raw = load_persistent_session_from_server()
     if not raw:
         return False
 
@@ -574,7 +689,7 @@ def restore_login_from_cookie():
     st.session_state.role = user.get("role")
     st.session_state.chauffeur_code = user.get("chauffeur_code")
     st.session_state.session_token = token
-    st.session_state["remember_me"] = True
+    st.session_state.remember_me = True
     return True
 # ============================================================
 #   LOGIN SCREEN
@@ -586,49 +701,39 @@ def login_screen():
     st.title("🚐 Airports-Lines — Planning chauffeurs (DB)")
     st.subheader("Connexion")
 
-    col1, col2 = st.columns(2)
-
-    with col1:
-        login = st.text_input("Login", key="login_name")
-    with col2:
-        pwd = st.text_input("Mot de passe", type="password", key="login_pass")
-
-    remember_default = bool(st.session_state.get("remember_me", True))
-    remember_choice = st.checkbox(
+    login = st.text_input("Login", key="login_name")
+    pwd = st.text_input("Mot de passe", type="password", key="login_pass")
+    remember_me = st.checkbox(
         "Se rappeler de moi sur cet appareil",
-        value=remember_default,
+        value=bool(st.session_state.get("remember_me", True)),
         key="remember_me_widget",
-        help="Garde uniquement la session de cet appareil jusqu’à Déconnexion.",
     )
 
     if st.button("Se connecter"):
-        login = str(login or "").strip().lower()
-        pwd = str(pwd or "")
-        user = USERS.get(login)
+        login_norm = str(login or "").strip().lower()
+        user = USERS.get(login_norm)
 
         if user and user["password"] == pwd:
             token = str(uuid.uuid4())
 
             st.session_state.logged_in = True
-            st.session_state.username = login
+            st.session_state.username = login_norm
             st.session_state.role = user['role']
             st.session_state.chauffeur_code = user.get('chauffeur_code')
             st.session_state.session_token = token
-            st.session_state["remember_me"] = bool(remember_choice)
+            st.session_state.remember_me = bool(remember_me)
             st.session_state["_persist_state_saved"] = False
 
-            if remember_choice:
-                set_login_cookie(f"{login}|{token}")
-                st.info("Restauration automatique activée sur cet appareil.")
+            if remember_me:
+                save_persistent_session(login_norm, token, True)
+                set_login_cookie(f"{login_norm}|{token}")
             else:
+                clear_persistent_session()
                 clear_login_cookie()
-                st.info("Connexion temporaire : la session ne sera pas restaurée automatiquement.")
 
-            st.success(f"Connecté en tant que **{login}** – rôle : {user['role']}")
             st.rerun()
         else:
             st.error("Identifiants incorrects.")
-
 
 
 FLIGHT_ALERT_DELAY_MIN = 30  # seuil d’alerte retard (modifiable)
@@ -3748,10 +3853,8 @@ def leon_allowed_for_row(go_val: str) -> bool:
 # ============================================================
 
 def logout():
-    """
-    Déconnexion volontaire uniquement.
-    On laisse le JS effacer la persistance puis recharger la page.
-    """
+    """Déconnexion volontaire uniquement sur cet appareil."""
+    clear_persistent_session()
     clear_login_cookie()
     for k in (
         "logged_in",
@@ -10330,6 +10433,7 @@ def main():
     restore_login_from_cookie()
     init_db_once()
     init_all_db_once()
+    ensure_persistent_sessions_table()
     # 🔄 DEBUG rerun
     if "RUN_COUNTER" not in st.session_state:
         st.session_state.RUN_COUNTER = 0
@@ -10342,9 +10446,7 @@ def main():
     # ======================================
     if not st.session_state.logged_in:
         login_screen()
-        if not st.session_state.logged_in:
-            st.stop()
-        st.rerun()
+        st.stop()
 
     # ======================================
     # 3️⃣ UI MINIMALE
