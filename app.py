@@ -598,6 +598,14 @@ def login_screen():
     st.title("🚐 Airports-Lines — Planning chauffeurs (DB)")
     st.subheader("Connexion")
 
+    # IMPORTANT:
+    # - la checkbox a son propre state widget (remember_me_widget)
+    # - la préférence applicative reste dans remember_me
+    # Cela évite l'erreur StreamlitAPIException quand on modifie
+    # session_state["remember_me"] après la création du widget.
+    if "remember_me_widget" not in st.session_state:
+        st.session_state["remember_me_widget"] = bool(st.session_state.get("remember_me", True))
+
     col1, col2 = st.columns(2)
 
     with col1:
@@ -605,11 +613,9 @@ def login_screen():
     with col2:
         pwd = st.text_input("Mot de passe", type="password", key="login_pass")
 
-    remember_default = bool(st.session_state.get("remember_me", True))
     remember_me = st.checkbox(
         "Se rappeler de moi sur cet appareil",
-        value=remember_default,
-        key="remember_me",
+        key="remember_me_widget",
         help="Chaque téléphone garde uniquement SA session jusqu'à la déconnexion.",
     )
 
@@ -620,6 +626,7 @@ def login_screen():
 
         if user and user["password"] == pwd:
             token = str(uuid.uuid4())
+            remember_choice = bool(remember_me)
 
             st.session_state.logged_in = True
             st.session_state.username = login
@@ -627,15 +634,15 @@ def login_screen():
             st.session_state.chauffeur_code = user.get('chauffeur_code')
             st.session_state.session_token = token
             st.session_state["_persist_state_saved"] = False
-            st.session_state["remember_me"] = bool(remember_me)
+            st.session_state["remember_me"] = remember_choice
+            st.session_state["remember_me_widget"] = remember_choice
 
-            if remember_me:
-                set_login_cookie(f"{login}|{token}", remember=True)
-                st.success(f"Connecté en tant que **{login}** – rôle : {user['role']}")
+            set_login_cookie(f"{login}|{token}", remember=remember_choice)
+
+            st.success(f"Connecté en tant que **{login}** – rôle : {user['role']}")
+            if remember_choice:
                 st.info("Connexion persistante activée sur cet appareil.")
             else:
-                set_login_cookie(f"{login}|{token}", remember=False)
-                st.success(f"Connecté en tant que **{login}** – rôle : {user['role']}")
                 st.info("Connexion active uniquement pour cette session.")
 
             st.rerun()
