@@ -445,8 +445,8 @@ def _get_client_id():
 def set_login_cookie(token: str):
     """
     Persistance login par appareil/utilisateur.
-    Le token reste côté navigateur/app via cookie + localStorage + query params.
-    Pas d'état global serveur partagé entre chauffeurs.
+    IMPORTANT: en Streamlit App, il ne faut pas déclencher st.rerun juste après,
+    sinon le JS n'a pas le temps d'écrire le localStorage / query params.
     """
     token = str(token or "").strip()
     if not token:
@@ -485,20 +485,20 @@ def set_login_cookie(token: str):
 
             try {{ window.localStorage.setItem(sessionKey, sessionValue); }} catch (e) {{}}
 
-            function updateUrl(baseUrl, replaceTarget) {{
+            function go(baseUrl, replaceTarget) {{
                 try {{
                     const url = new URL(baseUrl);
                     url.searchParams.set(sessionKey, sessionValue);
                     if (clientId) url.searchParams.set(clientKey, clientId);
-                    replaceTarget(url.toString());
+                    setTimeout(() => replaceTarget(url.toString()), 150);
                 }} catch (e) {{}}
             }}
 
             try {{
-                updateUrl(window.parent.location.href, (u) => window.parent.location.replace(u));
+                go(window.parent.location.href, (u) => window.parent.location.replace(u));
             }} catch (e) {{
                 try {{
-                    updateUrl(window.location.href, (u) => window.location.replace(u));
+                    go(window.location.href, (u) => window.location.replace(u));
                 }} catch (e2) {{}}
             }}
         }})();
@@ -521,15 +521,20 @@ def clear_login_cookie():
             try {{
                 window.localStorage.removeItem(sessionKey);
             }} catch (e) {{}}
+
+            function go(baseUrl, replaceTarget) {{
+                try {{
+                    const url = new URL(baseUrl);
+                    url.searchParams.delete(sessionKey);
+                    setTimeout(() => replaceTarget(url.toString()), 150);
+                }} catch (e) {{}}
+            }}
+
             try {{
-                const url = new URL(window.parent.location.href);
-                url.searchParams.delete(sessionKey);
-                window.parent.history.replaceState({{}}, "", url.toString());
+                go(window.parent.location.href, (u) => window.parent.location.replace(u));
             }} catch (e) {{
                 try {{
-                    const url = new URL(window.location.href);
-                    url.searchParams.delete(sessionKey);
-                    window.history.replaceState({{}}, "", url.toString());
+                    go(window.location.href, (u) => window.location.replace(u));
                 }} catch (e2) {{}}
             }}
         }})();
@@ -540,13 +545,28 @@ def clear_login_cookie():
 
 
 def get_login_cookie():
+    # 1) query params (pont JS -> Python)
     try:
         val = st.query_params.get(LOGIN_PERSIST_KEY)
         if isinstance(val, list):
             val = val[0] if val else None
-        return str(val).strip() if val else None
+        if val:
+            return str(val).strip()
     except Exception:
-        return None
+        pass
+
+    # 2) cookie direct si dispo dans la version de Streamlit
+    try:
+        ctx = getattr(st, "context", None)
+        cookies = getattr(ctx, "cookies", None)
+        if cookies:
+            val = cookies.get(LOGIN_PERSIST_KEY)
+            if val:
+                return str(val).strip()
+    except Exception:
+        pass
+
+    return None
 
 
 def restore_login_from_cookie():
@@ -612,7 +632,8 @@ def login_screen():
             set_login_cookie(f"{login}|{token}")
 
             st.success(f"Connecté en tant que **{login}** – rôle : {user['role']}")
-            st.rerun()
+            st.info("Restauration automatique activée sur cet appareil.")
+            st.stop()
         else:
             st.error("Identifiants incorrects.")
 
@@ -3737,18 +3758,26 @@ def leon_allowed_for_row(go_val: str) -> bool:
 def logout():
     """
     Déconnexion volontaire uniquement.
-    Ne casse pas la session Streamlit interne.
+    On laisse le JS effacer la persistance puis recharger la page.
     """
+    clear_login_cookie()
     for k in (
         "logged_in",
         "username",
         "role",
         "chauffeur_code",
+        "session_token",
+        "_persist_state_saved",
     ):
         st.session_state.pop(k, None)
 
-    st.cache_data.clear()
-    st.rerun()
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
+    st.info("Déconnexion en cours...")
+    st.stop()
 
 # ============================================================
 
@@ -10562,8 +10591,3 @@ def build_printable_html(df):
     """
 
 
-# 🔁 Auto-login via cookie
-if not st.session_state.get("logged_in"):
-    tok = _get_login_cookie()
-    if tok and st.session_state.get("session_token") == tok:
-        st.session_state.logged_in = True
