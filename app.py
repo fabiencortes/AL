@@ -346,394 +346,26 @@ CH_CODES = [
     "MF", "WS", "PO"
 ]
 # ============================================================
-# 🔐 SESSION PERSISTANTE (TOKEN SIGNÉ + URL/COOKIE)
+# 🔐 SESSION PERSISTANTE (COOKIE)
 # ============================================================
-import os
-import time
-import hmac
-import base64
-import hashlib
-import json
+import uuid
 import streamlit.components.v1 as components
 
-AL_SESSION_SECRET = os.environ.get("AL_SESSION_SECRET", "airports-lines-session-secret-2026")
-AL_SESSION_MAX_AGE = 60 * 60 * 24 * 30  # 30 jours
-AL_TRUSTED_DEVICES_FILE = str((Path(__file__).resolve().parent / ".al_trusted_devices.json"))
-
-
-def _b64u_encode(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
-
-
-def _b64u_decode(value: str) -> bytes:
-    pad = "=" * (-len(value) % 4)
-    return base64.urlsafe_b64decode((value + pad).encode("utf-8"))
-
-
-def make_login_token(username: str, role: str, chauffeur_code: str | None = None, ttl_seconds: int = AL_SESSION_MAX_AGE) -> str:
-    payload = {
-        "u": str(username or "").strip(),
-        "r": str(role or "").strip(),
-        "c": str(chauffeur_code or "").strip(),
-        "exp": int(time.time()) + int(ttl_seconds or AL_SESSION_MAX_AGE),
-    }
-    payload_b64 = _b64u_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
-    sig = hmac.new(AL_SESSION_SECRET.encode("utf-8"), payload_b64.encode("utf-8"), hashlib.sha256).digest()
-    return f"{payload_b64}.{_b64u_encode(sig)}"
-
-
-def parse_login_token(token: str) -> dict | None:
-    try:
-        token = str(token or "").strip()
-        if not token or "." not in token:
-            return None
-        payload_b64, sig_b64 = token.split(".", 1)
-        expected = hmac.new(AL_SESSION_SECRET.encode("utf-8"), payload_b64.encode("utf-8"), hashlib.sha256).digest()
-        given = _b64u_decode(sig_b64)
-        if not hmac.compare_digest(expected, given):
-            return None
-        payload = json.loads(_b64u_decode(payload_b64).decode("utf-8"))
-        if int(payload.get("exp", 0) or 0) < int(time.time()):
-            return None
-        username = str(payload.get("u", "")).strip()
-        role = str(payload.get("r", "")).strip()
-        chauffeur_code = str(payload.get("c", "")).strip()
-        user = USERS.get(username)
-        if not user or user.get("role") != role:
-            return None
-        if (user.get("chauffeur_code") or "") != chauffeur_code:
-            return None
-        return {
-            "username": username,
-            "role": role,
-            "chauffeur_code": chauffeur_code or None,
-        }
-    except Exception:
-        return None
-
-
-def _device_fingerprint() -> str:
-    """
-    Empreinte "appareil" côté serveur pour restaurer la session
-    même si le conteneur Streamlit n'a pas gardé le cookie/localStorage.
-    Ce n'est pas une mesure de sécurité forte : c'est un mécanisme de confort.
-    """
-    try:
-        headers = getattr(st.context, "headers", None)
-    except Exception:
-        headers = None
-
-    def _h(name: str) -> str:
-        try:
-            if not headers:
-                return ""
-            val = headers.get(name)
-            if isinstance(val, list):
-                val = val[-1] if val else ""
-            return str(val or "").strip()
-        except Exception:
-            return ""
-
-    bits = [
-        _h("user-agent"),
-        _h("sec-ch-ua"),
-        _h("sec-ch-ua-platform"),
-        _h("accept-language"),
-        str(getattr(st.context, "timezone", "") or ""),
-        str(getattr(st.context, "locale", "") or ""),
-        str(getattr(st.context, "url", "") or ""),
-        str(getattr(st.context, "is_embedded", "") or ""),
-        str(getattr(st.context, "ip_address", "") or ""),
-    ]
-    raw = "|".join(bits)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-
-def _load_trusted_devices() -> dict:
-    try:
-        fp = Path(AL_TRUSTED_DEVICES_FILE)
-        if not fp.exists():
-            return {}
-        data = json.loads(fp.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-
-def _save_trusted_devices(data: dict):
-    try:
-        fp = Path(AL_TRUSTED_DEVICES_FILE)
-        fp.parent.mkdir(parents=True, exist_ok=True)
-        tmp = fp.with_suffix(fp.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(fp)
-    except Exception:
-        pass
-
-
-
-def remember_trusted_device(token: str, username: str, role: str, chauffeur_code: str | None = None):
-    try:
-        device_key = _device_fingerprint()
-        if not device_key:
-            return
-        data = _load_trusted_devices()
-        data[device_key] = {
-            "token": str(token or "").strip(),
-            "username": str(username or "").strip(),
-            "role": str(role or "").strip(),
-            "chauffeur_code": str(chauffeur_code or "").strip(),
-            "exp": int(time.time()) + int(AL_SESSION_MAX_AGE),
-            "updated_at": int(time.time()),
-        }
-        # nettoyage des entrées expirées
-        now_ts = int(time.time())
-        data = {
-            k: v for k, v in data.items()
-            if isinstance(v, dict) and int(v.get("exp", 0) or 0) >= now_ts and str(v.get("token", "")).strip()
-        }
-        _save_trusted_devices(data)
-    except Exception:
-        pass
-
-
-
-def forget_trusted_device():
-    try:
-        device_key = _device_fingerprint()
-        if not device_key:
-            return
-        data = _load_trusted_devices()
-        if device_key in data:
-            data.pop(device_key, None)
-            _save_trusted_devices(data)
-    except Exception:
-        pass
-
-
-
-def get_trusted_device_token() -> str | None:
-    try:
-        device_key = _device_fingerprint()
-        if not device_key:
-            return None
-        data = _load_trusted_devices()
-        row = data.get(device_key) if isinstance(data, dict) else None
-        if not isinstance(row, dict):
-            return None
-        if int(row.get("exp", 0) or 0) < int(time.time()):
-            data.pop(device_key, None)
-            _save_trusted_devices(data)
-            return None
-        tok = str(row.get("token", "") or "").strip()
-        if not parse_login_token(tok):
-            data.pop(device_key, None)
-            _save_trusted_devices(data)
-            return None
-        return tok
-    except Exception:
-        return None
-
-
 def set_login_cookie(token: str):
-    safe_token = json.dumps(str(token or ""))
     components.html(
         f"""
         <script>
-        (function() {{
-            const token = {safe_token};
-            const maxAge = {AL_SESSION_MAX_AGE};
-
-            function setCookieOn(doc) {{
-                try {{
-                    if (!doc) return;
-                    doc.cookie = "al_session=" + encodeURIComponent(token) + "; path=/; max-age=" + maxAge + "; SameSite=Lax";
-                }} catch (e) {{}}
-            }}
-
-            function setStorageOn(win) {{
-                try {{
-                    if (!win || !win.localStorage) return;
-                    win.localStorage.setItem("al_session", token);
-                }} catch (e) {{}}
-            }}
-
-            setCookieOn(document);
-            setStorageOn(window);
-
-            try {{ setCookieOn(window.parent.document); }} catch (e) {{}}
-            try {{ setCookieOn(window.top.document); }} catch (e) {{}}
-            try {{ setStorageOn(window.parent); }} catch (e) {{}}
-            try {{ setStorageOn(window.top); }} catch (e) {{}}
-
-            try {{
-                const topWin = window.top || window;
-                const url = new URL(topWin.location.href);
-                if (url.searchParams.get("al_session") !== token) {{
-                    url.searchParams.set("al_session", token);
-                    topWin.history.replaceState({{}}, "", url.toString());
-                }}
-            }} catch (e) {{}}
-        }})();
+        document.cookie = "al_session={token}; path=/; max-age=28800";
         </script>
         """,
         height=0,
     )
-
-
-def clear_login_cookie():
-    components.html(
-        """
-        <script>
-        (function() {
-            function clearCookieOn(doc) {
-                try {
-                    if (!doc) return;
-                    doc.cookie = "al_session=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax";
-                } catch (e) {}
-            }
-
-            function clearStorageOn(win) {
-                try {
-                    if (!win || !win.localStorage) return;
-                    win.localStorage.removeItem("al_session");
-                } catch (e) {}
-            }
-
-            clearCookieOn(document);
-            clearStorageOn(window);
-
-            try { clearCookieOn(window.parent.document); } catch (e) {}
-            try { clearCookieOn(window.top.document); } catch (e) {}
-            try { clearStorageOn(window.parent); } catch (e) {}
-            try { clearStorageOn(window.top); } catch (e) {}
-
-            try {
-                const topWin = window.top || window;
-                const url = new URL(topWin.location.href);
-                url.searchParams.delete("al_session");
-                topWin.history.replaceState({}, "", url.toString());
-            } catch (e) {}
-        })();
-        </script>
-        """,
-        height=0,
-    )
-
 
 def get_login_cookie():
-    """
-    Ordre de priorité:
-    1) vrai cookie navigateur
-    2) query param (compatibilité)
-    3) appareil de confiance côté serveur (fallback Streamlit app)
-    """
-    # 1) vrai cookie navigateur (persistant après fermeture/réouverture)
     try:
-        cookies = getattr(st.context, "cookies", None)
-        if cookies:
-            tok = cookies.get("al_session")
-            if isinstance(tok, list):
-                tok = tok[0] if tok else None
-            tok = str(tok or "").strip()
-            if tok:
-                return tok
+        return st.query_params.get("al_session")
     except Exception:
-        pass
-
-    # 2) compat arrière: query param si présent
-    try:
-        tok = st.query_params.get("al_session")
-        if isinstance(tok, list):
-            tok = tok[0] if tok else None
-        tok = str(tok or "").strip()
-        if tok:
-            return tok
-    except Exception:
-        pass
-
-    # 3) fallback robuste: appareil de confiance mémorisé côté serveur
-    tok = get_trusted_device_token()
-    if tok:
-        return tok
-
-    return None
-
-
-def restore_session_from_token() -> bool:
-    if st.session_state.get("logged_in"):
-        return True
-
-    token = get_login_cookie()
-    data = parse_login_token(token)
-    if not data:
-        return False
-
-    st.session_state.logged_in = True
-    st.session_state.username = data["username"]
-    st.session_state.role = data["role"]
-    st.session_state.chauffeur_code = data.get("chauffeur_code")
-    st.session_state.session_token = token
-    remember_trusted_device(token, data["username"], data["role"], data.get("chauffeur_code"))
-    return True
-
-
-def _inject_client_session_bootstrap():
-    components.html(
-        """
-        <script>
-        (function() {
-            function readStorage(win) {
-                try {
-                    if (win && win.localStorage) {
-                        return win.localStorage.getItem("al_session") || "";
-                    }
-                } catch (e) {}
-                return "";
-            }
-
-            function readCookie(doc) {
-                try {
-                    if (!doc) return "";
-                    const m = doc.cookie.match(/(?:^|; )al_session=([^;]+)/);
-                    if (m) return decodeURIComponent(m[1] || "");
-                } catch (e) {}
-                return "";
-            }
-
-            try {
-                const topWin = window.top || window;
-                const url = new URL(topWin.location.href);
-                const qpToken = url.searchParams.get("al_session") || "";
-
-                let stored = "";
-                stored = readStorage(topWin) || readStorage(window.parent) || readStorage(window) || "";
-                if (!stored) {
-                    stored = readCookie(topWin.document) || readCookie(window.parent.document) || readCookie(document) || "";
-                }
-
-                if (stored) {
-                    try { topWin.localStorage.setItem("al_session", stored); } catch (e) {}
-                    try { topWin.document.cookie = "al_session=" + encodeURIComponent(stored) + "; path=/; max-age=2592000; SameSite=Lax"; } catch (e) {}
-                    if (qpToken !== stored) {
-                        url.searchParams.set("al_session", stored);
-                        topWin.location.replace(url.toString());
-                        return;
-                    }
-                }
-            } catch (e) {}
-        })();
-        </script>
-        """,
-        height=0,
-    )
-
-
-_inject_client_session_bootstrap()
-# La restauration réelle se fait dans main(), après init_session_state(),
-# en lisant le cookie navigateur persistant envoyé par Streamlit.
+        return None
 # ============================================================
 #   LOGIN SCREEN
 # ============================================================
@@ -755,7 +387,7 @@ def login_screen():
         user = USERS.get(login)
 
         if user and user["password"] == pwd:
-            token = make_login_token(login, user["role"], user.get("chauffeur_code"))
+            token = str(uuid.uuid4())
 
             st.session_state.logged_in = True
             st.session_state.username = login
@@ -763,13 +395,7 @@ def login_screen():
             st.session_state.chauffeur_code = user.get('chauffeur_code')
             st.session_state.session_token = token
 
-            try:
-                st.query_params["al_session"] = token
-            except Exception:
-                pass
-
             set_login_cookie(token)
-            remember_trusted_device(token, login, user["role"], user.get("chauffeur_code"))
 
             st.success(f"Connecté en tant que **{login}** – rôle : {user['role']}")
             st.rerun()
@@ -2746,13 +2372,70 @@ def _pick_first(row, candidates):
                 return v
     return ""
 
+def _clean_address_piece(val) -> str:
+    if val is None:
+        return ""
+    s = str(val).strip()
+    if not s:
+        return ""
+    # évite les 4000.0 / 12.0 venant d'Excel
+    if s.endswith('.0'):
+        try:
+            f = float(s)
+            if f.is_integer():
+                s = str(int(f))
+        except Exception:
+            pass
+    return re.sub(r"\s+", " ", s).strip(" ,;")
+
+
 def build_full_address_from_row(row: pd.Series) -> str:
     # Essaye de reconstruire "Adresse + CP + Ville"
-    adr = _pick_first(row, ["ADRESSE", "Adresse", "ADRESSE RDV", "Adresse RDV", "RUE", "Rue"])
-    cp  = _pick_first(row, ["CP", "Code postal", "CODE POSTAL", "Postal", "ZIP"])
-    vil = _pick_first(row, ["Localité", "LOCALITE", "Ville", "VILLE", "COMMUNE"])
+    adr = _clean_address_piece(_pick_first(row, ["ADRESSE", "Adresse", "ADRESSE RDV", "Adresse RDV", "RUE", "Rue"]))
+    cp  = _clean_address_piece(_pick_first(row, ["CP", "Code postal", "CODE POSTAL", "Postal", "ZIP"]))
+    vil = _clean_address_piece(_pick_first(row, ["Localité", "LOCALITE", "Ville", "VILLE", "COMMUNE"]))
     parts = [p for p in [adr, cp, vil] if p]
     return " ".join(parts).strip()
+
+
+def build_navigation_address_from_row(row: pd.Series) -> str:
+    """
+    Construit une adresse GPS plus fiable que l'adresse d'affichage.
+    Format privilégié : "Rue numéro, CP Ville, Belgique".
+    Fallback sur la destination si l'adresse est absente.
+    """
+    adr = _clean_address_piece(_pick_first(row, ["ADRESSE", "Adresse", "ADRESSE RDV", "Adresse RDV", "RUE", "Rue"]))
+    cp = _clean_address_piece(_pick_first(row, ["CP", "Code postal", "CODE POSTAL", "Postal", "ZIP"]))
+    vil = _clean_address_piece(_pick_first(row, ["Localité", "LOCALITE", "Ville", "VILLE", "COMMUNE"]))
+
+    street_line = adr
+    city_line = " ".join([p for p in [cp, vil] if p]).strip()
+
+    parts = [p for p in [street_line, city_line] if p]
+    if parts:
+        country = "Belgique"
+        city_up = vil.upper()
+        if city_up in {"LUXEMBOURG", "LUXEMBURG", "LUX AIRPORT"}:
+            country = "Luxembourg"
+        return ", ".join(parts + [country])
+
+    dest = resolve_destination_text(row)
+    dest = resolve_client_alias(dest)
+    dest_up = str(dest or "").upper()
+    airport_map = {
+        "BRU": "Brussels Airport, Zaventem, Belgique",
+        "ZAV": "Brussels Airport, Zaventem, Belgique",
+        "CRL": "Brussels South Charleroi Airport, Charleroi, Belgique",
+        "LUX": "Luxembourg Airport, Luxembourg",
+        "LGG": "Liège Airport, Grâce-Hollogne, Belgique",
+        "DUS": "Düsseldorf Airport, Düsseldorf, Allemagne",
+        "MIDI": "Gare de Bruxelles-Midi, Bruxelles, Belgique",
+    }
+    for code, full_addr in airport_map.items():
+        if code in dest_up:
+            return full_addr
+
+    return dest or build_full_address_from_row(row)
 
 
 def resolve_destination_text(row: pd.Series) -> str:
@@ -3253,12 +2936,12 @@ def build_waze_link(address: str) -> str:
     """Construit un lien Waze vers une adresse texte."""
     import urllib.parse
 
-    addr = (address or "").strip()
+    addr = re.sub(r"\s+", " ", str(address or "")).strip(" ,;")
     if not addr:
         return "#"
 
     query = urllib.parse.quote(addr)
-    # Sur GSM, ce lien ouvre directement l'appli Waze si elle est installée
+    # ll= évite certaines interprétations approximatives côté webview Waze
     return f"https://waze.com/ul?q={query}&navigate=yes"
 
 def build_google_maps_link(address: str) -> str:
@@ -3842,20 +3525,11 @@ def logout():
     Déconnexion volontaire uniquement.
     Ne casse pas la session Streamlit interne.
     """
-    clear_login_cookie()
-    forget_trusted_device()
-    try:
-        if "al_session" in st.query_params:
-            del st.query_params["al_session"]
-    except Exception:
-        pass
-
     for k in (
         "logged_in",
         "username",
         "role",
         "chauffeur_code",
-        "session_token",
     ):
         st.session_state.pop(k, None)
 
@@ -3866,7 +3540,7 @@ def logout():
 
 def _send_planning_next_3_days_to_all(*, want_pdf: bool = True) -> dict:
     """
-    Envoie le planning de demain à J+3 à tous les chauffeurs actifs sur la période.
+    Envoie le planning des 3 prochains jours (J à J+2) à tous les chauffeurs actifs sur la période.
     Retourne un petit récap {sent, skipped_empty, missing_email, errors}.
     """
     from datetime import date, timedelta
@@ -3879,8 +3553,8 @@ def _send_planning_next_3_days_to_all(*, want_pdf: bool = True) -> dict:
         return recap
 
     today = date.today()
-    d_start = today + timedelta(days=1)
-    d_end = today + timedelta(days=3)
+    d_start = today
+    d_end = today + timedelta(days=2)
 
     # init table log si dispo
     try:
@@ -4101,7 +3775,7 @@ def render_top_bar():
     # -------------------------------
     with col3:
         if role == "admin":
-            if st.button("📧 Maj + envoyer planning (demain → J+3)", use_container_width=True, key="topbar_sync_send_3j"):
+            if st.button("📧 Maj + envoyer planning (3j)", use_container_width=True, key="topbar_sync_send_3j"):
                 _topbar_sync_db_and_refresh(also_send_next3=True)
         else:
             st.empty()
@@ -7053,7 +6727,77 @@ def render_tab_chauffeur_driver():
                 html = build_printable_html_planning(df_table, ch_selected)
                 print_html_popup(html)
 
-                    
+        st.markdown("---")
+        st.markdown("### 📚 Export PDF période (historique chauffeur)")
+        hist_c1, hist_c2, hist_c3 = st.columns([1, 1, 1])
+        today_local = date.today()
+        default_start = today_local - timedelta(days=30)
+
+        with hist_c1:
+            hist_start = st.date_input(
+                "Date début",
+                value=default_start,
+                key=f"driver_hist_start_{ch_selected}",
+            )
+        with hist_c2:
+            hist_end = st.date_input(
+                "Date fin",
+                value=today_local,
+                key=f"driver_hist_end_{ch_selected}",
+            )
+        with hist_c3:
+            export_hist = st.button(
+                "📄 Générer PDF historique",
+                key=f"driver_hist_pdf_btn_{ch_selected}",
+                use_container_width=True,
+            )
+
+        if hist_start > hist_end:
+            st.error("La date de début doit être antérieure ou égale à la date de fin.")
+        else:
+            if export_hist:
+                df_hist = get_planning(
+                    start_date=hist_start,
+                    end_date=hist_end,
+                    chauffeur=ch_selected,
+                    type_filter=None,
+                    search="",
+                    max_rows=20000,
+                    source="full",
+                )
+
+                if df_hist is None or df_hist.empty:
+                    st.warning("Aucun transfert trouvé sur cette période.")
+                else:
+                    if "IS_INDISPO" in df_hist.columns:
+                        df_hist = df_hist[df_hist["IS_INDISPO"].fillna(0).astype(int) == 0].copy()
+                    if "IS_SUPERSEDED" in df_hist.columns:
+                        df_hist = df_hist[df_hist["IS_SUPERSEDED"].fillna(0).astype(int) == 0].copy()
+
+                    planning_cols_driver_hist = [
+                        "DATE","HEURE","CH","²²²²","IMMAT","PAX","Reh","Siège",
+                        "Unnamed: 8","DESIGNATION","H South","Décollage","N° Vol","Origine",
+                        "GO","Num BDC","NOM","ADRESSE","CP","Localité","Tél",
+                        "Type Nav","PAIEMENT","Caisse"
+                    ]
+
+                    for c in planning_cols_driver_hist:
+                        if c not in df_hist.columns:
+                            df_hist[c] = ""
+
+                    df_hist = _sort_df_by_date_heure(df_hist.copy())
+                    df_hist_pdf = df_hist[planning_cols_driver_hist].copy()
+                    pdf_hist = export_chauffeur_planning_table_pdf(df_hist_pdf, ch_selected)
+                    st.download_button(
+                        "⬇️ Télécharger le PDF historique",
+                        data=pdf_hist,
+                        file_name=(
+                            f"planning_{ch_selected}_{hist_start.strftime('%Y%m%d')}"
+                            f"_{hist_end.strftime('%Y%m%d')}.pdf"
+                        ),
+                        mime="application/pdf",
+                        key=f"driver_hist_pdf_dl_{ch_selected}",
+                    )
 
         return  # ⛔ STOP ICI → la vue détaillée n’est PAS affichée
 
@@ -7209,6 +6953,7 @@ def render_tab_chauffeur_driver():
         # Adresse / Tel
         # ------------------
         adr = build_full_address_from_row(row)
+        nav_adr = build_navigation_address_from_row(row)
         if adr:
             bloc.append(f"📍 {adr}")
 
@@ -7278,9 +7023,9 @@ def render_tab_chauffeur_driver():
         if tel:
             actions.append(f"[📞 Appeler](tel:{clean_phone(tel)})")
 
-        if adr:
-            actions.append(f"[🧭 Waze]({build_waze_link(adr)})")
-            actions.append(f"[🗺 Google Maps]({build_google_maps_link(adr)})")
+        if nav_adr:
+            actions.append(f"[🧭 Waze]({build_waze_link(nav_adr)})")
+            actions.append(f"[🗺 Google Maps]({build_google_maps_link(nav_adr)})")
 
         if tel:
             # =========================
@@ -10346,7 +10091,6 @@ def main():
     # 1️⃣ INITIALISATION SESSION + DB
     # ======================================
     init_session_state()
-    restore_session_from_token()
     init_db_once()
     init_all_db_once()
     # 🔄 DEBUG rerun
@@ -10600,3 +10344,10 @@ def build_printable_html(df):
     </body>
     </html>
     """
+
+
+# 🔁 Auto-login via cookie
+if not st.session_state.get("logged_in"):
+    tok = _get_login_cookie()
+    if tok and st.session_state.get("session_token") == tok:
+        st.session_state.logged_in = True
