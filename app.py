@@ -450,22 +450,46 @@ def clear_login_cookie():
 
 
 def get_login_cookie():
+    """
+    Lit d'abord le vrai cookie navigateur envoyé à Streamlit.
+    Fallback éventuel sur le query param pour compatibilité arrière.
+    """
+    # 1) vrai cookie navigateur (persistant après fermeture/réouverture)
+    try:
+        cookies = getattr(st.context, "cookies", None)
+        if cookies:
+            tok = cookies.get("al_session")
+            if isinstance(tok, list):
+                tok = tok[0] if tok else None
+            tok = str(tok or "").strip()
+            if tok:
+                return tok
+    except Exception:
+        pass
+
+    # 2) compat arrière: query param si présent
     try:
         tok = st.query_params.get("al_session")
         if isinstance(tok, list):
             tok = tok[0] if tok else None
-        return str(tok or "").strip() or None
+        tok = str(tok or "").strip()
+        if tok:
+            return tok
     except Exception:
-        return None
+        pass
+
+    return None
 
 
 def restore_session_from_token() -> bool:
     if st.session_state.get("logged_in"):
         return True
+
     token = get_login_cookie()
     data = parse_login_token(token)
     if not data:
         return False
+
     st.session_state.logged_in = True
     st.session_state.username = data["username"]
     st.session_state.role = data["role"]
@@ -505,7 +529,8 @@ def _inject_client_session_bootstrap():
 
 
 _inject_client_session_bootstrap()
-restore_session_from_token()
+# La restauration réelle se fait dans main(), après init_session_state(),
+# en lisant le cookie navigateur persistant envoyé par Streamlit.
 # ============================================================
 #   LOGIN SCREEN
 # ============================================================
@@ -536,7 +561,6 @@ def login_screen():
             st.session_state.session_token = token
 
             set_login_cookie(token)
-            st.query_params["al_session"] = token
 
             st.success(f"Connecté en tant que **{login}** – rôle : {user['role']}")
             st.rerun()
@@ -10112,6 +10136,7 @@ def main():
     # 1️⃣ INITIALISATION SESSION + DB
     # ======================================
     init_session_state()
+    restore_session_from_token()
     init_db_once()
     init_all_db_once()
     # 🔄 DEBUG rerun
