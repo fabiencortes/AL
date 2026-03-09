@@ -358,13 +358,77 @@ LOGIN_PERSIST_KEY = "al_session"
 LOGIN_CLIENT_KEY = "al_client_id"
 LOGIN_CLIENT_STORAGE_KEY = "al_client_id_local"
 LOGIN_PERSIST_HOURS = 8
-LOGIN_STATE_FILE = Path(".al_login_state.json")
-_LOGIN_STATE_LOCK = threading.Lock()
 
 
 def _js_quote(val: str) -> str:
     import json as _json
     return _json.dumps(str(val or ""))
+
+
+def bootstrap_login_persistence():
+    """
+    Important pour Streamlit App/Desktop :
+    - crée un client_id unique PAR appareil / navigateur
+    - restaure al_session + al_client_id depuis localStorage vers l'URL
+      si l'app redémarre sans query params
+    Ainsi chaque utilisateur garde SA propre session.
+    """
+    components.html(
+        f"""
+        <script>
+        (function() {{
+            const sessionKey = {_js_quote(LOGIN_PERSIST_KEY)};
+            const clientKey = {_js_quote(LOGIN_CLIENT_KEY)};
+            const clientStorageKey = {_js_quote(LOGIN_CLIENT_STORAGE_KEY)};
+
+            function makeId() {{
+                try {{
+                    if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID();
+                }} catch (e) {{}}
+                return "cid-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+            }}
+
+            let clientId = "";
+            let sessionValue = "";
+
+            try {{ clientId = window.localStorage.getItem(clientStorageKey) || ""; }} catch (e) {{}}
+            if (!clientId) {{
+                clientId = makeId();
+                try {{ window.localStorage.setItem(clientStorageKey, clientId); }} catch (e) {{}}
+            }}
+
+            try {{ sessionValue = window.localStorage.getItem(sessionKey) || ""; }} catch (e) {{}}
+
+            function syncUrl(baseUrl) {{
+                try {{
+                    const url = new URL(baseUrl);
+                    let changed = false;
+                    if (clientId && url.searchParams.get(clientKey) !== clientId) {{
+                        url.searchParams.set(clientKey, clientId);
+                        changed = true;
+                    }}
+                    if (sessionValue && url.searchParams.get(sessionKey) !== sessionValue) {{
+                        url.searchParams.set(sessionKey, sessionValue);
+                        changed = true;
+                    }}
+                    if (changed) {{
+                        window.location.replace(url.toString());
+                    }}
+                }} catch (e) {{}}
+            }}
+
+            try {{
+                syncUrl(window.parent.location.href);
+            }} catch (e) {{
+                try {{
+                    syncUrl(window.location.href);
+                }} catch (e2) {{}}
+            }}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
 
 
 def _get_client_id():
@@ -378,76 +442,11 @@ def _get_client_id():
         return None
 
 
-def _load_login_state_map() -> dict:
-    try:
-        if not LOGIN_STATE_FILE.exists():
-            return {}
-        with LOGIN_STATE_FILE.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def _save_login_state_map(data: dict):
-    try:
-        LOGIN_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = LOGIN_STATE_FILE.with_suffix(".tmp")
-        with tmp.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        tmp.replace(LOGIN_STATE_FILE)
-    except Exception:
-        pass
-
-
-def save_persistent_login_state(login: str, token: str):
-    client_id = _get_client_id()
-    login = str(login or "").strip().lower()
-    token = str(token or "").strip()
-    if not client_id or not login or not token:
-        return False
-    with _LOGIN_STATE_LOCK:
-        data = _load_login_state_map()
-        data[client_id] = {
-            "login": login,
-            "token": token,
-            "saved_at": datetime.now().isoformat(),
-        }
-        _save_login_state_map(data)
-    return True
-
-
-def clear_persistent_login_state():
-    client_id = _get_client_id()
-    if not client_id:
-        return False
-    with _LOGIN_STATE_LOCK:
-        data = _load_login_state_map()
-        if client_id in data:
-            data.pop(client_id, None)
-            _save_login_state_map(data)
-    return True
-
-
-def finalize_persistent_login_state():
-    if not st.session_state.get("logged_in"):
-        return False
-    if st.session_state.get("_persist_state_saved"):
-        return True
-    login = st.session_state.get("username")
-    token = st.session_state.get("session_token")
-    if save_persistent_login_state(login, token):
-        st.session_state["_persist_state_saved"] = True
-        return True
-    return False
-
-
 def set_login_cookie(token: str):
     """
-    Persistance login côté navigateur / app Streamlit.
-    Chaque appareil reçoit un client_id unique stocké localement.
-    Le serveur sauvegarde ensuite la session PAR client_id,
-    ce qui évite qu'un chauffeur récupère la session d'un autre.
+    Persistance login par appareil/utilisateur.
+    Le token reste côté navigateur/app via cookie + localStorage + query params.
+    Pas d'état global serveur partagé entre chauffeurs.
     """
     token = str(token or "").strip()
     if not token:
@@ -474,9 +473,7 @@ def set_login_cookie(token: str):
             }}
 
             let clientId = "";
-            try {{
-                clientId = window.localStorage.getItem(clientStorageKey) || "";
-            }} catch (e) {{}}
+            try {{ clientId = window.localStorage.getItem(clientStorageKey) || ""; }} catch (e) {{}}
             if (!clientId) {{
                 clientId = makeId();
                 try {{ window.localStorage.setItem(clientStorageKey, clientId); }} catch (e) {{}}
@@ -486,21 +483,22 @@ def set_login_cookie(token: str):
                 document.cookie = sessionKey + "=" + encodeURIComponent(sessionValue) + "; path=/; max-age=" + maxAge + "; SameSite=Lax";
             }} catch (e) {{}}
 
-            try {{
-                window.localStorage.setItem(sessionKey, sessionValue);
-            }} catch (e) {{}}
+            try {{ window.localStorage.setItem(sessionKey, sessionValue); }} catch (e) {{}}
+
+            function updateUrl(baseUrl, replaceTarget) {{
+                try {{
+                    const url = new URL(baseUrl);
+                    url.searchParams.set(sessionKey, sessionValue);
+                    if (clientId) url.searchParams.set(clientKey, clientId);
+                    replaceTarget(url.toString());
+                }} catch (e) {{}}
+            }}
 
             try {{
-                const url = new URL(window.parent.location.href);
-                url.searchParams.set(sessionKey, sessionValue);
-                url.searchParams.set(clientKey, clientId);
-                window.parent.history.replaceState({{}}, "", url.toString());
+                updateUrl(window.parent.location.href, (u) => window.parent.location.replace(u));
             }} catch (e) {{
                 try {{
-                    const url = new URL(window.location.href);
-                    url.searchParams.set(sessionKey, sessionValue);
-                    url.searchParams.set(clientKey, clientId);
-                    window.history.replaceState({{}}, "", url.toString());
+                    updateUrl(window.location.href, (u) => window.location.replace(u));
                 }} catch (e2) {{}}
             }}
         }})();
@@ -511,7 +509,7 @@ def set_login_cookie(token: str):
 
 
 def clear_login_cookie():
-    """Supprime la persistance login côté client."""
+    """Supprime la persistance login côté client, sans toucher au client_id appareil."""
     components.html(
         f"""
         <script>
@@ -553,24 +551,14 @@ def get_login_cookie():
 
 def restore_login_from_cookie():
     """
-    Restaure automatiquement la session à partir du token persisté.
-    Priorité :
-    1) query param al_session=login|uuid
-    2) fallback serveur par client_id (spécial app Streamlit)
+    Restaure automatiquement la session à partir du token persistant
+    stocké côté appareil.
+    Format attendu: 'login|uuid'.
     """
     if st.session_state.get("logged_in"):
         return False
 
     raw = get_login_cookie()
-    if not raw:
-        client_id = _get_client_id()
-        if client_id:
-            data = _load_login_state_map().get(client_id) or {}
-            login = str(data.get("login") or "").strip().lower()
-            token = str(data.get("token") or "").strip()
-            if login and token:
-                raw = f"{login}|{token}"
-
     if not raw:
         return False
 
@@ -590,7 +578,6 @@ def restore_login_from_cookie():
     st.session_state.role = user.get("role")
     st.session_state.chauffeur_code = user.get("chauffeur_code")
     st.session_state.session_token = token
-    st.session_state["_persist_state_saved"] = False
     return True
 # ============================================================
 #   LOGIN SCREEN
@@ -10318,8 +10305,8 @@ def main():
     # 1️⃣ INITIALISATION SESSION + DB
     # ======================================
     init_session_state()
+    bootstrap_login_persistence()
     restore_login_from_cookie()
-    finalize_persistent_login_state()
     init_db_once()
     init_all_db_once()
     # 🔄 DEBUG rerun
