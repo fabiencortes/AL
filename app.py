@@ -357,7 +357,7 @@ import json
 import streamlit.components.v1 as components
 
 AL_SESSION_SECRET = os.environ.get("AL_SESSION_SECRET", "airports-lines-session-secret-2026")
-AL_SESSION_MAX_AGE = 60 * 60 * 8  # 8 heures
+AL_SESSION_MAX_AGE = 60 * 60 * 24 * 30  # 30 jours
 
 
 def _b64u_encode(raw: bytes) -> str:
@@ -418,11 +418,37 @@ def set_login_cookie(token: str):
         <script>
         (function() {{
             const token = {safe_token};
+            const maxAge = {AL_SESSION_MAX_AGE};
+
+            function setCookieOn(doc) {{
+                try {{
+                    if (!doc) return;
+                    doc.cookie = "al_session=" + encodeURIComponent(token) + "; path=/; max-age=" + maxAge + "; SameSite=Lax";
+                }} catch (e) {{}}
+            }}
+
+            function setStorageOn(win) {{
+                try {{
+                    if (!win || !win.localStorage) return;
+                    win.localStorage.setItem("al_session", token);
+                }} catch (e) {{}}
+            }}
+
+            setCookieOn(document);
+            setStorageOn(window);
+
+            try {{ setCookieOn(window.parent.document); }} catch (e) {{}}
+            try {{ setCookieOn(window.top.document); }} catch (e) {{}}
+            try {{ setStorageOn(window.parent); }} catch (e) {{}}
+            try {{ setStorageOn(window.top); }} catch (e) {{}}
+
             try {{
-                document.cookie = "al_session=" + encodeURIComponent(token) + "; path=/; max-age={AL_SESSION_MAX_AGE}; SameSite=Lax";
-            }} catch (e) {{}}
-            try {{
-                window.localStorage.setItem("al_session", token);
+                const topWin = window.top || window;
+                const url = new URL(topWin.location.href);
+                if (url.searchParams.get("al_session") !== token) {{
+                    url.searchParams.set("al_session", token);
+                    topWin.history.replaceState({{}}, "", url.toString());
+                }}
             }} catch (e) {{}}
         }})();
         </script>
@@ -436,11 +462,33 @@ def clear_login_cookie():
         """
         <script>
         (function() {
+            function clearCookieOn(doc) {
+                try {
+                    if (!doc) return;
+                    doc.cookie = "al_session=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax";
+                } catch (e) {}
+            }
+
+            function clearStorageOn(win) {
+                try {
+                    if (!win || !win.localStorage) return;
+                    win.localStorage.removeItem("al_session");
+                } catch (e) {}
+            }
+
+            clearCookieOn(document);
+            clearStorageOn(window);
+
+            try { clearCookieOn(window.parent.document); } catch (e) {}
+            try { clearCookieOn(window.top.document); } catch (e) {}
+            try { clearStorageOn(window.parent); } catch (e) {}
+            try { clearStorageOn(window.top); } catch (e) {}
+
             try {
-                document.cookie = "al_session=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax";
-            } catch (e) {}
-            try {
-                window.localStorage.removeItem("al_session");
+                const topWin = window.top || window;
+                const url = new URL(topWin.location.href);
+                url.searchParams.delete("al_session");
+                topWin.history.replaceState({}, "", url.toString());
             } catch (e) {}
         })();
         </script>
@@ -503,22 +551,43 @@ def _inject_client_session_bootstrap():
         """
         <script>
         (function() {
-            try {
-                const url = new URL(window.location.href);
-                const qpToken = url.searchParams.get("al_session");
-                let stored = "";
+            function readStorage(win) {
                 try {
-                    stored = window.localStorage.getItem("al_session") || "";
+                    if (win && win.localStorage) {
+                        return win.localStorage.getItem("al_session") || "";
+                    }
                 } catch (e) {}
+                return "";
+            }
+
+            function readCookie(doc) {
+                try {
+                    if (!doc) return "";
+                    const m = doc.cookie.match(/(?:^|; )al_session=([^;]+)/);
+                    if (m) return decodeURIComponent(m[1] || "");
+                } catch (e) {}
+                return "";
+            }
+
+            try {
+                const topWin = window.top || window;
+                const url = new URL(topWin.location.href);
+                const qpToken = url.searchParams.get("al_session") || "";
+
+                let stored = "";
+                stored = readStorage(topWin) || readStorage(window.parent) || readStorage(window) || "";
                 if (!stored) {
-                    try {
-                        const m = document.cookie.match(/(?:^|; )al_session=([^;]+)/);
-                        if (m) stored = decodeURIComponent(m[1] || "");
-                    } catch (e) {}
+                    stored = readCookie(topWin.document) || readCookie(window.parent.document) || readCookie(document) || "";
                 }
-                if (stored && qpToken !== stored) {
-                    url.searchParams.set("al_session", stored);
-                    window.location.replace(url.toString());
+
+                if (stored) {
+                    try { topWin.localStorage.setItem("al_session", stored); } catch (e) {}
+                    try { topWin.document.cookie = "al_session=" + encodeURIComponent(stored) + "; path=/; max-age=2592000; SameSite=Lax"; } catch (e) {}
+                    if (qpToken !== stored) {
+                        url.searchParams.set("al_session", stored);
+                        topWin.location.replace(url.toString());
+                        return;
+                    }
                 }
             } catch (e) {}
         })();
@@ -559,6 +628,11 @@ def login_screen():
             st.session_state.role = user['role']
             st.session_state.chauffeur_code = user.get('chauffeur_code')
             st.session_state.session_token = token
+
+            try:
+                st.query_params["al_session"] = token
+            except Exception:
+                pass
 
             set_login_cookie(token)
 
