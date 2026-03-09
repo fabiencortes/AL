@@ -346,70 +346,72 @@ CH_CODES = [
     "MF", "WS", "PO"
 ]
 # ============================================================
-# 🔐 SESSION PERSISTANTE (TOKEN SIGNÉ + URL + STORAGE NAVIGATEUR)
+# 🔐 SESSION PERSISTANTE (TOKEN SIGNÉ + URL/COOKIE)
 # ============================================================
-import uuid
-import json
+import os
+import time
 import hmac
-import hashlib
 import base64
+import hashlib
+import json
 import streamlit.components.v1 as components
 
-LOGIN_TOKEN_SECRET = "airports-lines-login-v1"
-LOGIN_TOKEN_TTL_SEC = 60 * 60 * 24 * 30  # 30 jours
+AL_SESSION_SECRET = os.environ.get("AL_SESSION_SECRET", "airports-lines-session-secret-2026")
+AL_SESSION_MAX_AGE = 60 * 60 * 8  # 8 heures
 
 
 def _b64u_encode(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
 
 
-def _b64u_decode(data: str) -> bytes:
-    data = str(data or "")
-    padding = "=" * (-len(data) % 4)
-    return base64.urlsafe_b64decode(data + padding)
+def _b64u_decode(value: str) -> bytes:
+    pad = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode((value + pad).encode("utf-8"))
 
 
-def _make_login_token(username: str, role: str, chauffeur_code: str | None) -> str:
+def make_login_token(username: str, role: str, chauffeur_code: str | None = None, ttl_seconds: int = AL_SESSION_MAX_AGE) -> str:
     payload = {
         "u": str(username or "").strip(),
         "r": str(role or "").strip(),
         "c": str(chauffeur_code or "").strip(),
-        "exp": int(time.time()) + LOGIN_TOKEN_TTL_SEC,
+        "exp": int(time.time()) + int(ttl_seconds or AL_SESSION_MAX_AGE),
     }
-    payload_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    payload_b64 = _b64u_encode(payload_bytes)
-    sig = hmac.new(
-        LOGIN_TOKEN_SECRET.encode("utf-8"),
-        payload_b64.encode("utf-8"),
-        hashlib.sha256,
-    ).digest()
+    payload_b64 = _b64u_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    sig = hmac.new(AL_SESSION_SECRET.encode("utf-8"), payload_b64.encode("utf-8"), hashlib.sha256).digest()
     return f"{payload_b64}.{_b64u_encode(sig)}"
 
 
-def _parse_login_token(token: str) -> dict | None:
+def parse_login_token(token: str) -> dict | None:
     try:
-        payload_b64, sig_b64 = str(token or "").split(".", 1)
-        expected_sig = hmac.new(
-            LOGIN_TOKEN_SECRET.encode("utf-8"),
-            payload_b64.encode("utf-8"),
-            hashlib.sha256,
-        ).digest()
-        if not hmac.compare_digest(_b64u_encode(expected_sig), sig_b64):
+        token = str(token or "").strip()
+        if not token or "." not in token:
+            return None
+        payload_b64, sig_b64 = token.split(".", 1)
+        expected = hmac.new(AL_SESSION_SECRET.encode("utf-8"), payload_b64.encode("utf-8"), hashlib.sha256).digest()
+        given = _b64u_decode(sig_b64)
+        if not hmac.compare_digest(expected, given):
             return None
         payload = json.loads(_b64u_decode(payload_b64).decode("utf-8"))
-        if int(payload.get("exp", 0)) < int(time.time()):
+        if int(payload.get("exp", 0) or 0) < int(time.time()):
             return None
-        return payload
+        username = str(payload.get("u", "")).strip()
+        role = str(payload.get("r", "")).strip()
+        chauffeur_code = str(payload.get("c", "")).strip()
+        user = USERS.get(username)
+        if not user or user.get("role") != role:
+            return None
+        if (user.get("chauffeur_code") or "") != chauffeur_code:
+            return None
+        return {
+            "username": username,
+            "role": role,
+            "chauffeur_code": chauffeur_code or None,
+        }
     except Exception:
         return None
 
 
 def set_login_cookie(token: str):
-    try:
-        st.query_params["al_session"] = token
-    except Exception:
-        pass
-
     safe_token = json.dumps(str(token or ""))
     components.html(
         f"""
@@ -417,15 +419,10 @@ def set_login_cookie(token: str):
         (function() {{
             const token = {safe_token};
             try {{
-                document.cookie = "al_session=" + encodeURIComponent(token) + "; path=/; max-age={LOGIN_TOKEN_TTL_SEC}; SameSite=Lax";
+                document.cookie = "al_session=" + encodeURIComponent(token) + "; path=/; max-age={AL_SESSION_MAX_AGE}; SameSite=Lax";
             }} catch (e) {{}}
             try {{
                 window.localStorage.setItem("al_session", token);
-            }} catch (e) {{}}
-            try {{
-                const url = new URL(window.location.href);
-                url.searchParams.set("al_session", token);
-                window.history.replaceState({{}}, "", url.toString());
             }} catch (e) {{}}
         }})();
         </script>
@@ -435,26 +432,15 @@ def set_login_cookie(token: str):
 
 
 def clear_login_cookie():
-    try:
-        if "al_session" in st.query_params:
-            del st.query_params["al_session"]
-    except Exception:
-        pass
-
     components.html(
         """
         <script>
         (function() {
             try {
-                document.cookie = "al_session=; path=/; max-age=0; SameSite=Lax";
+                document.cookie = "al_session=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax";
             } catch (e) {}
             try {
                 window.localStorage.removeItem("al_session");
-            } catch (e) {}
-            try {
-                const url = new URL(window.location.href);
-                url.searchParams.delete("al_session");
-                window.history.replaceState({}, "", url.toString());
             } catch (e) {}
         })();
         </script>
@@ -466,46 +452,60 @@ def clear_login_cookie():
 def get_login_cookie():
     try:
         tok = st.query_params.get("al_session")
-        return str(tok).strip() if tok else None
+        if isinstance(tok, list):
+            tok = tok[0] if tok else None
+        return str(tok or "").strip() or None
     except Exception:
         return None
 
 
-def restore_login_from_token() -> bool:
+def restore_session_from_token() -> bool:
     if st.session_state.get("logged_in"):
         return True
-
-    tok = get_login_cookie()
-    if not tok:
+    token = get_login_cookie()
+    data = parse_login_token(token)
+    if not data:
         return False
-
-    payload = _parse_login_token(tok)
-    if not payload:
-        return False
-
-    username = str(payload.get("u", "")).strip()
-    role = str(payload.get("r", "")).strip()
-    chauffeur_code = str(payload.get("c", "")).strip() or None
-
-    if not username or username not in USERS:
-        return False
-
-    user = USERS.get(username, {})
-    expected_role = str(user.get("role") or "").strip()
-    expected_ch = str(user.get("chauffeur_code") or "").strip() or None
-
-    if expected_role != role:
-        return False
-    if (expected_ch or None) != chauffeur_code:
-        return False
-
     st.session_state.logged_in = True
-    st.session_state.username = username
-    st.session_state.role = role
-    st.session_state.chauffeur_code = chauffeur_code
-    st.session_state.session_token = tok
+    st.session_state.username = data["username"]
+    st.session_state.role = data["role"]
+    st.session_state.chauffeur_code = data.get("chauffeur_code")
+    st.session_state.session_token = token
     return True
 
+
+def _inject_client_session_bootstrap():
+    components.html(
+        """
+        <script>
+        (function() {
+            try {
+                const url = new URL(window.location.href);
+                const qpToken = url.searchParams.get("al_session");
+                let stored = "";
+                try {
+                    stored = window.localStorage.getItem("al_session") || "";
+                } catch (e) {}
+                if (!stored) {
+                    try {
+                        const m = document.cookie.match(/(?:^|; )al_session=([^;]+)/);
+                        if (m) stored = decodeURIComponent(m[1] || "");
+                    } catch (e) {}
+                }
+                if (stored && qpToken !== stored) {
+                    url.searchParams.set("al_session", stored);
+                    window.location.replace(url.toString());
+                }
+            } catch (e) {}
+        })();
+        </script>
+        """,
+        height=0,
+    )
+
+
+_inject_client_session_bootstrap()
+restore_session_from_token()
 # ============================================================
 #   LOGIN SCREEN
 # ============================================================
@@ -527,7 +527,7 @@ def login_screen():
         user = USERS.get(login)
 
         if user and user["password"] == pwd:
-            token = _make_login_token(login, user["role"], user.get("chauffeur_code"))
+            token = make_login_token(login, user["role"], user.get("chauffeur_code"))
 
             st.session_state.logged_in = True
             st.session_state.username = login
@@ -536,6 +536,7 @@ def login_screen():
             st.session_state.session_token = token
 
             set_login_cookie(token)
+            st.query_params["al_session"] = token
 
             st.success(f"Connecté en tant que **{login}** – rôle : {user['role']}")
             st.rerun()
@@ -3608,15 +3609,22 @@ def logout():
     Déconnexion volontaire uniquement.
     Ne casse pas la session Streamlit interne.
     """
+    clear_login_cookie()
+    try:
+        if "al_session" in st.query_params:
+            del st.query_params["al_session"]
+    except Exception:
+        pass
+
     for k in (
         "logged_in",
         "username",
         "role",
         "chauffeur_code",
+        "session_token",
     ):
         st.session_state.pop(k, None)
 
-    clear_login_cookie()
     st.cache_data.clear()
     st.rerun()
 
@@ -3672,10 +3680,10 @@ def _send_planning_next_3_days_to_all(*, want_pdf: bool = True) -> dict:
 
     chauffeurs = sorted(active_chauffeurs)
     if not chauffeurs:
-        st.info("Aucun chauffeur trouvé sur la période demain → J+3.")
+        st.info("Aucun chauffeur trouvé sur les 3 prochains jours.")
         return recap
 
-    periode_label = "de demain à J+3"
+    periode_label = "3 prochains jours"
     for ch in dict.fromkeys(chauffeurs):
         try:
             _tel, mail = get_chauffeur_contact(ch)
@@ -3701,6 +3709,7 @@ def _send_planning_next_3_days_to_all(*, want_pdf: bool = True) -> dict:
                     pass
                 continue
 
+            # corps mail (identique)
             try:
                 body = build_planning_mail_body(
                     df_ch=df_ch,
@@ -3726,6 +3735,7 @@ def _send_planning_next_3_days_to_all(*, want_pdf: bool = True) -> dict:
                         df_table[c] = ""
                 df_table = df_table[planning_cols_driver]
 
+                # ✅ Affichage plage horaire (HEURE début + ²²²² = fin) quand ²²²² contient une vraie heure
                 def _looks_like_time_local(v):
                     try:
                         t = normalize_time_string(v)
@@ -3736,13 +3746,19 @@ def _send_planning_next_3_days_to_all(*, want_pdf: bool = True) -> dict:
                 if "HEURE" in df_table.columns and "²²²²" in df_table.columns:
                     h_deb = df_table["HEURE"].astype(str).map(lambda x: normalize_time_string(x) or str(x))
                     h_fin = df_table["²²²²"].astype(str).map(_looks_like_time_local)
+
+                    # Si fin valide et différente → on affiche HEURE sous forme "HH:MM–HH:MM"
                     df_table["HEURE"] = [
                         (f"{a}–{b}" if (a and b and a != b) else a)
                         for a, b in zip(h_deb, h_fin)
                     ]
 
+                # ✅ IMPORTANT : on ne normalise PAS Unnamed: 8 ici (texte libre = on garde)
+
+
                 pdf_buf = export_chauffeur_planning_table_pdf(df_table, ch)
                 pdf_bytes = pdf_buf.getvalue() if hasattr(pdf_buf, "getvalue") else bytes(pdf_buf)
+
                 fname = f"Planning_{ch}_{d_start.isoformat()}_{d_end.isoformat()}.pdf"
 
                 ok = send_email_smtp_with_attachments(
@@ -3779,7 +3795,7 @@ def _send_planning_next_3_days_to_all(*, want_pdf: bool = True) -> dict:
 
 def _topbar_sync_db_and_refresh(*, also_send_next3: bool = False):
     """Bouton top-bar : MAJ DB depuis Dropbox puis rafraîchit l'UI.
-    Option: envoi aussi le planning de demain à J+3.
+    Option: envoi aussi le planning des 3 prochains jours.
     """
     from datetime import datetime
 
@@ -3792,7 +3808,7 @@ def _topbar_sync_db_and_refresh(*, also_send_next3: bool = False):
                 sync_planning_from_today(ui=True)
 
         if also_send_next3:
-            with st.spinner("📧 Envoi planning (demain → J+3)…"):
+            with st.spinner("📧 Envoi planning (3 prochains jours)…"):
                 recap = _send_planning_next_3_days_to_all(want_pdf=True)
                 st.success(
                     f"📧 Envoi terminé — envoyés: {recap['sent']} | vides: {recap['skipped_empty']} | emails manquants: {recap['missing_email']} | erreurs: {recap['errors']}"
@@ -3847,7 +3863,7 @@ def render_top_bar():
             st.empty()
 
     # -------------------------------
-    # 📧 MAJ + Envoi planning demain → J+3 (ADMIN ONLY, PDF joint)
+    # 📧 MAJ + Envoi planning 3 jours (ADMIN ONLY, PDF joint)
     # -------------------------------
     with col3:
         if role == "admin":
@@ -10108,7 +10124,6 @@ def main():
     # ======================================
     # 2️⃣ LOGIN
     # ======================================
-    restore_login_from_token()
     if not st.session_state.logged_in:
         login_screen()
         st.stop()
@@ -10350,5 +10365,3 @@ def build_printable_html(df):
     </body>
     </html>
     """
-
-
