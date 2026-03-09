@@ -347,27 +347,107 @@ CH_CODES = [
 ]
 # ============================================================
 # 🔐 SESSION PERSISTANTE (COOKIE / QUERY PARAMS / LOCALSTORAGE)
+#    + FALLBACK SERVEUR PAR CLIENT_ID (spécial Streamlit App)
 # ============================================================
 import uuid
+import json
+import threading
 import streamlit.components.v1 as components
 
 LOGIN_PERSIST_KEY = "al_session"
+LOGIN_CLIENT_KEY = "al_client_id"
+LOGIN_CLIENT_STORAGE_KEY = "al_client_id_local"
 LOGIN_PERSIST_HOURS = 8
-LOCAL_LOGIN_STATE_PATH = Path(".al_login_state.json")
+LOGIN_STATE_FILE = Path(".al_login_state.json")
+_LOGIN_STATE_LOCK = threading.Lock()
 
 
 def _js_quote(val: str) -> str:
-    import json
-    return json.dumps(str(val or ""))
+    import json as _json
+    return _json.dumps(str(val or ""))
+
+
+def _get_client_id():
+    try:
+        val = st.query_params.get(LOGIN_CLIENT_KEY)
+        if isinstance(val, list):
+            val = val[0] if val else None
+        val = str(val or "").strip()
+        return val or None
+    except Exception:
+        return None
+
+
+def _load_login_state_map() -> dict:
+    try:
+        if not LOGIN_STATE_FILE.exists():
+            return {}
+        with LOGIN_STATE_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_login_state_map(data: dict):
+    try:
+        LOGIN_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = LOGIN_STATE_FILE.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        tmp.replace(LOGIN_STATE_FILE)
+    except Exception:
+        pass
+
+
+def save_persistent_login_state(login: str, token: str):
+    client_id = _get_client_id()
+    login = str(login or "").strip().lower()
+    token = str(token or "").strip()
+    if not client_id or not login or not token:
+        return False
+    with _LOGIN_STATE_LOCK:
+        data = _load_login_state_map()
+        data[client_id] = {
+            "login": login,
+            "token": token,
+            "saved_at": datetime.now().isoformat(),
+        }
+        _save_login_state_map(data)
+    return True
+
+
+def clear_persistent_login_state():
+    client_id = _get_client_id()
+    if not client_id:
+        return False
+    with _LOGIN_STATE_LOCK:
+        data = _load_login_state_map()
+        if client_id in data:
+            data.pop(client_id, None)
+            _save_login_state_map(data)
+    return True
+
+
+def finalize_persistent_login_state():
+    if not st.session_state.get("logged_in"):
+        return False
+    if st.session_state.get("_persist_state_saved"):
+        return True
+    login = st.session_state.get("username")
+    token = st.session_state.get("session_token")
+    if save_persistent_login_state(login, token):
+        st.session_state["_persist_state_saved"] = True
+        return True
+    return False
 
 
 def set_login_cookie(token: str):
     """
     Persistance login côté navigateur / app Streamlit.
-    On stocke la session à 3 endroits :
-    - cookie navigateur
-    - localStorage
-    - query param de l'URL (lisible côté Python via st.query_params)
+    Chaque appareil reçoit un client_id unique stocké localement.
+    Le serveur sauvegarde ensuite la session PAR client_id,
+    ce qui évite qu'un chauffeur récupère la session d'un autre.
     """
     token = str(token or "").strip()
     if not token:
@@ -380,26 +460,46 @@ def set_login_cookie(token: str):
         f"""
         <script>
         (function() {{
-            const key = {_js_quote(LOGIN_PERSIST_KEY)};
-            const value = {token_js};
+            const sessionKey = {_js_quote(LOGIN_PERSIST_KEY)};
+            const clientKey = {_js_quote(LOGIN_CLIENT_KEY)};
+            const clientStorageKey = {_js_quote(LOGIN_CLIENT_STORAGE_KEY)};
+            const sessionValue = {token_js};
             const maxAge = {max_age};
 
+            function makeId() {{
+                try {{
+                    if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID();
+                }} catch (e) {{}}
+                return "cid-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+            }}
+
+            let clientId = "";
             try {{
-                document.cookie = key + "=" + encodeURIComponent(value) + "; path=/; max-age=" + maxAge + "; SameSite=Lax";
+                clientId = window.localStorage.getItem(clientStorageKey) || "";
+            }} catch (e) {{}}
+            if (!clientId) {{
+                clientId = makeId();
+                try {{ window.localStorage.setItem(clientStorageKey, clientId); }} catch (e) {{}}
+            }}
+
+            try {{
+                document.cookie = sessionKey + "=" + encodeURIComponent(sessionValue) + "; path=/; max-age=" + maxAge + "; SameSite=Lax";
             }} catch (e) {{}}
 
             try {{
-                window.localStorage.setItem(key, value);
+                window.localStorage.setItem(sessionKey, sessionValue);
             }} catch (e) {{}}
 
             try {{
                 const url = new URL(window.parent.location.href);
-                url.searchParams.set(key, value);
+                url.searchParams.set(sessionKey, sessionValue);
+                url.searchParams.set(clientKey, clientId);
                 window.parent.history.replaceState({{}}, "", url.toString());
             }} catch (e) {{
                 try {{
                     const url = new URL(window.location.href);
-                    url.searchParams.set(key, value);
+                    url.searchParams.set(sessionKey, sessionValue);
+                    url.searchParams.set(clientKey, clientId);
                     window.history.replaceState({{}}, "", url.toString());
                 }} catch (e2) {{}}
             }}
@@ -416,21 +516,21 @@ def clear_login_cookie():
         f"""
         <script>
         (function() {{
-            const key = {_js_quote(LOGIN_PERSIST_KEY)};
+            const sessionKey = {_js_quote(LOGIN_PERSIST_KEY)};
             try {{
-                document.cookie = key + "=; path=/; max-age=0; SameSite=Lax";
+                document.cookie = sessionKey + "=; path=/; max-age=0; SameSite=Lax";
             }} catch (e) {{}}
             try {{
-                window.localStorage.removeItem(key);
+                window.localStorage.removeItem(sessionKey);
             }} catch (e) {{}}
             try {{
                 const url = new URL(window.parent.location.href);
-                url.searchParams.delete(key);
+                url.searchParams.delete(sessionKey);
                 window.parent.history.replaceState({{}}, "", url.toString());
             }} catch (e) {{
                 try {{
                     const url = new URL(window.location.href);
-                    url.searchParams.delete(key);
+                    url.searchParams.delete(sessionKey);
                     window.history.replaceState({{}}, "", url.toString());
                 }} catch (e2) {{}}
             }}
@@ -451,79 +551,26 @@ def get_login_cookie():
         return None
 
 
-def save_login_state_local(login: str, token: str):
-    """
-    Fallback spécial Streamlit App/Desktop.
-    Si cookie/query params ne survivent pas, on garde une petite session locale.
-    """
-    try:
-        login = str(login or "").strip().lower()
-        token = str(token or "").strip()
-        user = USERS.get(login)
-        if not user or not token:
-            return
-
-        expires_at = (datetime.now() + timedelta(hours=LOGIN_PERSIST_HOURS)).isoformat()
-        payload = {
-            "login": login,
-            "token": token,
-            "expires_at": expires_at,
-        }
-        LOCAL_LOGIN_STATE_PATH.write_text(
-            json.dumps(payload, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    except Exception as e:
-        print(f"⚠️ save_login_state_local error: {e}", flush=True)
-
-
-def load_login_state_local() -> str | None:
-    try:
-        if not LOCAL_LOGIN_STATE_PATH.exists():
-            return None
-
-        raw = LOCAL_LOGIN_STATE_PATH.read_text(encoding="utf-8")
-        data = json.loads(raw or "{}")
-        login = str(data.get("login") or "").strip().lower()
-        token = str(data.get("token") or "").strip()
-        expires_at = str(data.get("expires_at") or "").strip()
-
-        if not login or not token:
-            return None
-
-        if expires_at:
-            try:
-                if datetime.fromisoformat(expires_at) < datetime.now():
-                    return None
-            except Exception:
-                pass
-
-        return f"{login}|{token}"
-    except Exception as e:
-        print(f"⚠️ load_login_state_local error: {e}", flush=True)
-        return None
-
-
-def clear_login_state_local():
-    try:
-        if LOCAL_LOGIN_STATE_PATH.exists():
-            LOCAL_LOGIN_STATE_PATH.unlink()
-    except Exception as e:
-        print(f"⚠️ clear_login_state_local error: {e}", flush=True)
-
-
 def restore_login_from_cookie():
     """
-    Restaure automatiquement la session.
+    Restaure automatiquement la session à partir du token persisté.
     Priorité :
-    1) query params / persistance navigateur
-    2) fallback fichier local (important pour Streamlit App/Desktop)
-    Format attendu: 'login|uuid'.
+    1) query param al_session=login|uuid
+    2) fallback serveur par client_id (spécial app Streamlit)
     """
     if st.session_state.get("logged_in"):
         return False
 
-    raw = get_login_cookie() or load_login_state_local()
+    raw = get_login_cookie()
+    if not raw:
+        client_id = _get_client_id()
+        if client_id:
+            data = _load_login_state_map().get(client_id) or {}
+            login = str(data.get("login") or "").strip().lower()
+            token = str(data.get("token") or "").strip()
+            if login and token:
+                raw = f"{login}|{token}"
+
     if not raw:
         return False
 
@@ -543,9 +590,7 @@ def restore_login_from_cookie():
     st.session_state.role = user.get("role")
     st.session_state.chauffeur_code = user.get("chauffeur_code")
     st.session_state.session_token = token
-
-    # Réécrit la persistance locale au passage pour prolonger la session.
-    save_login_state_local(login, token)
+    st.session_state["_persist_state_saved"] = False
     return True
 # ============================================================
 #   LOGIN SCREEN
@@ -575,9 +620,9 @@ def login_screen():
             st.session_state.role = user['role']
             st.session_state.chauffeur_code = user.get('chauffeur_code')
             st.session_state.session_token = token
+            st.session_state["_persist_state_saved"] = False
 
             set_login_cookie(f"{login}|{token}")
-            save_login_state_local(login, token)
 
             st.success(f"Connecté en tant que **{login}** – rôle : {user['role']}")
             st.rerun()
@@ -3707,22 +3752,13 @@ def logout():
     Déconnexion volontaire uniquement.
     Ne casse pas la session Streamlit interne.
     """
-    clear_login_cookie()
-    clear_login_state_local()
-
     for k in (
         "logged_in",
         "username",
         "role",
         "chauffeur_code",
-        "session_token",
     ):
         st.session_state.pop(k, None)
-
-    try:
-        st.query_params.pop(LOGIN_PERSIST_KEY, None)
-    except Exception:
-        pass
 
     st.cache_data.clear()
     st.rerun()
@@ -10283,6 +10319,7 @@ def main():
     # ======================================
     init_session_state()
     restore_login_from_cookie()
+    finalize_persistent_login_state()
     init_db_once()
     init_all_db_once()
     # 🔄 DEBUG rerun
@@ -10538,8 +10575,8 @@ def build_printable_html(df):
     """
 
 
-# 🔁 Auto-login via persistance navigateur
-try:
-    restore_login_from_cookie()
-except Exception:
-    pass
+# 🔁 Auto-login via cookie
+if not st.session_state.get("logged_in"):
+    tok = _get_login_cookie()
+    if tok and st.session_state.get("session_token") == tok:
+        st.session_state.logged_in = True
