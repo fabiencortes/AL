@@ -353,6 +353,7 @@ import streamlit.components.v1 as components
 
 LOGIN_PERSIST_KEY = "al_session"
 LOGIN_PERSIST_HOURS = 8
+LOCAL_LOGIN_STATE_PATH = Path(".al_login_state.json")
 
 
 def _js_quote(val: str) -> str:
@@ -450,15 +451,79 @@ def get_login_cookie():
         return None
 
 
+def save_login_state_local(login: str, token: str):
+    """
+    Fallback spécial Streamlit App/Desktop.
+    Si cookie/query params ne survivent pas, on garde une petite session locale.
+    """
+    try:
+        login = str(login or "").strip().lower()
+        token = str(token or "").strip()
+        user = USERS.get(login)
+        if not user or not token:
+            return
+
+        expires_at = (datetime.now() + timedelta(hours=LOGIN_PERSIST_HOURS)).isoformat()
+        payload = {
+            "login": login,
+            "token": token,
+            "expires_at": expires_at,
+        }
+        LOCAL_LOGIN_STATE_PATH.write_text(
+            json.dumps(payload, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        print(f"⚠️ save_login_state_local error: {e}", flush=True)
+
+
+def load_login_state_local() -> str | None:
+    try:
+        if not LOCAL_LOGIN_STATE_PATH.exists():
+            return None
+
+        raw = LOCAL_LOGIN_STATE_PATH.read_text(encoding="utf-8")
+        data = json.loads(raw or "{}")
+        login = str(data.get("login") or "").strip().lower()
+        token = str(data.get("token") or "").strip()
+        expires_at = str(data.get("expires_at") or "").strip()
+
+        if not login or not token:
+            return None
+
+        if expires_at:
+            try:
+                if datetime.fromisoformat(expires_at) < datetime.now():
+                    return None
+            except Exception:
+                pass
+
+        return f"{login}|{token}"
+    except Exception as e:
+        print(f"⚠️ load_login_state_local error: {e}", flush=True)
+        return None
+
+
+def clear_login_state_local():
+    try:
+        if LOCAL_LOGIN_STATE_PATH.exists():
+            LOCAL_LOGIN_STATE_PATH.unlink()
+    except Exception as e:
+        print(f"⚠️ clear_login_state_local error: {e}", flush=True)
+
+
 def restore_login_from_cookie():
     """
-    Restaure automatiquement la session à partir du token persisté.
+    Restaure automatiquement la session.
+    Priorité :
+    1) query params / persistance navigateur
+    2) fallback fichier local (important pour Streamlit App/Desktop)
     Format attendu: 'login|uuid'.
     """
     if st.session_state.get("logged_in"):
         return False
 
-    raw = get_login_cookie()
+    raw = get_login_cookie() or load_login_state_local()
     if not raw:
         return False
 
@@ -478,6 +543,9 @@ def restore_login_from_cookie():
     st.session_state.role = user.get("role")
     st.session_state.chauffeur_code = user.get("chauffeur_code")
     st.session_state.session_token = token
+
+    # Réécrit la persistance locale au passage pour prolonger la session.
+    save_login_state_local(login, token)
     return True
 # ============================================================
 #   LOGIN SCREEN
@@ -509,6 +577,7 @@ def login_screen():
             st.session_state.session_token = token
 
             set_login_cookie(f"{login}|{token}")
+            save_login_state_local(login, token)
 
             st.success(f"Connecté en tant que **{login}** – rôle : {user['role']}")
             st.rerun()
@@ -3639,6 +3708,7 @@ def logout():
     Ne casse pas la session Streamlit interne.
     """
     clear_login_cookie()
+    clear_login_state_local()
 
     for k in (
         "logged_in",
