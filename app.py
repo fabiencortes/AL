@@ -393,15 +393,39 @@ def ensure_persistent_sessions_table():
 
 
 def get_client_id():
+    """Retourne un identifiant stable par appareil.
+    Priorité: query params -> cookies -> session_state.
+    """
+    # 1) Query param (web classique)
     try:
         v = st.query_params.get(LOGIN_CLIENT_KEY)
         if isinstance(v, list):
             v = v[0] if v else None
         if v:
-            return str(v).strip()
+            v = str(v).strip()
+            if v:
+                st.session_state["client_id"] = v
+                return v
     except Exception:
         pass
-    return ""
+
+    # 2) Cookie (souvent indispensable sur l'app Streamlit)
+    try:
+        ctx = getattr(st, "context", None)
+        cookies = getattr(ctx, "cookies", None)
+        if cookies:
+            v = cookies.get(LOGIN_CLIENT_KEY)
+            if v:
+                v = str(v).strip()
+                if v:
+                    st.session_state["client_id"] = v
+                    return v
+    except Exception:
+        pass
+
+    # 3) Fallback mémoire session
+    v = str(st.session_state.get("client_id") or "").strip()
+    return v
 
 
 def bootstrap_login_persistence():
@@ -424,6 +448,15 @@ def bootstrap_login_persistence():
                 try {{ return window.parent || window; }} catch (e) {{ return window; }}
             }}
 
+            function cookieFlags(w) {{
+                try {{
+                    if (w.location && w.location.protocol === "https:") {{
+                        return "; path=/; max-age=" + maxAge + "; SameSite=None; Secure";
+                    }}
+                }} catch (e) {{}}
+                return "; path=/; max-age=" + maxAge + "; SameSite=Lax";
+            }}
+
             function ensureCid(w) {{
                 let cid = "";
                 try {{ cid = w.localStorage.getItem(clientKey) || ""; }} catch (e) {{}}
@@ -440,7 +473,7 @@ def bootstrap_login_persistence():
 
             function setCookie(w, key, val) {{
                 try {{
-                    w.document.cookie = key + "=" + encodeURIComponent(val) + "; path=/; max-age=" + maxAge + "; SameSite=Lax";
+                    w.document.cookie = key + "=" + encodeURIComponent(val) + cookieFlags(w);
                 }} catch (e) {{}}
             }}
 
@@ -482,7 +515,6 @@ def bootstrap_login_persistence():
         """,
         height=0,
     )
-
 
 def save_persistent_session(login: str, token: str, remember_me: bool = True):
     client_id = get_client_id()
@@ -604,7 +636,7 @@ def load_persistent_session_from_server():
 
 def set_login_cookie(token: str):
     token = str(token or "").strip()
-    client_id = get_client_id()
+    client_id = str(get_client_id() or "").strip()
     if not token:
         return
 
@@ -620,15 +652,32 @@ def set_login_cookie(token: str):
             const clientStorageKey = {_js_quote(LOGIN_CLIENT_STORAGE_KEY)};
             const clientParam = {_js_quote(LOGIN_CLIENT_KEY)};
             const sessionValue = {token_js};
-            const clientId = {client_js};
+            let clientId = {client_js};
             const maxAge = {max_age};
             const w = (function() {{ try {{ return window.parent || window; }} catch(e) {{ return window; }} }})();
-            try {{ w.document.cookie = sessionKey + "=" + encodeURIComponent(sessionValue) + "; path=/; max-age=" + maxAge + "; SameSite=Lax"; }} catch (e) {{}}
+
+            function cookieFlags() {{
+                try {{
+                    if (w.location && w.location.protocol === "https:") {{
+                        return "; path=/; max-age=" + maxAge + "; SameSite=None; Secure";
+                    }}
+                }} catch (e) {{}}
+                return "; path=/; max-age=" + maxAge + "; SameSite=Lax";
+            }}
+
+            // Si Python n'a pas encore le client_id, on le reprend depuis localStorage
+            if (!clientId) {{
+                try {{ clientId = w.localStorage.getItem(clientStorageKey) || ""; }} catch (e) {{}}
+            }}
+
+            try {{ w.document.cookie = sessionKey + "=" + encodeURIComponent(sessionValue) + cookieFlags(); }} catch (e) {{}}
             try {{ w.localStorage.setItem(sessionKey, sessionValue); }} catch (e) {{}}
+
             if (clientId) {{
                 try {{ w.localStorage.setItem(clientStorageKey, clientId); }} catch (e) {{}}
-                try {{ w.document.cookie = clientParam + "=" + encodeURIComponent(clientId) + "; path=/; max-age=" + maxAge + "; SameSite=Lax"; }} catch (e) {{}}
+                try {{ w.document.cookie = clientParam + "=" + encodeURIComponent(clientId) + cookieFlags(); }} catch (e) {{}}
             }}
+
             try {{
                 const url = new URL(w.location.href);
                 url.searchParams.set(sessionKey, sessionValue);
@@ -641,19 +690,35 @@ def set_login_cookie(token: str):
         height=0,
     )
 
-
 def clear_login_cookie():
     components.html(
         f"""
         <script>
         (function() {{
             const sessionKey = {_js_quote(LOGIN_PERSIST_KEY)};
+            const clientParam = {_js_quote(LOGIN_CLIENT_KEY)};
             const w = (function() {{ try {{ return window.parent || window; }} catch(e) {{ return window; }} }})();
-            try {{ w.document.cookie = sessionKey + "=; path=/; max-age=0; SameSite=Lax"; }} catch (e) {{}}
+
+            function clearCookie(k) {{
+                try {{
+                    // On tente de supprimer en mode https (Secure) et en mode http
+                    if (w.location && w.location.protocol === "https:") {{
+                        w.document.cookie = k + "=; path=/; max-age=0; SameSite=None; Secure";
+                    }}
+                }} catch (e) {{}}
+                try {{
+                    w.document.cookie = k + "=; path=/; max-age=0; SameSite=Lax";
+                }} catch (e) {{}}
+            }}
+
+            clearCookie(sessionKey);
+            clearCookie(clientParam);
+
             try {{ w.localStorage.removeItem(sessionKey); }} catch (e) {{}}
             try {{
                 const url = new URL(w.location.href);
                 url.searchParams.delete(sessionKey);
+                url.searchParams.delete(clientParam);
                 w.history.replaceState({{}}, "", url.toString());
             }} catch (e) {{}}
         }})();
@@ -3262,19 +3327,21 @@ def build_whatsapp_link(phone: str, message: str) -> str:
     num = phone_to_whatsapp_number(phone)
     if not num:
         return "#"
-    return f"https://wa.me/{num}?text={urllib.parse.quote(message)}"
+    text = urllib.parse.quote(str(message or ""))
+    return f"https://wa.me/{num}?text={text}"
+
 
 def build_waze_link(address: str) -> str:
-    """Construit un lien Waze vers une adresse texte."""
+    """Construit un lien Waze vers une adresse texte (plus fiable en webview)."""
     import urllib.parse
+    import re
 
     addr = re.sub(r"\s+", " ", str(address or "")).strip(" ,;")
     if not addr:
         return "#"
 
     query = urllib.parse.quote(addr)
-    # ll= évite certaines interprétations approximatives côté webview Waze
-    return f"https://waze.com/ul?q={query}&navigate=yes"
+    return f"https://www.waze.com/ul?query={query}&navigate=yes"
 
 def build_google_maps_link(address: str) -> str:
     import urllib.parse
@@ -4104,6 +4171,9 @@ def render_top_bar():
     with col2:
         if role == "admin":
             if st.button("🔄 Maj DB (Dropbox) + vue", use_container_width=True, key="topbar_sync_db"):
+                _topbar_sync_db_and_refresh(also_send_next3=False)
+        elif role == "driver":
+            if st.button("🔄 MAJ planning", use_container_width=True, key="topbar_driver_sync"):
                 _topbar_sync_db_and_refresh(also_send_next3=False)
         else:
             st.empty()
@@ -6899,6 +6969,13 @@ def render_tab_chauffeur_driver():
 
     df_ch = pd.DataFrame()  # sécurité
     today = date.today()
+    # ===================================================
+    # 🔄 REFRESH MANUEL (chauffeur)
+    # ===================================================
+    btn_col, _ = st.columns([1, 6])
+    with btn_col:
+        if st.button("🔄", key=f"driver_refresh_square_{ch_selected}", help="Mettre à jour le planning depuis Dropbox"):
+            _topbar_sync_db_and_refresh(also_send_next3=False)
 
     # ===================================================
     # 💶 BADGE — CAISSE À REMETTRE
