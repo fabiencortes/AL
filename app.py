@@ -393,10 +393,13 @@ def ensure_persistent_sessions_table():
 
 
 def get_client_id():
-    """Retourne un identifiant stable par appareil.
-    Priorité: query params -> cookies -> session_state.
     """
-    # 1) Query param (web classique)
+    Retourne un identifiant stable par appareil.
+    Priorité:
+    1) query params
+    2) cookies
+    3) session_state
+    """
     try:
         v = st.query_params.get(LOGIN_CLIENT_KEY)
         if isinstance(v, list):
@@ -409,7 +412,6 @@ def get_client_id():
     except Exception:
         pass
 
-    # 2) Cookie (souvent indispensable sur l'app Streamlit)
     try:
         ctx = getattr(st, "context", None)
         cookies = getattr(ctx, "cookies", None)
@@ -423,29 +425,40 @@ def get_client_id():
     except Exception:
         pass
 
-    # 3) Fallback mémoire session
     v = str(st.session_state.get("client_id") or "").strip()
-    return v
+    if v:
+        return v
+
+    return None
 
 
 def bootstrap_login_persistence():
     """
-    1) crée un client_id stable dans localStorage si absent
-    2) remonte client_id + session token dans l'URL parent
-    3) force AU PLUS un rechargement complet si l'URL parent n'a pas encore ces infos
+    Initialise la persistance login côté navigateur :
+    - crée un client_id stable si absent
+    - relit la session persistée
+    - écrit cookies + localStorage
+    - pousse les valeurs dans l'URL
+    - force un reload unique si nécessaire
     """
     components.html(
         f"""
         <script>
         (function() {{
             const sessionKey = {_js_quote(LOGIN_PERSIST_KEY)};
-            const clientKey = {_js_quote(LOGIN_CLIENT_STORAGE_KEY)};
+            const clientStorageKey = {_js_quote(LOGIN_CLIENT_STORAGE_KEY)};
             const clientParam = {_js_quote(LOGIN_CLIENT_KEY)};
             const bootFlag = {_js_quote(LOGIN_BOOTSTRAP_FLAG)};
             const maxAge = {int(LOGIN_PERSIST_HOURS * 3600)};
 
-            function getTopWin() {{
-                try {{ return window.parent || window; }} catch (e) {{ return window; }}
+            function getBestWin() {{
+                try {{
+                    if (window.top) return window.top;
+                }} catch (e) {{}}
+                try {{
+                    if (window.parent) return window.parent;
+                }} catch (e) {{}}
+                return window;
             }}
 
             function cookieFlags(w) {{
@@ -457,42 +470,69 @@ def bootstrap_login_persistence():
                 return "; path=/; max-age=" + maxAge + "; SameSite=Lax";
             }}
 
-            function ensureCid(w) {{
-                let cid = "";
-                try {{ cid = w.localStorage.getItem(clientKey) || ""; }} catch (e) {{}}
-                if (!cid) {{
-                    cid = "cid-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
-                    try {{ w.localStorage.setItem(clientKey, cid); }} catch (e) {{}}
+            function safeGetLocal(w, key) {{
+                try {{
+                    return w.localStorage.getItem(key) || "";
+                }} catch (e) {{
+                    return "";
                 }}
-                return cid;
             }}
 
-            function getStoredSession(w) {{
-                try {{ return w.localStorage.getItem(sessionKey) || ""; }} catch (e) {{ return ""; }}
+            function safeSetLocal(w, key, val) {{
+                try {{
+                    w.localStorage.setItem(key, val);
+                }} catch (e) {{}}
             }}
 
-            function setCookie(w, key, val) {{
+            function safeSetCookie(w, key, val) {{
                 try {{
                     w.document.cookie = key + "=" + encodeURIComponent(val) + cookieFlags(w);
                 }} catch (e) {{}}
             }}
 
-            const w = getTopWin();
-            const cid = ensureCid(w);
-            const sess = getStoredSession(w);
-            if (sess) {{ setCookie(w, sessionKey, sess); }}
-            if (cid)  {{ setCookie(w, clientParam, cid); }}
+            function ensureClientId(w) {{
+                let cid = safeGetLocal(w, clientStorageKey);
+
+                if (!cid) {{
+                    cid = "cid-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+                    safeSetLocal(w, clientStorageKey, cid);
+                }}
+
+                return cid || "";
+            }}
+
+            const w = getBestWin();
+            const cid = ensureClientId(w);
+            const sess = safeGetLocal(w, sessionKey);
+
+            if (cid) {{
+                safeSetCookie(w, clientParam, cid);
+                safeSetLocal(w, clientStorageKey, cid);
+            }}
+
+            if (sess) {{
+                safeSetCookie(w, sessionKey, sess);
+                safeSetLocal(w, sessionKey, sess);
+            }}
 
             let url;
-            try {{ url = new URL(w.location.href); }} catch (e) {{
-                try {{ url = new URL(window.location.href); }} catch (e2) {{ return; }}
+            try {{
+                url = new URL(w.location.href);
+            }} catch (e) {{
+                try {{
+                    url = new URL(window.location.href);
+                }} catch (e2) {{
+                    return;
+                }}
             }}
 
             let changed = false;
+
             if (cid && url.searchParams.get(clientParam) !== cid) {{
                 url.searchParams.set(clientParam, cid);
                 changed = true;
             }}
+
             if (sess && url.searchParams.get(sessionKey) !== sess) {{
                 url.searchParams.set(sessionKey, sess);
                 changed = true;
@@ -500,22 +540,32 @@ def bootstrap_login_persistence():
 
             const guardKey = bootFlag + ":" + (cid || "none");
             let already = false;
-            try {{ already = w.sessionStorage.getItem(guardKey) === "1"; }} catch (e) {{}}
+
+            try {{
+                already = w.sessionStorage.getItem(guardKey) === "1";
+            }} catch (e) {{}}
 
             if (changed && !already) {{
-                try {{ w.sessionStorage.setItem(guardKey, "1"); }} catch (e) {{}}
-                try {{ w.location.replace(url.toString()); return; }} catch (e) {{}}
+                try {{
+                    w.sessionStorage.setItem(guardKey, "1");
+                }} catch (e) {{}}
+
+                try {{
+                    w.location.replace(url.toString());
+                    return;
+                }} catch (e) {{}}
             }}
 
             if (!changed) {{
-                try {{ w.sessionStorage.removeItem(guardKey); }} catch (e) {{}}
+                try {{
+                    w.sessionStorage.removeItem(guardKey);
+                }} catch (e) {{}}
             }}
         }})();
         </script>
         """,
         height=0,
     )
-
 def save_persistent_session(login: str, token: str, remember_me: bool = True):
     client_id = get_client_id()
     if not client_id or not login or not token or not remember_me:
@@ -637,6 +687,7 @@ def load_persistent_session_from_server():
 def set_login_cookie(token: str):
     token = str(token or "").strip()
     client_id = str(get_client_id() or "").strip()
+
     if not token:
         return
 
@@ -654,7 +705,18 @@ def set_login_cookie(token: str):
             const sessionValue = {token_js};
             let clientId = {client_js};
             const maxAge = {max_age};
-            const w = (function() {{ try {{ return window.parent || window; }} catch(e) {{ return window; }} }})();
+
+            function getBestWin() {{
+                try {{
+                    if (window.top) return window.top;
+                }} catch (e) {{}}
+                try {{
+                    if (window.parent) return window.parent;
+                }} catch (e) {{}}
+                return window;
+            }}
+
+            const w = getBestWin();
 
             function cookieFlags() {{
                 try {{
@@ -665,23 +727,48 @@ def set_login_cookie(token: str):
                 return "; path=/; max-age=" + maxAge + "; SameSite=Lax";
             }}
 
-            // Si Python n'a pas encore le client_id, on le reprend depuis localStorage
-            if (!clientId) {{
-                try {{ clientId = w.localStorage.getItem(clientStorageKey) || ""; }} catch (e) {{}}
+            function safeGetLocal(key) {{
+                try {{
+                    return w.localStorage.getItem(key) || "";
+                }} catch (e) {{
+                    return "";
+                }}
             }}
 
-            try {{ w.document.cookie = sessionKey + "=" + encodeURIComponent(sessionValue) + cookieFlags(); }} catch (e) {{}}
-            try {{ w.localStorage.setItem(sessionKey, sessionValue); }} catch (e) {{}}
+            function safeSetLocal(key, val) {{
+                try {{
+                    w.localStorage.setItem(key, val);
+                }} catch (e) {{}}
+            }}
+
+            function safeSetCookie(key, val) {{
+                try {{
+                    w.document.cookie = key + "=" + encodeURIComponent(val) + cookieFlags();
+                }} catch (e) {{}}
+            }}
+
+            if (!clientId) {{
+                clientId = safeGetLocal(clientStorageKey);
+            }}
+
+            if (!clientId) {{
+                clientId = "cid-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+            }}
+
+            safeSetLocal(sessionKey, sessionValue);
+            safeSetCookie(sessionKey, sessionValue);
 
             if (clientId) {{
-                try {{ w.localStorage.setItem(clientStorageKey, clientId); }} catch (e) {{}}
-                try {{ w.document.cookie = clientParam + "=" + encodeURIComponent(clientId) + cookieFlags(); }} catch (e) {{}}
+                safeSetLocal(clientStorageKey, clientId);
+                safeSetCookie(clientParam, clientId);
             }}
 
             try {{
                 const url = new URL(w.location.href);
                 url.searchParams.set(sessionKey, sessionValue);
-                if (clientId) url.searchParams.set(clientParam, clientId);
+                if (clientId) {{
+                    url.searchParams.set(clientParam, clientId);
+                }}
                 w.history.replaceState({{}}, "", url.toString());
             }} catch (e) {{}}
         }})();
@@ -733,8 +820,10 @@ def restore_login_from_cookie():
         return False
 
     raw = get_login_cookie()
+
     if not raw:
         raw = load_persistent_session_from_server()
+
     if not raw:
         return False
 
@@ -745,6 +834,7 @@ def restore_login_from_cookie():
 
     login = str(login or "").strip().lower()
     token = str(token or "").strip()
+
     user = USERS.get(login)
     if not user or not token:
         return False
@@ -755,6 +845,7 @@ def restore_login_from_cookie():
     st.session_state.chauffeur_code = user.get("chauffeur_code")
     st.session_state.session_token = token
     st.session_state.remember_me = True
+
     return True
 # ============================================================
 #   LOGIN SCREEN
@@ -10507,16 +10598,18 @@ def main():
     # ======================================
     init_session_state()
     bootstrap_login_persistence()
-    restore_login_from_cookie()
     init_db_once()
     init_all_db_once()
     ensure_persistent_sessions_table()
+
+    restored = restore_login_from_cookie()
+
     # 🔄 DEBUG rerun
     if "RUN_COUNTER" not in st.session_state:
         st.session_state.RUN_COUNTER = 0
 
     st.session_state.RUN_COUNTER += 1
-    debug_print(f"🔄 MAIN RUN COUNT = {st.session_state.RUN_COUNTER}")
+
 
     # ======================================
     # 2️⃣ LOGIN
