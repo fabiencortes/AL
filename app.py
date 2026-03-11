@@ -1,4 +1,5 @@
 from utils_mail_universal import parse_mail_to_navette_universal
+from urllib.parse import unquote
 # ============================================================
 # 🐞 DEBUG GLOBAL (console) — activable via env AL_DEBUG=1
 # ============================================================
@@ -828,7 +829,15 @@ def restore_login_from_cookie():
         return False
 
     try:
-        login, token = str(raw).split("|", 1)
+        raw = unquote(str(raw).strip())
+    except Exception:
+        raw = str(raw).strip()
+
+    if not raw:
+        return False
+
+    try:
+        login, token = raw.split("|", 1)
     except Exception:
         return False
 
@@ -847,6 +856,10 @@ def restore_login_from_cookie():
     st.session_state.remember_me = True
 
     return True
+    st.write("DEBUG restored =", restored)
+    st.write("DEBUG client_id =", get_client_id())
+    st.write("DEBUG cookie al_session =", get_login_cookie())
+    st.write("DEBUG logged_in =", st.session_state.get("logged_in"))
 # ============================================================
 #   LOGIN SCREEN
 # ============================================================
@@ -10602,13 +10615,38 @@ def main():
     init_all_db_once()
     ensure_persistent_sessions_table()
 
+    # On attend au maximum 1 rerun interne pour laisser le JS de persistance
+    # remonter client_id + session dans query params / cookies
+    if "BOOTSTRAP_TRY" not in st.session_state:
+        st.session_state.BOOTSTRAP_TRY = 0
+
     restored = restore_login_from_cookie()
+
+    if not st.session_state.get("logged_in"):
+        client_id = get_client_id()
+        cookie_val = get_login_cookie()
+
+        st.write("DEBUG client_id =", client_id)
+        st.write("DEBUG cookie al_session =", cookie_val)
+        st.write("DEBUG logged_in =", st.session_state.get("logged_in"))
+        st.write("DEBUG BOOTSTRAP_TRY =", st.session_state.BOOTSTRAP_TRY)
+
+        if st.session_state.BOOTSTRAP_TRY < 1 and (not client_id or not cookie_val):
+            st.session_state.BOOTSTRAP_TRY += 1
+            st.info("⏳ Initialisation de la reconnexion automatique...")
+            st.rerun()
+    else:
+        st.session_state.BOOTSTRAP_TRY = 0
 
     # 🔄 DEBUG rerun
     if "RUN_COUNTER" not in st.session_state:
         st.session_state.RUN_COUNTER = 0
 
     st.session_state.RUN_COUNTER += 1
+
+    st.write("DEBUG client_id =", get_client_id())
+    st.write("DEBUG cookie al_session =", get_login_cookie())
+    st.write("DEBUG logged_in =", st.session_state.get("logged_in"))
 
 
     # ======================================
