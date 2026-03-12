@@ -396,20 +396,23 @@ def ensure_persistent_sessions_table():
 def get_client_id():
     """
     Retourne un identifiant stable par appareil.
-    Priorité:
-    1) query params
-    2) cookies
-    3) session_state
+    Priorité :
+    1) session_state
+    2) query params
+    3) cookies
     """
+    v = str(st.session_state.get("client_id") or "").strip()
+    if v:
+        return v
+
     try:
-        v = st.query_params.get(LOGIN_CLIENT_KEY)
-        if isinstance(v, list):
-            v = v[0] if v else None
-        if v:
-            v = str(v).strip()
-            if v:
-                st.session_state["client_id"] = v
-                return v
+        q = st.query_params.get(LOGIN_CLIENT_KEY)
+        if isinstance(q, list):
+            q = q[0] if q else None
+        q = str(q or "").strip()
+        if q:
+            st.session_state["client_id"] = q
+            return q
     except Exception:
         pass
 
@@ -417,18 +420,13 @@ def get_client_id():
         ctx = getattr(st, "context", None)
         cookies = getattr(ctx, "cookies", None)
         if cookies:
-            v = cookies.get(LOGIN_CLIENT_KEY)
-            if v:
-                v = str(v).strip()
-                if v:
-                    st.session_state["client_id"] = v
-                    return v
+            c = cookies.get(LOGIN_CLIENT_KEY)
+            c = str(c or "").strip()
+            if c:
+                st.session_state["client_id"] = c
+                return c
     except Exception:
         pass
-
-    v = str(st.session_state.get("client_id") or "").strip()
-    if v:
-        return v
 
     return None
 
@@ -647,11 +645,12 @@ def get_login_cookie():
 
 
 def load_persistent_session_from_server():
-    client_id = get_client_id()
+    client_id = str(get_client_id() or "").strip()
     if not client_id:
         return None
 
     ensure_persistent_sessions_table()
+
     try:
         with get_connection() as conn:
             row = conn.execute(
@@ -661,6 +660,7 @@ def load_persistent_session_from_server():
                 WHERE client_id = ?
                   AND active = 1
                   AND remember_me = 1
+                LIMIT 1
                 """,
                 (client_id,),
             ).fetchone()
@@ -672,6 +672,7 @@ def load_persistent_session_from_server():
         return None
 
     login, token, expires_at = row
+
     try:
         if expires_at and datetime.fromisoformat(str(expires_at)) < datetime.now():
             clear_persistent_session()
@@ -679,11 +680,13 @@ def load_persistent_session_from_server():
     except Exception:
         pass
 
+    login = str(login or "").strip().lower()
+    token = str(token or "").strip()
+
     if not login or not token:
         return None
 
-    return f"{str(login).strip().lower()}|{str(token).strip()}"
-
+    return f"{login}|{token}"
 
 def set_login_cookie(token: str):
     token = str(token or "").strip()
@@ -856,10 +859,6 @@ def restore_login_from_cookie():
     st.session_state.remember_me = True
 
     return True
-    st.write("DEBUG restored =", restored)
-    st.write("DEBUG client_id =", get_client_id())
-    st.write("DEBUG cookie al_session =", get_login_cookie())
-    st.write("DEBUG logged_in =", st.session_state.get("logged_in"))
 # ============================================================
 #   LOGIN SCREEN
 # ============================================================
@@ -10622,15 +10621,28 @@ def main():
 
     restored = restore_login_from_cookie()
 
+    # ✅ Si on est connecté et remember_me, on force une sauvegarde persistante 1x
+    if st.session_state.get("logged_in") and st.session_state.get("remember_me"):
+        if not st.session_state.get("_persist_state_saved", False):
+            login = str(st.session_state.get("username") or "").strip().lower()
+            token = str(st.session_state.get("session_token") or "").strip()
+            if login and token:
+                ok = save_persistent_session(login, token, True)
+                set_login_cookie(f"{login}|{token}")
+                if ok:
+                    st.session_state["_persist_state_saved"] = True
+
     if not st.session_state.get("logged_in"):
         client_id = get_client_id()
         cookie_val = get_login_cookie()
 
+        st.write("DEBUG restored =", restored)
         st.write("DEBUG client_id =", client_id)
         st.write("DEBUG cookie al_session =", cookie_val)
         st.write("DEBUG logged_in =", st.session_state.get("logged_in"))
         st.write("DEBUG BOOTSTRAP_TRY =", st.session_state.BOOTSTRAP_TRY)
 
+        # 1 seul rerun si cid/session pas encore visibles
         if st.session_state.BOOTSTRAP_TRY < 1 and (not client_id or not cookie_val):
             st.session_state.BOOTSTRAP_TRY += 1
             st.info("⏳ Initialisation de la reconnexion automatique...")
@@ -10648,14 +10660,12 @@ def main():
     st.write("DEBUG cookie al_session =", get_login_cookie())
     st.write("DEBUG logged_in =", st.session_state.get("logged_in"))
 
-
     # ======================================
     # 2️⃣ LOGIN
     # ======================================
     if not st.session_state.logged_in:
         login_screen()
         st.stop()
-
     # ======================================
     # 3️⃣ UI MINIMALE
     # ======================================
