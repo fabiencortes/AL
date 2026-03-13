@@ -707,13 +707,7 @@ def set_login_cookie(token: str):
     token_js = _js_quote(token)
     max_age = int(LOGIN_PERSIST_HOURS * 3600)
 
-    # 1) Query params (utile si dispo, mais pas suffisant dans l'app Streamlit)
-    try:
-        st.query_params[LOGIN_PERSIST_KEY] = token
-    except Exception:
-        pass
-
-    # 2) Cookie + localStorage via JS (le vrai "persist" pour l'app Streamlit)
+    # ✅ APP Streamlit: cookie + localStorage uniquement
     components.html(
         f"""
         <script>
@@ -750,29 +744,20 @@ def set_login_cookie(token: str):
                 try {{ w.document.cookie = key + "=" + encodeURIComponent(val) + cookieFlags(); }} catch(e) {{}}
             }}
 
-            // Client ID (si Python ne l'a pas encore)
-            let cid = "";
-            try {{ cid = safeGetLocal(clientKey); }} catch(e) {{}}
+            // client_id stable par appareil (localStorage)
+            let cid = safeGetLocal(clientKey);
             if (!cid) {{
                 cid = "cid-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
                 safeSetLocal(clientKey, cid);
             }}
 
-            // Stocke session
+            // session
             safeSetLocal(sessionKey, sessionValue);
             safeSetCookie(sessionKey, sessionValue);
 
-            // Stocke client_id
+            // client_id
             safeSetLocal(clientKey, cid);
             safeSetCookie(clientParam, cid);
-
-            // Met aussi dans l'URL sans recharger
-            try {{
-                const url = new URL(w.location.href);
-                url.searchParams.set(sessionKey, sessionValue);
-                url.searchParams.set(clientParam, cid);
-                w.history.replaceState({{}}, "", url.toString());
-            }} catch(e) {{}}
         }})();
         </script>
         """,
