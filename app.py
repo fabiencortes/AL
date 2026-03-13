@@ -394,13 +394,6 @@ def ensure_persistent_sessions_table():
 
 
 def get_client_id():
-    """
-    Retourne un identifiant stable par appareil.
-    Priorité :
-    1) session_state
-    2) query params
-    3) cookies
-    """
     v = str(st.session_state.get("client_id") or "").strip()
     if v:
         return v
@@ -416,19 +409,17 @@ def get_client_id():
     except Exception:
         pass
 
+    # fallback : cid serveur (au moins stable pendant la session)
+    cid = "cid-" + uuid.uuid4().hex[:16]
+    st.session_state["client_id"] = cid
+
+    # et on le pousse dans l'URL pour persister au re-open
     try:
-        ctx = getattr(st, "context", None)
-        cookies = getattr(ctx, "cookies", None)
-        if cookies:
-            c = cookies.get(LOGIN_CLIENT_KEY)
-            c = str(c or "").strip()
-            if c:
-                st.session_state["client_id"] = c
-                return c
+        st.query_params[LOGIN_CLIENT_KEY] = cid
     except Exception:
         pass
 
-    return None
+    return cid
 
 
 def bootstrap_login_persistence():
@@ -630,17 +621,6 @@ def get_login_cookie():
             return str(val).strip()
     except Exception:
         pass
-
-    try:
-        ctx = getattr(st, "context", None)
-        cookies = getattr(ctx, "cookies", None)
-        if cookies:
-            val = cookies.get(LOGIN_PERSIST_KEY)
-            if val:
-                return str(val).strip()
-    except Exception:
-        pass
-
     return None
 
 
@@ -690,97 +670,22 @@ def load_persistent_session_from_server():
 
 def set_login_cookie(token: str):
     token = str(token or "").strip()
-    client_id = str(get_client_id() or "").strip()
-
     if not token:
         return
 
-    token_js = _js_quote(token)
-    client_js = _js_quote(client_id)
-    max_age = int(LOGIN_PERSIST_HOURS * 3600)
+    # ⚠️ on pousse dans l'URL (query params) = plus fiable sur Streamlit Cloud/App
+    try:
+        st.query_params[LOGIN_PERSIST_KEY] = token
+    except Exception:
+        pass
 
-    components.html(
-        f"""
-        <script>
-        (function() {{
-            const sessionKey = {_js_quote(LOGIN_PERSIST_KEY)};
-            const clientStorageKey = {_js_quote(LOGIN_CLIENT_STORAGE_KEY)};
-            const clientParam = {_js_quote(LOGIN_CLIENT_KEY)};
-            const sessionValue = {token_js};
-            let clientId = {client_js};
-            const maxAge = {max_age};
-
-            function getBestWin() {{
-                try {{
-                    if (window.top) return window.top;
-                }} catch (e) {{}}
-                try {{
-                    if (window.parent) return window.parent;
-                }} catch (e) {{}}
-                return window;
-            }}
-
-            const w = getBestWin();
-
-            function cookieFlags() {{
-                try {{
-                    if (w.location && w.location.protocol === "https:") {{
-                        return "; path=/; max-age=" + maxAge + "; SameSite=None; Secure";
-                    }}
-                }} catch (e) {{}}
-                return "; path=/; max-age=" + maxAge + "; SameSite=Lax";
-            }}
-
-            function safeGetLocal(key) {{
-                try {{
-                    return w.localStorage.getItem(key) || "";
-                }} catch (e) {{
-                    return "";
-                }}
-            }}
-
-            function safeSetLocal(key, val) {{
-                try {{
-                    w.localStorage.setItem(key, val);
-                }} catch (e) {{}}
-            }}
-
-            function safeSetCookie(key, val) {{
-                try {{
-                    w.document.cookie = key + "=" + encodeURIComponent(val) + cookieFlags();
-                }} catch (e) {{}}
-            }}
-
-            if (!clientId) {{
-                clientId = safeGetLocal(clientStorageKey);
-            }}
-
-            if (!clientId) {{
-                clientId = "cid-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
-            }}
-
-            safeSetLocal(sessionKey, sessionValue);
-            safeSetCookie(sessionKey, sessionValue);
-
-            if (clientId) {{
-                safeSetLocal(clientStorageKey, clientId);
-                safeSetCookie(clientParam, clientId);
-            }}
-
-            try {{
-                const url = new URL(w.location.href);
-                url.searchParams.set(sessionKey, sessionValue);
-                if (clientId) {{
-                    url.searchParams.set(clientParam, clientId);
-                }}
-                w.history.replaceState({{}}, "", url.toString());
-            }} catch (e) {{}}
-        }})();
-        </script>
-        """,
-        height=0,
-    )
-
+    # On tente aussi d'écrire le client_id si dispo
+    try:
+        cid = str(get_client_id() or "").strip()
+        if cid:
+            st.query_params[LOGIN_CLIENT_KEY] = cid
+    except Exception:
+        pass
 def clear_login_cookie():
     components.html(
         f"""
@@ -884,20 +789,46 @@ def login_screen():
         if user and user["password"] == pwd:
             token = str(uuid.uuid4())
 
+            # ✅ Force un client_id maintenant (et le pousse dans query params si besoin)
+            _ = get_client_id()
+
             st.session_state.logged_in = True
             st.session_state.username = login_norm
-            st.session_state.role = user['role']
-            st.session_state.chauffeur_code = user.get('chauffeur_code')
+            st.session_state.role = user["role"]
+            st.session_state.chauffeur_code = user.get("chauffeur_code")
             st.session_state.session_token = token
             st.session_state.remember_me = bool(remember_me)
             st.session_state["_persist_state_saved"] = False
 
             if remember_me:
+                # ✅ Sauvegarde côté serveur (SQLite)
                 save_persistent_session(login_norm, token, True)
-                set_login_cookie(f"{login_norm}|{token}")
+
+                # ✅ Persistance ULTRA fiable : on met la session dans l'URL
+                # (Streamlit Cloud/App relira toujours st.query_params)
+                try:
+                    st.query_params[LOGIN_PERSIST_KEY] = f"{login_norm}|{token}"
+                except Exception:
+                    pass
+
+                try:
+                    cid = str(get_client_id() or "").strip()
+                    if cid:
+                        st.query_params[LOGIN_CLIENT_KEY] = cid
+                except Exception:
+                    pass
+
+                # (optionnel) conserve l'ancien système si tu veux :
+                # set_login_cookie(f"{login_norm}|{token}")
+
             else:
                 clear_persistent_session()
                 clear_login_cookie()
+                try:
+                    st.query_params.pop(LOGIN_PERSIST_KEY, None)
+                    st.query_params.pop(LOGIN_CLIENT_KEY, None)
+                except Exception:
+                    pass
 
             st.rerun()
         else:
