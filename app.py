@@ -250,7 +250,12 @@ def init_db_once():
     print("▶️ init_db_once DONE", flush=True)
 
 
+def get_device_bound_login() -> str | None:
+    return str(st.session_state.get("device_bound_login") or "").strip().lower() or None
 
+
+def set_device_bound_login(login: str):
+    st.session_state["device_bound_login"] = str(login or "").strip().lower()
 
 # ============================================================
 #   SESSION STATE
@@ -698,6 +703,128 @@ def load_persistent_session_from_server():
         return None
 
     return f"{login}|{token}"
+def remember_trusted_device(token: str, username: str, role: str, chauffeur_code: str | None = None):
+    try:
+        device_key = _device_fingerprint()
+        if not device_key:
+            return
+
+        data = _load_trusted_devices()
+        now_ts = int(time.time())
+
+        # Format nouveau: data[device_key] = {"entries": {username: {...}}, "updated_at": ...}
+        row = data.get(device_key)
+        if isinstance(row, dict) and "entries" in row and isinstance(row.get("entries"), dict):
+            entries = row["entries"]
+        elif isinstance(row, dict) and row.get("token"):
+            # compat ancien format (1 seul user)
+            old_u = str(row.get("username") or "").strip() or "unknown"
+            entries = {
+                old_u: {
+                    "token": str(row.get("token") or "").strip(),
+                    "username": old_u,
+                    "role": str(row.get("role") or "").strip(),
+                    "chauffeur_code": str(row.get("chauffeur_code") or "").strip(),
+                    "exp": int(row.get("exp", 0) or 0),
+                    "updated_at": int(row.get("updated_at", 0) or 0),
+                }
+            }
+        else:
+            entries = {}
+
+        u = str(username or "").strip().lower()
+        entries[u] = {
+            "token": str(token or "").strip(),
+            "username": u,
+            "role": str(role or "").strip(),
+            "chauffeur_code": str(chauffeur_code or "").strip(),
+            "exp": now_ts + int(AL_SESSION_MAX_AGE),
+            "updated_at": now_ts,
+        }
+
+        # nettoyage: garder seulement entrées valides
+        cleaned = {}
+        for k, v in entries.items():
+            if not isinstance(v, dict):
+                continue
+            if int(v.get("exp", 0) or 0) < now_ts:
+                continue
+            tok = str(v.get("token", "") or "").strip()
+            if not tok:
+                continue
+            if not parse_login_token(tok):
+                continue
+            cleaned[k] = v
+
+        if cleaned:
+            data[device_key] = {"entries": cleaned, "updated_at": now_ts}
+        else:
+            data.pop(device_key, None)
+
+        _save_trusted_devices(data)
+
+    except Exception:
+        return
+def get_trusted_device_token() -> str | None:
+    try:
+        device_key = _device_fingerprint()
+        if not device_key:
+            return None
+
+        data = _load_trusted_devices()
+        row = data.get(device_key) if isinstance(data, dict) else None
+        if not isinstance(row, dict):
+            return None
+
+        now_ts = int(time.time())
+
+        # ✅ Nouveau format
+        if "entries" in row and isinstance(row.get("entries"), dict):
+            entries = row["entries"]
+
+            # nettoyage local
+            valid = []
+            for u, v in entries.items():
+                if not isinstance(v, dict):
+                    continue
+                if int(v.get("exp", 0) or 0) < now_ts:
+                    continue
+                tok = str(v.get("token", "") or "").strip()
+                if not tok:
+                    continue
+                if not parse_login_token(tok):
+                    continue
+                valid.append(tok)
+
+            # 0 entrée => rien
+            if not valid:
+                data.pop(device_key, None)
+                _save_trusted_devices(data)
+                return None
+
+            # ✅ Anti-mix: si plusieurs sessions possibles pour la même empreinte, on NE RESTORE PAS
+            # (on oblige login manuel)
+            if len(valid) > 1:
+                return None
+
+            return valid[0]
+
+        # ✅ Ancien format (1 seule entrée)
+        if int(row.get("exp", 0) or 0) < now_ts:
+            data.pop(device_key, None)
+            _save_trusted_devices(data)
+            return None
+
+        tok = str(row.get("token", "") or "").strip()
+        if not tok or not parse_login_token(tok):
+            data.pop(device_key, None)
+            _save_trusted_devices(data)
+            return None
+
+        return tok
+
+    except Exception:
+        return None
 
 def set_login_cookie(token: str):
     token = str(token or "").strip()
@@ -825,9 +952,18 @@ def restore_login_from_cookie():
 
     login = str(login or "").strip().lower()
     token = str(token or "").strip()
+    if not login or not token:
+        return False
+
+    # ✅ Anti-mix : si cet appareil est déjà lié à un autre login, on refuse la restauration auto
+    bound = get_device_bound_login()
+    if bound and bound != login:
+        # Optionnel: on peut nettoyer le cookie session pour éviter une boucle de mauvais restore
+        # clear_login_cookie()
+        return False
 
     user = USERS.get(login)
-    if not user or not token:
+    if not user:
         return False
 
     st.session_state.logged_in = True
@@ -836,6 +972,9 @@ def restore_login_from_cookie():
     st.session_state.chauffeur_code = user.get("chauffeur_code")
     st.session_state.session_token = token
     st.session_state.remember_me = True
+
+    # ✅ On "bind" l'appareil à ce login après une restauration réussie
+    set_device_bound_login(login)
 
     return True
 # ============================================================
@@ -863,8 +1002,8 @@ def login_screen():
         if user and user["password"] == pwd:
             token = str(uuid.uuid4())
 
-            # Important: fixe un client_id pour cet appareil
-            _ = get_client_id()
+            # ✅ Force un client_id stable pour cet appareil
+            cid = str(get_client_id() or "").strip()
 
             st.session_state.logged_in = True
             st.session_state.username = login_norm
@@ -875,15 +1014,23 @@ def login_screen():
             st.session_state["_persist_state_saved"] = False
 
             if remember_me:
-                # 1) Sauvegarde serveur liée AU client_id (anti-mix)
+                # ✅ 1) Sauvegarde serveur PAR APPAREIL (anti-mix)
                 save_persistent_session(login_norm, token, True)
 
-                # 2) Sauvegarde locale (Streamlit App) : cookie + localStorage + query params si possible
+                # ✅ 2) Sauvegarde locale APP Streamlit : cookie + localStorage uniquement
+                # (important: pas de query params pour éviter les sessions qui se mélangent)
                 set_login_cookie(f"{login_norm}|{token}")
+
+                # ✅ 3) Optionnel (fortement recommandé) : marquer l'appareil comme associé à ce login
+                # (sert à refuser un restore si l'appareil essaie de reprendre un autre chauffeur)
+                st.session_state["device_bound_login"] = login_norm
+                st.session_state["device_bound_cid"] = cid
 
             else:
                 clear_persistent_session()
                 clear_login_cookie()
+                st.session_state.pop("device_bound_login", None)
+                st.session_state.pop("device_bound_cid", None)
 
             st.rerun()
         else:
