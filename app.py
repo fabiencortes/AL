@@ -789,8 +789,8 @@ def login_screen():
         if user and user["password"] == pwd:
             token = str(uuid.uuid4())
 
-            # ✅ Force un client_id maintenant (et le pousse dans query params si besoin)
-            _ = get_client_id()
+            # ✅ Force un client_id maintenant
+            cid = str(get_client_id() or "").strip()
 
             st.session_state.logged_in = True
             st.session_state.username = login_norm
@@ -804,22 +804,33 @@ def login_screen():
                 # ✅ Sauvegarde côté serveur (SQLite)
                 save_persistent_session(login_norm, token, True)
 
-                # ✅ Persistance ULTRA fiable : on met la session dans l'URL
-                # (Streamlit Cloud/App relira toujours st.query_params)
+                # ✅ On tente aussi de mettre dans query params côté Streamlit
                 try:
                     st.query_params[LOGIN_PERSIST_KEY] = f"{login_norm}|{token}"
-                except Exception:
-                    pass
-
-                try:
-                    cid = str(get_client_id() or "").strip()
                     if cid:
                         st.query_params[LOGIN_CLIENT_KEY] = cid
                 except Exception:
                     pass
 
-                # (optionnel) conserve l'ancien système si tu veux :
-                # set_login_cookie(f"{login_norm}|{token}")
+                # ✅ IMPORTANT : redirection navigateur pour GRAVER l'URL avec les params
+                components.html(
+                    f"""
+                    <script>
+                    (function() {{
+                        try {{
+                            const url = new URL(window.location.href);
+                            url.searchParams.set("{LOGIN_PERSIST_KEY}", "{login_norm}|{token}");
+                            if ("{cid}") {{
+                                url.searchParams.set("{LOGIN_CLIENT_KEY}", "{cid}");
+                            }}
+                            window.location.replace(url.toString());
+                        }} catch(e) {{}}
+                    }})();
+                    </script>
+                    """,
+                    height=0,
+                )
+                st.stop()
 
             else:
                 clear_persistent_session()
@@ -830,11 +841,9 @@ def login_screen():
                 except Exception:
                     pass
 
-            st.rerun()
+                st.rerun()
         else:
             st.error("Identifiants incorrects.")
-
-
 FLIGHT_ALERT_DELAY_MIN = 30  # seuil d’alerte retard (modifiable)
 
 def init_all_db_once():
@@ -10545,33 +10554,49 @@ def main():
     init_all_db_once()
     ensure_persistent_sessions_table()
 
-    # On attend au maximum 1 rerun interne pour laisser le JS de persistance
-    # remonter client_id + session dans query params / cookies
+    # 1 rerun max pour laisser query params se stabiliser
     if "BOOTSTRAP_TRY" not in st.session_state:
         st.session_state.BOOTSTRAP_TRY = 0
 
     restored = restore_login_from_cookie()
 
     # ✅ Si on est connecté et remember_me, on force une sauvegarde persistante 1x
+    # IMPORTANT: on n'appelle plus set_login_cookie (cookies/localStorage pas fiables)
     if st.session_state.get("logged_in") and st.session_state.get("remember_me"):
         if not st.session_state.get("_persist_state_saved", False):
             login = str(st.session_state.get("username") or "").strip().lower()
             token = str(st.session_state.get("session_token") or "").strip()
+
             if login and token:
                 ok = save_persistent_session(login, token, True)
-                set_login_cookie(f"{login}|{token}")
+
+                # ✅ On pousse la session dans l'URL (query params) = fiable Cloud/App
+                try:
+                    st.query_params[LOGIN_PERSIST_KEY] = f"{login}|{token}"
+                except Exception:
+                    pass
+
+                try:
+                    cid = str(get_client_id() or "").strip()
+                    if cid:
+                        st.query_params[LOGIN_CLIENT_KEY] = cid
+                except Exception:
+                    pass
+
                 if ok:
                     st.session_state["_persist_state_saved"] = True
 
+    # Debug (temporaire)
+    st.write("DEBUG restored =", restored)
+    st.write("DEBUG client_id =", get_client_id())
+    st.write("DEBUG cookie al_session =", get_login_cookie())
+    st.write("DEBUG logged_in =", st.session_state.get("logged_in"))
+    st.write("DEBUG BOOTSTRAP_TRY =", st.session_state.BOOTSTRAP_TRY)
+
+    # Si pas connecté, on laisse 1 rerun pour que l'URL/params soient visibles
     if not st.session_state.get("logged_in"):
         client_id = get_client_id()
         cookie_val = get_login_cookie()
-
-        st.write("DEBUG restored =", restored)
-        st.write("DEBUG client_id =", client_id)
-        st.write("DEBUG cookie al_session =", cookie_val)
-        st.write("DEBUG logged_in =", st.session_state.get("logged_in"))
-        st.write("DEBUG BOOTSTRAP_TRY =", st.session_state.BOOTSTRAP_TRY)
 
         # 1 seul rerun si cid/session pas encore visibles
         if st.session_state.BOOTSTRAP_TRY < 1 and (not client_id or not cookie_val):
@@ -10586,11 +10611,6 @@ def main():
         st.session_state.RUN_COUNTER = 0
 
     st.session_state.RUN_COUNTER += 1
-
-    st.write("DEBUG client_id =", get_client_id())
-    st.write("DEBUG cookie al_session =", get_login_cookie())
-    st.write("DEBUG logged_in =", st.session_state.get("logged_in"))
-
     # ======================================
     # 2️⃣ LOGIN
     # ======================================
