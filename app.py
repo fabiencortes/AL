@@ -364,6 +364,7 @@ LOGIN_CLIENT_KEY = "al_cid"
 LOGIN_CLIENT_STORAGE_KEY = "al_cid_local"
 LOGIN_BOOTSTRAP_FLAG = "al_bootstrap_done"
 LOGIN_PERSIST_HOURS = 24 * 30  # 30 jours
+LOGIN_SID_KEY = "al_sid"
 
 
 def _js_quote(val: str) -> str:
@@ -378,6 +379,7 @@ def ensure_persistent_sessions_table():
                 """
                 CREATE TABLE IF NOT EXISTS persistent_sessions (
                     client_id TEXT PRIMARY KEY,
+                    sid TEXT,
                     login TEXT NOT NULL,
                     token TEXT NOT NULL,
                     remember_me INTEGER DEFAULT 1,
@@ -388,6 +390,7 @@ def ensure_persistent_sessions_table():
                 )
                 """
             )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_persistent_sid ON persistent_sessions(sid)")
             conn.commit()
     except Exception as e:
         print(f"⚠️ ensure_persistent_sessions_table error: {e}", flush=True)
@@ -565,13 +568,16 @@ def save_persistent_session(login: str, token: str, remember_me: bool = True):
     now = datetime.now()
     exp = now + timedelta(hours=LOGIN_PERSIST_HOURS)
 
+    sid = str(uuid.uuid4())
+
     try:
         with get_connection() as conn:
             conn.execute(
                 """
-                INSERT INTO persistent_sessions (client_id, login, token, remember_me, active, created_at, updated_at, expires_at)
-                VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                INSERT INTO persistent_sessions (client_id, sid, login, token, remember_me, active, created_at, updated_at, expires_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
                 ON CONFLICT(client_id) DO UPDATE SET
+                    sid=excluded.sid,
                     login=excluded.login,
                     token=excluded.token,
                     remember_me=excluded.remember_me,
@@ -581,15 +587,18 @@ def save_persistent_session(login: str, token: str, remember_me: bool = True):
                 """,
                 (
                     client_id,
+                    sid,
                     str(login).strip().lower(),
                     str(token).strip(),
                     1 if remember_me else 0,
-                    now.isoformat(timespec='seconds'),
-                    now.isoformat(timespec='seconds'),
-                    exp.isoformat(timespec='seconds'),
+                    now.isoformat(timespec="seconds"),
+                    now.isoformat(timespec="seconds"),
+                    exp.isoformat(timespec="seconds"),
                 ),
             )
             conn.commit()
+
+        st.session_state["last_sid"] = sid
         return True
     except Exception as e:
         print(f"⚠️ save_persistent_session error: {e}", flush=True)
@@ -728,11 +737,58 @@ def restore_login_from_cookie():
     if st.session_state.get("logged_in"):
         return False
 
-    raw = get_login_cookie()
+    # 1) priorité SID (fiable même si client_id change)
+    sid = None
+    try:
+        sid = st.query_params.get(LOGIN_SID_KEY)
+        if isinstance(sid, list):
+            sid = sid[0] if sid else None
+        sid = str(sid or "").strip()
+    except Exception:
+        sid = None
 
+    if sid:
+        ensure_persistent_sessions_table()
+        try:
+            with get_connection() as conn:
+                row = conn.execute(
+                    """
+                    SELECT login, token, expires_at
+                    FROM persistent_sessions
+                    WHERE sid = ?
+                      AND active = 1
+                      AND remember_me = 1
+                    LIMIT 1
+                    """,
+                    (sid,),
+                ).fetchone()
+        except Exception:
+            row = None
+
+        if row:
+            login, token, expires_at = row
+            try:
+                if expires_at and datetime.fromisoformat(str(expires_at)) < datetime.now():
+                    return False
+            except Exception:
+                pass
+
+            login = str(login or "").strip().lower()
+            token = str(token or "").strip()
+            user = USERS.get(login)
+            if user and token:
+                st.session_state.logged_in = True
+                st.session_state.username = login
+                st.session_state.role = user.get("role")
+                st.session_state.chauffeur_code = user.get("chauffeur_code")
+                st.session_state.session_token = token
+                st.session_state.remember_me = True
+                return True
+
+    # 2) fallback ancien système (al_session / client_id)
+    raw = get_login_cookie()
     if not raw:
         raw = load_persistent_session_from_server()
-
     if not raw:
         return False
 
@@ -741,9 +797,6 @@ def restore_login_from_cookie():
     except Exception:
         raw = str(raw).strip()
 
-    if not raw:
-        return False
-
     try:
         login, token = raw.split("|", 1)
     except Exception:
@@ -751,8 +804,8 @@ def restore_login_from_cookie():
 
     login = str(login or "").strip().lower()
     token = str(token or "").strip()
-
     user = USERS.get(login)
+
     if not user or not token:
         return False
 
@@ -762,7 +815,6 @@ def restore_login_from_cookie():
     st.session_state.chauffeur_code = user.get("chauffeur_code")
     st.session_state.session_token = token
     st.session_state.remember_me = True
-
     return True
 # ============================================================
 #   LOGIN SCREEN
@@ -801,36 +853,37 @@ def login_screen():
             st.session_state["_persist_state_saved"] = False
 
             if remember_me:
-                # ✅ Sauvegarde côté serveur (SQLite)
+                # ✅ Sauvegarde côté serveur (SQLite) + génère last_sid
                 save_persistent_session(login_norm, token, True)
 
-                # ✅ On tente aussi de mettre dans query params côté Streamlit
-                try:
-                    st.query_params[LOGIN_PERSIST_KEY] = f"{login_norm}|{token}"
-                    if cid:
-                        st.query_params[LOGIN_CLIENT_KEY] = cid
-                except Exception:
-                    pass
+                sid = str(st.session_state.get("last_sid") or "").strip()
 
-                # ✅ IMPORTANT : redirection navigateur pour GRAVER l'URL avec les params
-                components.html(
-                    f"""
-                    <script>
-                    (function() {{
-                        try {{
-                            const url = new URL(window.location.href);
-                            url.searchParams.set("{LOGIN_PERSIST_KEY}", "{login_norm}|{token}");
-                            if ("{cid}") {{
-                                url.searchParams.set("{LOGIN_CLIENT_KEY}", "{cid}");
-                            }}
-                            window.location.replace(url.toString());
-                        }} catch(e) {{}}
-                    }})();
-                    </script>
-                    """,
-                    height=0,
-                )
-                st.stop()
+                # ✅ Redirection navigateur vers URL avec SID (fiable Cloud/App)
+                if sid:
+                    components.html(
+                        f"""
+                        <script>
+                        (function() {{
+                            try {{
+                                const url = new URL(window.location.href);
+                                url.searchParams.set("{LOGIN_SID_KEY}", "{sid}");
+                                // Optionnel: conserver cid en param si tu veux le voir/debug
+                                if ("{cid}") {{
+                                    url.searchParams.set("{LOGIN_CLIENT_KEY}", "{cid}");
+                                }}
+                                // On peut nettoyer l'ancien al_session si présent
+                                url.searchParams.delete("{LOGIN_PERSIST_KEY}");
+                                window.location.replace(url.toString());
+                            }} catch(e) {{}}
+                        }})();
+                        </script>
+                        """,
+                        height=0,
+                    )
+                    st.stop()
+
+                # Si jamais pas de sid (ne devrait pas arriver), on rerun classique
+                st.rerun()
 
             else:
                 clear_persistent_session()
@@ -838,12 +891,14 @@ def login_screen():
                 try:
                     st.query_params.pop(LOGIN_PERSIST_KEY, None)
                     st.query_params.pop(LOGIN_CLIENT_KEY, None)
+                    st.query_params.pop(LOGIN_SID_KEY, None)
                 except Exception:
                     pass
 
                 st.rerun()
         else:
             st.error("Identifiants incorrects.")
+
 FLIGHT_ALERT_DELAY_MIN = 30  # seuil d’alerte retard (modifiable)
 
 def init_all_db_once():
