@@ -4193,8 +4193,8 @@ def _send_planning_next_3_days_to_all(*, want_pdf: bool = True) -> dict:
         return recap
 
     today = date.today()
-    d_start = today
-    d_end = today + timedelta(days=2)
+    d_start = today + timedelta(days=1)
+    d_end = today + timedelta(days=3)
 
     # init table log si dispo
     try:
