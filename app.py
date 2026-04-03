@@ -1114,6 +1114,38 @@ def extract_positive_int(val):
 
     return None
 
+
+def is_blankish(val) -> bool:
+    try:
+        if pd.isna(val):
+            return True
+    except Exception:
+        pass
+
+    if val is None:
+        return True
+
+    s = str(val).strip()
+    return s == "" or s.lower() in {"nan", "none", "nat"}
+
+
+def clean_display(val, default: str = "") -> str:
+    if is_blankish(val):
+        return default
+    return str(val).strip()
+
+
+def clean_numeric_display(val, default: str = "") -> str:
+    if is_blankish(val):
+        return default
+    try:
+        f = float(val)
+        if f.is_integer():
+            return str(int(f))
+        return str(f)
+    except Exception:
+        return str(val).strip()
+
 # ============================================================
 #   COULEURS EXCEL -> FLAGS DB (GROUPAGE / PARTAGE / ATTENTE)
 # ============================================================
@@ -1708,7 +1740,7 @@ def format_navette_full_details(row, chauffeur_code: str) -> str:
     # =========================
     # CLIENT / TRAJET
     # =========================
-    nom = str(row.get("NOM", "") or "").strip()
+    nom = clean_display(row.get("NOM", ""))
     adr_full = build_full_address_from_row(
         pd.Series(row) if not isinstance(row, pd.Series) else row
     )
@@ -1722,10 +1754,10 @@ def format_navette_full_details(row, chauffeur_code: str) -> str:
     def g(*cols):
         for c in cols:
             v = row.get(c, "")
-            if v is None:
+            if is_blankish(v):
                 continue
             s = str(v).strip()
-            if s and s.lower() != "nan":
+            if s:
                 return s
         return ""
 
@@ -1739,7 +1771,7 @@ def format_navette_full_details(row, chauffeur_code: str) -> str:
     # =========================
     # CHAUFFEUR
     # =========================
-    ch_raw = str(row.get("CH", "") or "").strip()
+    ch_raw = clean_display(row.get("CH", ""))
     ch_norm = normalize_ch_for_phone(ch_raw)
 
     # =========================
@@ -3726,7 +3758,7 @@ def build_planning_mail_body(
         # ------------------
         # Client
         # ------------------
-        nom = str(row.get("NOM", "") or "").strip()
+        nom = clean_display(row.get("NOM", ""))
         if nom:
             lines.append(f"🧑 {nom}")
 
@@ -3770,7 +3802,7 @@ def build_planning_mail_body(
         # ------------------
         # Paiement
         # ------------------
-        paiement = str(row.get("PAIEMENT", "") or "").lower().strip()
+        paiement = clean_display(row.get("PAIEMENT", "")).lower()
         caisse = row.get("Caisse")
 
         if paiement == "facture":
@@ -3797,7 +3829,7 @@ def build_planning_mail_body(
         # ------------------
         # GO
         # ------------------
-        go_val = str(row.get("GO", "") or "").strip()
+        go_val = clean_display(row.get("GO", ""))
         if go_val:
             lines.append(f"🟢 {go_val}")
 
@@ -3908,14 +3940,14 @@ def build_client_sms(row: pd.Series, tel_chauffeur: str) -> str:
     heure = normalize_time_string(row.get("HEURE", "")) or "??:??"
 
     # NOM client (si dispo)
-    nom_client = str(row.get("NOM", "") or "").strip()
+    nom_client = clean_display(row.get("NOM", ""))
     if nom_client:
         bonjour = f"Bonjour Mr / Mme {nom_client}, c'est Airports-Lines."
     else:
         bonjour = "Bonjour, c'est Airports-Lines."
 
     # Code chauffeur (CH)
-    ch_code = str(row.get("CH", "") or "").strip()
+    ch_code = clean_display(row.get("CH", ""))
 
     return (
         f"{bonjour}\n"
@@ -3943,7 +3975,7 @@ def build_client_sms_from_driver(row: pd.Series, ch_code: str, tel_chauffeur: st
     heure = normalize_time_string(row.get("HEURE", "")) or "??:??"
 
     # Nom du client
-    nom_client = str(row.get("NOM", "") or "").strip()
+    nom_client = clean_display(row.get("NOM", ""))
     if nom_client:
         bonjour = f"Bonjour Mr / Mme {nom_client}, c'est votre chauffeur {ch_code} pour Airports-Lines."
     else:
@@ -4014,7 +4046,7 @@ def show_client_messages_for_period(df_base: pd.DataFrame, start: date, nb_days:
             continue
 
         # 3) GSM chauffeur (si absent, on affiche quand même mais sans lien WhatsApp fonctionnel)
-        raw_ch_code = str(row.get("CH", "") or "").strip()
+        raw_ch_code = clean_display(row.get("CH", ""))
 
         # On normalise le code pour retrouver le bon chauffeur dans Feuil2
         norm_ch_code = normalize_ch_for_phone(raw_ch_code)
@@ -4037,7 +4069,7 @@ def show_client_messages_for_period(df_base: pd.DataFrame, start: date, nb_days:
                 d_txt = str(date_val or "").strip()
 
         heure = normalize_time_string(row.get("HEURE", "")) or "??:??"
-        nom_client = str(row.get("NOM", "") or "").strip()
+        nom_client = clean_display(row.get("NOM", ""))
         label_client = nom_client if nom_client else "(client sans nom)"
 
         if wa_url:
@@ -4483,7 +4515,7 @@ def style_groupage_partage(styler):
         except Exception:
             heure = str(row.get("HEURE", "") or "").strip()
 
-        immat = str(row.get("IMMAT", "") or "").strip()
+        immat = clean_display(row.get("IMMAT", ""))
         is_conge = (heure == "00:00") and immat.isdigit()
 
         if is_conge:
@@ -6251,7 +6283,7 @@ def render_tab_vue_chauffeur(forced_ch=None):
     # =======================================================
     periode = st.radio(
         "📅 Quelle période envoyer ?",
-        ["Aujourd’hui", "Demain + 2 jours"],
+        ["Aujourd’hui", "Demain à J+4"],
         horizontal=True,
         key="bureau_send_periode",
     )
@@ -6262,8 +6294,8 @@ def render_tab_vue_chauffeur(forced_ch=None):
         periode_label = "du jour"
     else:
         d_start = today + timedelta(days=1)
-        d_end = today + timedelta(days=3)
-        periode_label = "de demain à J+3"
+        d_end = today + timedelta(days=4)
+        periode_label = "de demain à J+4"
 
     # =======================================================
     # 🧾 FORMAT D'ENVOI
@@ -7545,7 +7577,7 @@ def render_tab_chauffeur_driver():
         # ------------------
         # Chauffeur + statut
         # ------------------
-        ch_code = str(row.get("CH", "") or ch_selected).strip()
+        ch_code = clean_display(row.get("CH", ch_selected), ch_selected)
 
         if row.get("IS_INDISPO") == 1:
             ch_status = "🚫 Indispo"
@@ -7588,7 +7620,7 @@ def render_tab_chauffeur_driver():
         dest_raw = ""
         for cand in ["DESIGNATION", "DESTINATION", "DE/VERS"]:
             if cand in cols and row.get(cand):
-                dest_raw = str(row.get(cand)).strip()
+                dest_raw = clean_display(row.get(cand))
                 if dest_raw:
                     break
 
@@ -9025,7 +9057,7 @@ def render_tab_admin_transferts():
         end_iso = _to_iso(end_date)
 
         # ======================================================
-        # 📱 WHATSAPP CLIENT — J+1 / J+3 (AUTO, GROUPÉ)
+        # 📱 WHATSAPP CLIENT — J+1 / J+4 (AUTO, GROUPÉ)
         # ======================================================
         # ======================================================
         # 📋 VUE TRANSFERTS
@@ -9181,7 +9213,7 @@ def render_tab_admin_transferts():
   
 
     # ======================================================
-    # 💬 ONGLET WHATSAPP (CLIENTS) — J+1 / J+3
+    # 💬 ONGLET WHATSAPP (CLIENTS) — J+1 / J+4
     # ======================================================
     with tab_whatsapp:
         st.subheader("💬 WhatsApp — confirmations clients")
@@ -9231,14 +9263,14 @@ def render_tab_admin_transferts():
             ]
 
             for r in rows:
-                sens = str(r.get("Unnamed: 8", "") or "").strip()
-                dest = str(r.get("DESIGNATION", "") or "").strip()
-                adr = str(r.get("ADRESSE", "") or "").strip()
-                cp = str(r.get("CP", "") or "").strip()
-                loc = str(r.get("Localité", "") or "").strip()
-                h = str(r.get("HEURE", "") or "").strip()
+                sens = clean_display(r.get("Unnamed: 8", ""))
+                dest = clean_display(r.get("DESIGNATION", ""))
+                adr = clean_display(r.get("ADRESSE", ""))
+                cp = clean_numeric_display(r.get("CP", ""))
+                loc = clean_display(r.get("Localité", ""))
+                h = clean_display(r.get("HEURE", ""))
 
-                ch = str(r.get("CH", "") or "").replace("*", "").strip()
+                ch = clean_display(r.get("CH", "")).replace("*", "")
                 ch_gsms = r.get("_CH_GSMS") or []
 
                 lines.append(f"⏰ {h}")
@@ -9349,8 +9381,8 @@ def render_tab_admin_transferts():
             for (gsm, dval), g in groups:
                 if not gsm:
                     continue
-                client_name = str(g.iloc[0].get("NOM", "") or "").strip()
-                date_txt = str(dval or "").strip()
+                client_name = clean_display(g.iloc[0].get("NOM", ""))
+                date_txt = clean_display(dval)
                 msg = _build_client_message(client_name, date_txt, g.to_dict(orient="records"))
                 try:
                     link = build_whatsapp_link(gsm, msg)
@@ -9378,10 +9410,10 @@ def render_tab_admin_transferts():
                 _render_send_links(df_source, d1, d1)
 
         with c2:
-            if st.button("📅 Préparer WhatsApp J+3 (3 prochains jours)", key="wa_btn_j3"):
+            if st.button("📅 Préparer WhatsApp J+4 (4 prochains jours)", key="wa_btn_j4"):
                 d1 = date.today() + timedelta(days=1)
-                d3 = date.today() + timedelta(days=3)
-                _render_send_links(df_source, d1, d3)
+                d4 = date.today() + timedelta(days=4)
+                _render_send_links(df_source, d1, d4)
 
         with st.expander("🧪 Debug WhatsApp (source)", expanded=False):
             st.caption(f"Lignes source chargées : {len(df_source)}")
@@ -9402,10 +9434,6 @@ def _coerce_minutes(val) -> int:
     Accepte: 150 | "150" | "2h30" | "2:30" | "2.5"
     Retourne des minutes (int)
     """
-    import math
-    import pandas as pd
-
-    # 🔒 None / NaN
     if val is None:
         return 0
 
@@ -9415,7 +9443,6 @@ def _coerce_minutes(val) -> int:
     except Exception:
         pass
 
-    # 🔢 nombre direct
     if isinstance(val, (int, float)):
         try:
             if math.isnan(val) or math.isinf(val):
@@ -9425,7 +9452,7 @@ def _coerce_minutes(val) -> int:
         return int(val * 60) if val < 24 else int(val)
 
     s = str(val).strip().lower()
-    if not s:
+    if not s or s in {"nan", "none", "nat"}:
         return 0
 
     # 2h30
