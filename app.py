@@ -4236,9 +4236,9 @@ def logout():
 
 # ============================================================
 
-def _send_planning_next_3_days_to_all(*, want_pdf: bool = True) -> dict:
+def _send_planning_next_4_days_to_all(*, want_pdf: bool = True) -> dict:
     """
-    Envoie le planning des 3 prochains jours (J à J+2) à tous les chauffeurs actifs sur la période.
+    Envoie le planning des 4 prochains jours (J+1 à J+4) à tous les chauffeurs actifs sur la période.
     Retourne un petit récap {sent, skipped_empty, missing_email, errors}.
     """
     from datetime import date, timedelta
@@ -4252,7 +4252,7 @@ def _send_planning_next_3_days_to_all(*, want_pdf: bool = True) -> dict:
 
     today = date.today()
     d_start = today + timedelta(days=1)
-    d_end = today + timedelta(days=3)
+    d_end = today + timedelta(days=4)
 
     # init table log si dispo
     try:
@@ -4286,10 +4286,10 @@ def _send_planning_next_3_days_to_all(*, want_pdf: bool = True) -> dict:
 
     chauffeurs = sorted(active_chauffeurs)
     if not chauffeurs:
-        st.info("Aucun chauffeur trouvé sur les 3 prochains jours.")
+        st.info("Aucun chauffeur trouvé sur les 4 prochains jours.")
         return recap
 
-    periode_label = "3 prochains jours"
+    periode_label = "4 prochains jours"
     for ch in dict.fromkeys(chauffeurs):
         try:
             _tel, mail = get_chauffeur_contact(ch)
@@ -4400,7 +4400,7 @@ def _send_planning_next_3_days_to_all(*, want_pdf: bool = True) -> dict:
     return recap
 
 
-def _topbar_sync_db_and_refresh(*, also_send_next3: bool = False):
+def _topbar_sync_db_and_refresh(*, also_send_next4: bool = False):
     """Bouton top-bar : MAJ DB depuis Dropbox puis rafraîchit l'UI.
     Option: envoi aussi le planning des 3 prochains jours.
     """
@@ -4414,9 +4414,9 @@ def _topbar_sync_db_and_refresh(*, also_send_next3: bool = False):
             except TypeError:
                 sync_planning_from_today(ui=True)
 
-        if also_send_next3:
+        if also_send_next4:
             with st.spinner("📧 Envoi planning (3 prochains jours)…"):
-                recap = _send_planning_next_3_days_to_all(want_pdf=True)
+                recap = _send_planning_next_4_days_to_all(want_pdf=True)
                 st.success(
                     f"📧 Envoi terminé — envoyés: {recap['sent']} | vides: {recap['skipped_empty']} | emails manquants: {recap['missing_email']} | erreurs: {recap['errors']}"
                 )
@@ -4465,10 +4465,10 @@ def render_top_bar():
     with col2:
         if role == "admin":
             if st.button("🔄 Maj DB (Dropbox) + vue", use_container_width=True, key="topbar_sync_db"):
-                _topbar_sync_db_and_refresh(also_send_next3=False)
+                _topbar_sync_db_and_refresh(also_send_next4=False)
         elif role == "driver":
             if st.button("🔄 MAJ planning", use_container_width=True, key="topbar_driver_sync"):
-                _topbar_sync_db_and_refresh(also_send_next3=False)
+                _topbar_sync_db_and_refresh(also_send_next4=False)
         else:
             st.empty()
 
@@ -4478,7 +4478,7 @@ def render_top_bar():
     with col3:
         if role == "admin":
             if st.button("📧 Maj + envoyer planning (3j)", use_container_width=True, key="topbar_sync_send_3j"):
-                _topbar_sync_db_and_refresh(also_send_next3=True)
+                _topbar_sync_db_and_refresh(also_send_next4=True)
         else:
             st.empty()
 
@@ -7270,7 +7270,7 @@ def render_tab_chauffeur_driver():
     btn_col, _ = st.columns([1, 6])
     with btn_col:
         if st.button("🔄", key=f"driver_refresh_square_{ch_selected}", help="Mettre à jour le planning depuis Dropbox"):
-            _topbar_sync_db_and_refresh(also_send_next3=False)
+            _topbar_sync_db_and_refresh(also_send_next4=False)
 
     # ===================================================
     # 💶 BADGE — CAISSE À REMETTRE
@@ -7592,7 +7592,12 @@ def render_tab_chauffeur_driver():
         # ------------------
         # Confirmation
         # ------------------
-        if is_navette_confirmed(row):
+        is_indispo = int(row.get("IS_INDISPO", 0) or 0) == 1
+        is_bureau = clean_display(dest_raw if 'dest_raw' in locals() else row.get("DESIGNATION", ""), "").upper() == "BUREAU"
+
+        if is_indispo:
+            bloc.append("🚫 **Indisponibilité**")
+        elif is_navette_confirmed(row):
             bloc.append("✅ **Navette confirmée**")
         else:
             bloc.append("🕒 **À confirmer**")
@@ -7619,12 +7624,14 @@ def render_tab_chauffeur_driver():
 
         dest_raw = ""
         for cand in ["DESIGNATION", "DESTINATION", "DE/VERS"]:
-            if cand in cols and row.get(cand):
-                dest_raw = clean_display(row.get(cand))
+            v = row.get(cand)
+            if cand in cols and not is_blankish(v):
+                dest_raw = clean_display(v)
                 if dest_raw:
                     break
 
-        dest = resolve_client_alias(dest_raw)
+        dest = resolve_client_alias(dest_raw) if dest_raw else ""
+        is_bureau = clean_display(dest_raw, "").upper() == "BUREAU" or clean_display(dest, "").upper() == "BUREAU"
 
         if sens_txt and dest:
             bloc.append(f"➡ {sens_txt} ({dest})")
@@ -7634,84 +7641,77 @@ def render_tab_chauffeur_driver():
             bloc.append(f"➡ {dest}")
 
         # ------------------
-        # Client
+        # Client / PAX / véhicule / coordonnées
         # ------------------
-        nom = str(row.get("NOM", "") or "").strip()
-        if nom:
-            bloc.append(f"🧑 {nom}")
+        nom = clean_display(row.get("NOM", ""))
+        pax = clean_numeric_display(row.get("PAX"))
+        immat = clean_display(row.get("PLAQUE") or row.get("IMMAT"), "")
+        siege_bebe = extract_positive_int(row.get("SIEGE", row.get("SIÈGE")))
+        reh_n = extract_positive_int(row.get("REH"))
 
-        # ------------------
-        # 👥 PAX
-        # ------------------
-        pax = row.get("PAX")
-        if pax not in ("", None, 0, "0"):
-            try:
-                pax_i = int(pax)
-                if pax_i > 0:
-                    bloc.append(f"👥 **{pax_i} pax**")
-            except Exception:
+        adr = clean_display(build_full_address_from_row(row), "")
+        nav_adr = clean_display(build_navigation_address_from_row(row), "")
+        tel = clean_display(get_client_phone_from_row(row), "")
+
+        if (not is_indispo) and (not is_bureau):
+            if nom:
+                bloc.append(f"🧑 {nom}")
+
+            if pax and pax != "0":
                 bloc.append(f"👥 **{pax} pax**")
 
-        # ------------------
-        # 🚘 Véhicule (SIÈGE BÉBÉ / RÉHAUSSEUR)
-        # ------------------
-        immat = str(row.get("IMMAT", "") or "").strip()
-        if immat:
+            if immat:
+                bloc.append(f"🚘 Plaque : {immat}")
+
+            if siege_bebe:
+                bloc.append(f"🍼 Siège bébé : {siege_bebe}")
+
+            if reh_n:
+                bloc.append(f"🪑 Rehausseur : {reh_n}")
+
+            if adr:
+                bloc.append(f"📍 {adr}")
+
+            if tel:
+                bloc.append(f"📞 {tel}")
+        elif immat and not is_indispo:
+            # Bureau : on peut garder la plaque si elle existe vraiment
             bloc.append(f"🚘 Plaque : {immat}")
-
-        siege_bebe = extract_positive_int(row.get("SIEGE", row.get("SIÈGE")))
-        if siege_bebe:
-            bloc.append(f"🍼 Siège bébé : {siege_bebe}")
-
-        reh_n = extract_positive_int(row.get("REH"))
-        if reh_n:
-            bloc.append(f"🪑 Rehausseur : {reh_n}")
-
-        # ------------------
-        # Adresse / Tel
-        # ------------------
-        adr = build_full_address_from_row(row)
-        nav_adr = build_navigation_address_from_row(row)
-        if adr:
-            bloc.append(f"📍 {adr}")
-
-        tel = get_client_phone_from_row(row)
-        if tel:
-            bloc.append(f"📞 {tel}")
 
         # ------------------
         # Paiement
         # ------------------
-        paiement = str(row.get("PAIEMENT", "") or "").lower().strip()
-        caisse = row.get("Caisse")
+        paiement = clean_display(row.get("PAIEMENT", "")).lower()
+        caisse = clean_numeric_display(row.get("Caisse"), "")
 
-        if paiement == "facture":
-            bloc.append("🧾 **FACTURE**")
-        elif paiement == "caisse" and caisse:
-            bloc.append(
-                "<span style='color:#d32f2f;font-weight:800;'>"
-                f"💶 {caisse} € (CASH)</span>"
-            )
-        elif paiement == "bancontact" and caisse:
-            bloc.append(
-                "<span style='color:#1976d2;font-weight:800;'>"
-                f"💳 {caisse} € (BANCONTACT)</span>"
-            )
+        if (not is_indispo) and (not is_bureau):
+            if paiement == "facture":
+                bloc.append("🧾 **FACTURE**")
+            elif paiement == "caisse" and caisse:
+                bloc.append(
+                    "<span style='color:#d32f2f;font-weight:800;'>"
+                    f"💶 {caisse} € (CASH)</span>"
+                )
+            elif paiement == "bancontact" and caisse:
+                bloc.append(
+                    "<span style='color:#1976d2;font-weight:800;'>"
+                    f"💳 {caisse} € (BANCONTACT)</span>"
+                )
 
         # ===================================================
-        # ✈️ Vol – TOUJOURS AFFICHÉ / STATUT = JOUR J
+        # ✈️ Vol – uniquement si renseigné et navette réelle
         # ===================================================
-        vol = extract_vol_val(row, cols)
-        if vol:
+        vol = clean_display(extract_vol_val(row, cols), "")
+        if vol and (not is_indispo) and (not is_bureau):
             bloc.append(f"✈️ Vol **{vol}**")
 
             # 🔎 Vérification statut UNIQUEMENT le jour J
             if date_obj and date_obj == today:
                 status, delay_min, *_ = get_flight_status_cached(vol)
-                badge = flight_badge(status, delay_min)
-
-                if badge:
-                    bloc.append(f"📡 {badge}")
+                if status:
+                    badge = flight_badge(status, delay_min)
+                    if badge:
+                        bloc.append(f"📡 {badge}")
 
                 if delay_min is not None and delay_min >= FLIGHT_ALERT_DELAY_MIN:
                     bloc.append(
@@ -7721,17 +7721,19 @@ def render_tab_chauffeur_driver():
         # ------------------
         # GO
         # ------------------
-        go_val = str(row.get("GO", "") or "").strip()
-        if go_val:
+        go_val = clean_display(row.get("GO", ""), "")
+        if go_val and (not is_indispo) and (not is_bureau):
             bloc.append(f"🟢 {go_val}")
 
         # ------------------
         # 🧾 BDC (juste après GO)
         # ------------------
-        for cand in ["NUM BDC", "Num BDC", "NUM_BDC", "BDC"]:
-            if cand in cols and row.get(cand):
-                bloc.append(f"🧾 **BDC : {row.get(cand)}**")
-                break
+        if (not is_indispo) and (not is_bureau):
+            for cand in ["NUM BDC", "Num BDC", "NUM_BDC", "BDC"]:
+                v = row.get(cand)
+                if cand in cols and not is_blankish(v):
+                    bloc.append(f"🧾 **BDC : {clean_display(v)}**")
+                    break
 
         # ------------------
         # Actions
@@ -7745,7 +7747,7 @@ def render_tab_chauffeur_driver():
             actions.append(f"[🧭 Waze]({build_waze_link(nav_adr)})")
             actions.append(f"[🗺 Google Maps]({build_google_maps_link(nav_adr)})")
 
-        if tel:
+        if tel and (not is_indispo) and (not is_bureau):
             # =========================
             # 📞 GSM CHAUFFEUR(S) – Feuil2
             # =========================
@@ -7761,7 +7763,6 @@ def render_tab_chauffeur_driver():
             actions.append(
                 f"[💬 WhatsApp]({build_whatsapp_link(tel, msg)})"
             )
-
 
         if actions:
             bloc.append(" | ".join(actions))
