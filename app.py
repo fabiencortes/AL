@@ -9402,10 +9402,26 @@ def _coerce_minutes(val) -> int:
     Accepte: 150 | "150" | "2h30" | "2:30" | "2.5"
     Retourne des minutes (int)
     """
+    import math
+    import pandas as pd
+
+    # 🔒 None / NaN
     if val is None:
         return 0
 
+    try:
+        if pd.isna(val):
+            return 0
+    except Exception:
+        pass
+
+    # 🔢 nombre direct
     if isinstance(val, (int, float)):
+        try:
+            if math.isnan(val) or math.isinf(val):
+                return 0
+        except Exception:
+            pass
         return int(val * 60) if val < 24 else int(val)
 
     s = str(val).strip().lower()
@@ -9431,6 +9447,8 @@ def _coerce_minutes(val) -> int:
     # 2.5
     try:
         f = float(s.replace(",", "."))
+        if math.isnan(f) or math.isinf(f):
+            return 0
         return int(f * 60) if f < 24 else int(f)
     except Exception:
         return 0
