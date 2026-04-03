@@ -47,7 +47,7 @@ def get_dropbox_access_token():
     return r.json()["access_token"]
 
 
-def download_dropbox_excel_bytes(path="/Goldenlines/Planning 2026.xlsx"):
+def download_dropbox_excel_bytes(path="/Goldenlines/Planning 2026.xlsm"):
     token = get_dropbox_access_token()
     headers = {
         "Authorization": f"Bearer {token}",
@@ -63,7 +63,7 @@ def download_dropbox_excel_bytes(path="/Goldenlines/Planning 2026.xlsx"):
     return r.content
 
 
-def upload_dropbox_excel_bytes(content: bytes, path="/Goldenlines/Planning 2026.xlsx"):
+def upload_dropbox_excel_bytes(content: bytes, path="/Goldenlines/Planning 2026.xlsm"):
     """Upload (overwrite) du fichier Excel vers Dropbox."""
     token = get_dropbox_access_token()
     headers = {
@@ -369,7 +369,7 @@ def _make_row_key_like_db(row: dict) -> str:
 # ============================================================
 
 def ensure_excel_row_key_column(
-    dropbox_path: str = "/Goldenlines/Planning 2026.xlsx",
+    dropbox_path: str = "/Goldenlines/Planning 2026.xlsm",
     sheet_name: str = "Feuil1",
     header_row: int = 2,
     data_start_row: int = 3,
@@ -421,7 +421,7 @@ def ensure_excel_row_key_column(
 def update_excel_rows_by_row_key(
     updates_by_row_key: dict,
     sheet_name: str = "Feuil1",
-    dropbox_path: str = "/Goldenlines/Planning 2026.xlsx",
+    dropbox_path: str = "/Goldenlines/Planning 2026.xlsm",
     row_key_col_letter: str = "ZX",
     debug: bool = False,
 ) -> int:
@@ -491,7 +491,7 @@ def update_excel_rows_by_row_key(
 
     return updated
 
-def mark_caisse_paid_in_excel(row_keys: list, sheet_name: str = "Feuil1", dropbox_path: str = "/Goldenlines/Planning 2026.xlsx") -> int:
+def mark_caisse_paid_in_excel(row_keys: list, sheet_name: str = "Feuil1", dropbox_path: str = "/Goldenlines/Planning 2026.xlsm") -> int:
     """Met la cellule CAISSE en vert (payé) pour les lignes (row_key)."""
     if not row_keys:
         return 0

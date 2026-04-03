@@ -1161,6 +1161,14 @@ def ensure_excel_sync_column():
             conn.commit()
 
 
+def ensure_surcharge_carburant_column():
+    with get_connection() as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(planning)").fetchall()]
+        if "SURCHARGE_CARBURANT" not in cols:
+            conn.execute('ALTER TABLE planning ADD COLUMN "SURCHARGE_CARBURANT" REAL DEFAULT 0')
+        conn.commit()
+
+
 def ensure_planning_row_key_index():
     with get_connection() as conn:
         conn.execute(

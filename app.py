@@ -120,11 +120,18 @@ from database import (
     ensure_excel_sync_column,
     cleanup_orphan_planning_rows,
     ensure_ch_manual_column,
+    ensure_surcharge_carburant_column,
     list_pending_actions,
     mark_actions_done,
     unlock_rows_by_row_keys,
 )
 from utils import add_excel_color_flags_from_dropbox, log_event, render_logs_ui, format_mail_navette_v2, parse_mail_to_navette_v2, detect_dest_code, suggest_heures_from_rules, parse_mail_to_navette_v2, format_mail_navette_v2, parse_mail_to_navette_v2_cached
+
+try:
+    from fuel_surcharge import render_fuel_tab
+except Exception as _fuel_e:
+    def render_fuel_tab():
+        st.error(f"Module surcharge carburant indisponible : {_fuel_e}")
 def rebuild_planning_views():
     """
     🔒 Version ULTIME (corrigée)
@@ -241,6 +248,7 @@ def init_db_once():
     ensure_admin_reply_columns()
     ensure_excel_sync_column()
     ensure_ch_manual_column()
+    ensure_surcharge_carburant_column()
     print("▶️ ensure columns OK", flush=True)
 
     # 🔒 VUES SQLITE (UNE SEULE FOIS)
@@ -256,6 +264,23 @@ def get_device_bound_login() -> str | None:
 
 def set_device_bound_login(login: str):
     st.session_state["device_bound_login"] = str(login or "").strip().lower()
+
+def can_access_fuel_tab() -> bool:
+    role = str(st.session_state.get("role") or "").strip().lower()
+    ch = str(st.session_state.get("chauffeur_code") or "").strip().upper()
+    username = str(st.session_state.get("username") or "").strip().lower()
+    return role == "admin" or username in {"fab", "oli"} or ch in {"FA", "AD"} or role == "restricted"
+
+
+def can_see_surcharge_column() -> bool:
+    return can_access_fuel_tab()
+
+
+def add_surcharge_column_if_allowed(cols: list[str], df=None) -> list[str]:
+    cols = list(cols or [])
+    if can_see_surcharge_column() and "SURCHARGE_CARBURANT" not in cols:
+        cols.append("SURCHARGE_CARBURANT")
+    return cols
 
 # ============================================================
 #   SESSION STATE
@@ -1065,6 +1090,7 @@ def init_all_db_once():
     ensure_ack_columns()
     ensure_caisse_columns()
     ensure_urgence_columns()
+    ensure_surcharge_carburant_column()
 
     st.session_state["all_db_init_done"] = True
 
@@ -1278,10 +1304,10 @@ import pandas as pd
 import requests
 import streamlit as st
 
-DROPBOX_FILE_PATH = "/Goldenlines/Planning 2026.xlsx"
+DROPBOX_FILE_PATH = "/Goldenlines/Planning 2026.xlsm"
 
 # 🔗 Lien public Dropbox (édition Excel Online)
-PLANNING_ONLINE_URL = "https://www.dropbox.com/scl/fi/3s712xzr85tijl3mcw5sy/Planning-2022.xlsx?rlkey=6zl8px1zzjz6lhcp9dutz25n3&st=sqs73z3s&dl=0"
+PLANNING_ONLINE_URL = "https://www.dropbox.com/scl/fi/e8f3zb2f022ovm8nbax9y/Planning-2026.xlsm?rlkey=aga4h1jy6dz7s7th3sng13l0c&st=3lqwgwhf&dl=0"
 
 
 import os
@@ -1349,7 +1375,7 @@ def get_dropbox_file_last_modified() -> datetime | None:
         }
 
         data = {
-            "path": "/Goldenlines/Planning 2026.xlsx"
+            "path": "/Goldenlines/Planning 2026.xlsm"
         }
 
         r = requests.post(
@@ -1371,7 +1397,7 @@ from utils import download_dropbox_excel_bytes as _download_dropbox_excel_bytes
 from utils import upload_dropbox_excel_bytes as _upload_dropbox_excel_bytes
 
 
-def download_dropbox_excel_bytes(path: str = "/Goldenlines/Planning 2026.xlsx") -> bytes | None:
+def download_dropbox_excel_bytes(path: str = "/Goldenlines/Planning 2026.xlsm") -> bytes | None:
     """Wrapper: télécharge le fichier Excel depuis Dropbox (bytes)."""
     try:
         return _download_dropbox_excel_bytes(path)
@@ -1380,7 +1406,7 @@ def download_dropbox_excel_bytes(path: str = "/Goldenlines/Planning 2026.xlsx") 
         return None
 
 
-def upload_dropbox_excel_bytes(content: bytes, path: str = "/Goldenlines/Planning 2026.xlsx") -> bool:
+def upload_dropbox_excel_bytes(content: bytes, path: str = "/Goldenlines/Planning 2026.xlsm") -> bool:
     """Wrapper: upload (overwrite) le fichier Excel sur Dropbox."""
     try:
         _upload_dropbox_excel_bytes(content, path)
@@ -1618,7 +1644,7 @@ def render_excel_modified_indicator():
             h = mins // 60
             m = mins % 60
             txt = f"il y a {h}h{m:02d}"
-        st.caption(f"📄 Excel Dropbox modifié {txt} (source : Planning 2026.xlsx)")
+        st.caption(f"📄 Excel Dropbox modifié {txt} (source : Planning 2026.xlsm)")
     except Exception:
         pass
 
@@ -4277,6 +4303,7 @@ def _send_planning_next_3_days_to_all(*, want_pdf: bool = True) -> dict:
                     "GO","Num BDC","NOM","ADRESSE","CP","Localité","Tél",
                     "Type Nav","PAIEMENT","Caisse"
                 ]
+                planning_cols_driver = add_surcharge_column_if_allowed(planning_cols_driver)
                 df_table = df_ch.copy()
                 for c in planning_cols_driver:
                     if c not in df_table.columns:
@@ -5504,7 +5531,7 @@ def render_tab_table():
 
     EXCEL_ONLINE_URL = (
         "https://www.dropbox.com/scl/fi/lymuumy8en46l7p0uwjj3/"
-        "Planning-2026.xlsx"
+        "Planning-2026.xlsm"
         "?rlkey=sgvr0a58ekpr471p5aguqk3k8&dl=0"
     )
 
@@ -6385,6 +6412,7 @@ def render_tab_vue_chauffeur(forced_ch=None):
                         "GO","Num BDC","NOM","ADRESSE","CP","Localité","Tél",
                         "Type Nav","PAIEMENT","Caisse"
                     ]
+                    planning_cols_driver = add_surcharge_column_if_allowed(planning_cols_driver)
 
                     df_table = df_ch.copy()
 
@@ -7331,6 +7359,7 @@ def render_tab_chauffeur_driver():
             "GO","Num BDC","NOM","ADRESSE","CP","Localité","Tél",
             "Type Nav","PAIEMENT","Caisse"
         ]
+        planning_cols_driver = add_surcharge_column_if_allowed(planning_cols_driver)
 
         df_table = df_ch.copy()
         for c in planning_cols_driver:
@@ -7338,6 +7367,13 @@ def render_tab_chauffeur_driver():
                 df_table[c] = ""
 
         df_table = df_table[planning_cols_driver]
+
+        if can_see_surcharge_column() and "SURCHARGE_CARBURANT" in df_table.columns:
+            try:
+                _sur = pd.to_numeric(df_table["SURCHARGE_CARBURANT"], errors="coerce").fillna(0.0)
+                st.caption(f"⛽ Total surcharge visible : {_sur.sum():.2f} €")
+            except Exception:
+                pass
 
         def style_rows(row):
             if str(row.get("PAIEMENT","")).lower()=="caisse" and row.get("Caisse"):
@@ -7738,6 +7774,7 @@ def render_tab_chauffeur_driver():
             "PAIEMENT",
             "Caisse",
         ]
+        planning_cols_driver = add_surcharge_column_if_allowed(planning_cols_driver)
 
         df_table = df_ch.copy()
 
@@ -7749,6 +7786,13 @@ def render_tab_chauffeur_driver():
         df_table = df_table[planning_cols_driver]
 
         # Renommage propre affichage
+        if can_see_surcharge_column() and "SURCHARGE_CARBURANT" in df_table.columns:
+            try:
+                _sur = pd.to_numeric(df_table["SURCHARGE_CARBURANT"], errors="coerce").fillna(0.0)
+                st.caption(f"⛽ Total surcharge visible : {_sur.sum():.2f} €")
+            except Exception:
+                pass
+
         df_table = df_table.rename(columns={
             "Unnamed: 8": "SENS",
             "DESIGNATION": "DEST",
@@ -8074,7 +8118,7 @@ def render_tab_excel_sync():
         ---
         🔧 **Workflow normal :**
 
-        1. Ouvre le fichier **Planning 2026.xlsx** dans **Dropbox**
+        1. Ouvre le fichier **Planning 2026.xlsm** dans **Dropbox**
         2. Modifie *Feuil1*, *Feuil2*, *Feuil3*
         3. Enregistre le fichier
         4. Clique sur **FORCER MAJ DROPBOX → DB**
@@ -8089,8 +8133,8 @@ def render_tab_excel_sync():
     st.subheader("🆘 Mode secours — Charger un fichier Excel manuellement")
 
     uploaded_file = st.file_uploader(
-        "📤 Charger un fichier Planning Excel (.xlsx)",
-        type=["xlsx"],
+        "📤 Charger un fichier Planning Excel (.xlsm)",
+        type=["xlsm"],
         accept_multiple_files=False,
     )
 
@@ -10882,6 +10926,13 @@ def main():
                 render_tab_indispo_admin()
             st.stop()
 
+        if DEBUG_STEP == 13:
+            st.success("✅ TEST 13 : Surcharge carburant seule")
+            (tab11,) = st.tabs(["⛽ Surcharge carburant"])
+            with tab11:
+                render_fuel_tab()
+            st.stop()
+
         # ---------------- MODE NORMAL ----------------
         pending = count_pending_confirmations()
         confirm_label = (
@@ -10902,6 +10953,7 @@ def main():
             tab8,
             tab9,
             tab10,
+            tab11,
         ) = st.tabs(
             [
                 "📅 Planning",
@@ -10915,6 +10967,7 @@ def main():
                 "📦 Admin transferts",
                 "📂 Excel ↔ DB",
                 "🚫 Indispos chauffeurs",
+                "⛽ Surcharge carburant",
             ]
         )
 
@@ -10940,10 +10993,12 @@ def main():
             render_tab_excel_sync()
         with tab10:
             render_tab_indispo_admin()
+        with tab11:
+            render_fuel_tab()
 
     # ==================== RESTRICTED ========================
     elif role == "restricted":
-        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
             [
                 "📅 Planning",
                 "📊 Tableau / Édition",
@@ -10951,6 +11006,7 @@ def main():
                 "🚖 Vue Chauffeur",
                 "👨‍✈️ Feuil2 / Chauffeurs",
                 "📄 Feuil3",
+                "⛽ Surcharge carburant",
             ]
         )
 
@@ -10966,6 +11022,8 @@ def main():
             render_tab_chauffeurs()
         with tab6:
             render_tab_feuil3()
+        with tab7:
+            render_fuel_tab()
 
     # ==================== DRIVER ============================
     elif role == "driver":
