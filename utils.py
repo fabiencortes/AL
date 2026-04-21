@@ -893,3 +893,79 @@ def parse_mail_to_navette_flexible(text: str) -> dict:
         "SOURCE": "flexible",
         "ROWS": rows,
     }
+
+
+# ======================================================
+# 📘 FLAGS FACTURE + CLIENT HUB
+# ======================================================
+
+def read_client_hub_excel_flags(sheet_name: str = "Feuil1") -> pd.DataFrame:
+    """Retourne un DataFrame léger avec row-index Excel et flags client:
+    - FACTURE_ENVOYEE si P+Q verts
+    - BDC_NOM_VERT si P+Q verts
+    """
+    out = []
+    try:
+        content = get_dropbox_excel_cached()
+        wb = load_workbook(BytesIO(content), data_only=True)
+        ws = wb[sheet_name]
+        # colonnes fixes Feuil1: P=16, Q=17
+        for excel_row in range(3, ws.max_row + 1):
+            c_p = ws.cell(excel_row, 16)
+            c_q = ws.cell(excel_row, 17)
+            fact = 1 if _cell_is_green(c_p) and _cell_is_green(c_q) else 0
+            out.append({
+                "_excel_row": excel_row,
+                "FACTURE_ENVOYEE": fact,
+                "BDC_NOM_VERT": fact,
+            })
+    except Exception:
+        pass
+    return pd.DataFrame(out)
+
+def read_dates_carburant_map() -> dict:
+    try:
+        content = get_dropbox_excel_cached()
+        wb = load_workbook(BytesIO(content), data_only=True)
+        ws = wb["dates carburant"]
+        mapping = {}
+        for r in range(2, ws.max_row + 1):
+            d = ws.cell(r, 1).value
+            coef = ws.cell(r, 3).value
+            if not d:
+                continue
+            try:
+                key = pd.to_datetime(d, errors="coerce").strftime("%Y-%m-%d")
+            except Exception:
+                continue
+            try:
+                mapping[key] = float(coef or 0)
+            except Exception:
+                mapping[key] = 0.0
+        return mapping
+    except Exception:
+        return {}
+
+def compute_surcharge_like_xlsm(date_iso: str, km, htva, coef_map: dict) -> float:
+    try:
+        if not date_iso:
+            return 0.0
+        d = pd.to_datetime(date_iso, errors="coerce")
+        if pd.isna(d):
+            return 0.0
+        if d.date() < pd.Timestamp("2026-04-01").date():
+            return 0.0
+        coef = float(coef_map.get(d.strftime("%Y-%m-%d"), 0) or 0)
+        if coef <= 0:
+            return 0.0
+        h = float(htva or 0)
+        if h in (47.5, 55.0):
+            return 2.0
+        if h in (115.0, 148.5):
+            return round(200.0 * coef, 2)
+        k = float(km or 0)
+        if k > 0:
+            return round(k * coef, 2)
+        return 0.0
+    except Exception:
+        return 0.0

@@ -1,6 +1,6 @@
 import sqlite3
 from datetime import date, datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 import streamlit as st
 import pandas as pd
 import hashlib
@@ -3857,3 +3857,174 @@ def parse_sens_from_mail(text: str) -> str:
 
     return ""
 
+
+
+# ============================================================
+#   CLIENT HUB / FACTURATION — HISTORIQUE DB-FIRST
+# ============================================================
+
+def ensure_facture_envoyee_column():
+    with get_connection() as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(planning)").fetchall()}
+        if "FACTURE_ENVOYEE" not in cols:
+            conn.execute('ALTER TABLE planning ADD COLUMN "FACTURE_ENVOYEE" INTEGER DEFAULT 0')
+        conn.commit()
+
+def _norm_txt_key(v: Any) -> str:
+    try:
+        if pd.isna(v):
+            return ""
+    except Exception:
+        pass
+    return str(v or "").strip().upper()
+
+def _norm_time_key(v: Any) -> str:
+    try:
+        return _normalize_heure_str(v)
+    except Exception:
+        return str(v or "").strip()
+
+def find_existing_transfer_candidates(data: Dict[str, Any]) -> list[dict]:
+    ensure_facture_envoyee_column()
+    date_iso = str(data.get("DATE_ISO") or "").strip()
+    heure = _norm_time_key(data.get("HEURE"))
+    sens = _norm_txt_key(data.get("Unnamed: 8"))
+    designation = _norm_txt_key(data.get("DESIGNATION"))
+    bdc = _norm_txt_key(data.get("Num BDC") or data.get("NUM BDC"))
+    nom = _norm_txt_key(data.get("NOM"))
+    adresse = _norm_txt_key(data.get("ADRESSE"))
+    cp = _norm_txt_key(data.get("CP"))
+    localite = _norm_txt_key(data.get("Localité") or data.get("LOCALITE"))
+    query = """
+        SELECT id, row_key, COALESCE(FACTURE_ENVOYEE,0) AS FACTURE_ENVOYEE,
+               COALESCE(SURCHARGE_CARBURANT,0) AS SURCHARGE_CARBURANT,
+               COALESCE(updated_at,'') AS updated_at
+        FROM planning
+        WHERE COALESCE(IS_SUPERSEDED,0)=0
+          AND COALESCE(DATE_ISO,'')=?
+          AND UPPER(TRIM(COALESCE(HEURE,'')))=?
+          AND UPPER(TRIM(COALESCE("Unnamed: 8",'')))=?
+          AND UPPER(TRIM(COALESCE(DESIGNATION,'')))=?
+          AND UPPER(TRIM(COALESCE("Num BDC", COALESCE("NUM BDC",''))))=?
+          AND UPPER(TRIM(COALESCE(NOM,'')))=?
+          AND UPPER(TRIM(COALESCE(ADRESSE,'')))=?
+          AND UPPER(TRIM(COALESCE(CP,'')))=?
+          AND UPPER(TRIM(COALESCE("Localité", COALESCE("LOCALITE",''))))=?
+        ORDER BY COALESCE(FACTURE_ENVOYEE,0) DESC,
+                 CASE WHEN COALESCE(SURCHARGE_CARBURANT,0) > 0 THEN 1 ELSE 0 END DESC,
+                 COALESCE(updated_at,'') DESC,
+                 id DESC
+    """
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(query, (date_iso, heure, sens, designation, bdc, nom, adresse, cp, localite))
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in rows]
+
+def upsert_transfer_historical(data: Dict[str, Any], *, force: bool = False) -> Tuple[str, int | None]:
+    ensure_facture_envoyee_column()
+    ensure_planning_row_key_column()
+    ensure_planning_row_key_index()
+    ensure_surcharge_carburant_column()
+    if not data:
+        return ("skipped", None)
+
+    payload = {k: v for k, v in dict(data).items() if k in get_planning_table_columns()}
+    # row_key stable if provided else business-key fallback
+    rk = str(payload.get("row_key") or "").strip()
+    if not rk:
+        rk = make_row_key_from_row(payload)
+        payload["row_key"] = rk
+
+    # exact row_key first
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, COALESCE(FACTURE_ENVOYEE,0) FROM planning WHERE row_key = ? LIMIT 1", (rk,))
+        row = cur.fetchone()
+    if row:
+        row_id, facture = int(row[0]), int(row[1] or 0)
+        if facture == 1 and not force:
+            return ("locked", row_id)
+        apply_row_update(row_id, payload)
+        return ("updated", row_id)
+
+    # business-key fallback
+    candidates = find_existing_transfer_candidates(payload)
+    if candidates:
+        cand = candidates[0]
+        row_id = int(cand["id"])
+        if int(cand.get("FACTURE_ENVOYEE") or 0) == 1 and not force:
+            return ("locked", row_id)
+        payload["row_key"] = rk
+        apply_row_update(row_id, payload)
+        # supersede duplicates of same business key
+        dup_ids = [int(x["id"]) for x in candidates[1:]]
+        if dup_ids:
+            q = ",".join("?" for _ in dup_ids)
+            with get_connection() as conn:
+                conn.execute(f'UPDATE planning SET IS_SUPERSEDED=1 WHERE id IN ({q})', dup_ids)
+                conn.commit()
+        return ("updated", row_id)
+
+    rid = insert_planning_row(payload, ignore_conflict=False)
+    return ("inserted", rid if rid != -1 else None)
+
+def cleanup_duplicate_transfers_historical() -> int:
+    ensure_facture_envoyee_column()
+    ensure_surcharge_carburant_column()
+    query = """
+        SELECT id,
+               COALESCE(DATE_ISO,'') AS DATE_ISO,
+               UPPER(TRIM(COALESCE(HEURE,''))) AS HEURE,
+               UPPER(TRIM(COALESCE("Unnamed: 8",''))) AS SENS,
+               UPPER(TRIM(COALESCE(DESIGNATION,''))) AS DESIGNATION,
+               UPPER(TRIM(COALESCE("Num BDC", COALESCE("NUM BDC",'')))) AS NUMBDC,
+               UPPER(TRIM(COALESCE(NOM,''))) AS NOM,
+               UPPER(TRIM(COALESCE(ADRESSE,''))) AS ADRESSE,
+               UPPER(TRIM(COALESCE(CP,''))) AS CP,
+               UPPER(TRIM(COALESCE("Localité", COALESCE("LOCALITE",'')))) AS LOCALITE,
+               COALESCE(FACTURE_ENVOYEE,0) AS FACTURE_ENVOYEE,
+               COALESCE(SURCHARGE_CARBURANT,0) AS SURCHARGE_CARBURANT,
+               COALESCE(updated_at,'') AS updated_at
+        FROM planning
+        WHERE COALESCE(IS_SUPERSEDED,0)=0
+    """
+    with get_connection() as conn:
+        df = pd.read_sql_query(query, conn)
+    if df.empty:
+        return 0
+
+    group_cols = ["DATE_ISO","HEURE","SENS","DESIGNATION","NUMBDC","NOM","ADRESSE","CP","LOCALITE"]
+    cleaned = 0
+    to_supersede = []
+    for _, grp in df.groupby(group_cols, dropna=False):
+        if len(grp) <= 1:
+            continue
+        grp = grp.copy()
+        grp["_prio_fact"] = grp["FACTURE_ENVOYEE"].fillna(0).astype(int)
+        grp["_prio_sur"] = (pd.to_numeric(grp["SURCHARGE_CARBURANT"], errors="coerce").fillna(0) > 0).astype(int)
+        grp = grp.sort_values(["_prio_fact","_prio_sur","updated_at","id"], ascending=[False,False,False,False])
+        keep_id = int(grp.iloc[0]["id"])
+        drop_ids = [int(x) for x in grp["id"].tolist()[1:]]
+        # merge best values into keeper
+        patch = {}
+        try:
+            best_sur = pd.to_numeric(grp["SURCHARGE_CARBURANT"], errors="coerce").fillna(0).max()
+            if best_sur > 0:
+                patch["SURCHARGE_CARBURANT"] = float(best_sur)
+        except Exception:
+            pass
+        if int(grp["FACTURE_ENVOYEE"].fillna(0).max()) == 1:
+            patch["FACTURE_ENVOYEE"] = 1
+        if patch:
+            apply_row_update(keep_id, patch)
+        to_supersede.extend(drop_ids)
+        cleaned += len(drop_ids)
+
+    if to_supersede:
+        q = ",".join("?" for _ in to_supersede)
+        with get_connection() as conn:
+            conn.execute(f'UPDATE planning SET IS_SUPERSEDED=1 WHERE id IN ({q})', to_supersede)
+            conn.commit()
+    return int(cleaned)

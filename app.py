@@ -11090,7 +11090,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    pass  # déplacé en fin de fichier pour que les overrides soient déjà définis
 
 import base64
 
@@ -11130,4 +11130,615 @@ def build_printable_html(df):
     </html>
     """
 
+
+
+
+# ============================================================
+#   PATCH DB RESET + REBUILD HISTORIQUE EXACT (OpenAI)
+# ============================================================
+def _clienthub_norm_iso(val):
+    import pandas as pd
+    from datetime import date, datetime
+
+    try:
+        if pd.isna(val):
+            return None
+    except Exception:
+        pass
+
+    if val is None:
+        return None
+
+    if isinstance(val, (datetime, date)):
+        try:
+            if pd.isna(val):
+                return None
+        except Exception:
+            pass
+        try:
+            return val.strftime("%Y-%m-%d")
+        except Exception:
+            return None
+
+    s = str(val).strip()
+    if not s or s.lower() in {"nat", "nan", "none"}:
+        return None
+
+    try:
+        dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
+        if pd.isna(dt):
+            return None
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+def _clienthub_load_dates_carburant_map():
+    import pandas as pd
+    from io import BytesIO
+    from utils import get_dropbox_excel_cached
+    content = get_dropbox_excel_cached()
+    if not content:
+        return {}
+    try:
+        df = pd.read_excel(BytesIO(content), sheet_name="dates carburant", header=None, engine="openpyxl")
+    except Exception:
+        return {}
+    out = {}
+    for _, row in df.iterrows():
+        d = _clienthub_norm_iso(row.iloc[0] if len(row) > 0 else None)
+        coef = row.iloc[2] if len(row) > 2 else None
+        if not d:
+            continue
+        try:
+            if pd.isna(coef):
+                continue
+        except Exception:
+            pass
+        try:
+            out[d] = float(coef)
+        except Exception:
+            continue
+    return out
+
+def _clienthub_to_float(v):
+    import pandas as pd
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    if v is None:
+        return None
+    s = str(v).replace(",", ".").strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def _clienthub_calc_surcharge(date_iso, km, h_tva, coef_map):
+    if not date_iso or date_iso < "2026-04-01":
+        return 0.0
+    coef = coef_map.get(date_iso)
+    if coef is None:
+        return 0.0
+    h = _clienthub_to_float(h_tva)
+    y = _clienthub_to_float(km)
+    if h in (47.5, 55.0):
+        return 2.0
+    if h in (115.0, 148.5):
+        return round(200.0 * float(coef), 2)
+    if y is None:
+        return 0.0
+    return round(float(y) * float(coef), 2)
+
+def _clienthub_read_excel_history_df():
+    import pandas as pd
+    from io import BytesIO
+    from datetime import date
+    import openpyxl
+
+    from utils import (
+        get_dropbox_excel_cached,
+        add_excel_color_flags_from_dropbox,
+        ensure_excel_row_key_column,
+        _cell_is_green,
+    )
+    from database import make_row_key_from_row
+
+    ensure_excel_row_key_column(
+        dropbox_path=DROPBOX_FILE_PATH,
+        sheet_name="Feuil1",
+        target_col_letter="ZX",
+    )
+
+    content = get_dropbox_excel_cached()
+    if not content:
+        return pd.DataFrame()
+
+    raw0 = pd.read_excel(
+        BytesIO(content),
+        sheet_name="Feuil1",
+        header=None,
+        engine="openpyxl",
+    )
+
+    if raw0 is None or raw0.empty:
+        return pd.DataFrame()
+
+    header_row = None
+    for i in range(min(10, len(raw0))):
+        vals = raw0.iloc[i].astype(str).str.strip().str.upper().tolist()
+        if "DATE" in vals and "HEURE" in vals:
+            header_row = i
+            break
+
+    if header_row is None:
+        return pd.DataFrame()
+
+    raw = pd.read_excel(
+        BytesIO(content),
+        sheet_name="Feuil1",
+        header=header_row,
+        engine="openpyxl",
+    )
+
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    raw = raw.fillna("").copy()
+
+    if "DATE" not in raw.columns:
+        return pd.DataFrame()
+
+    # ✅ garde la vraie position Excel avant filtres pour relire ZX / couleurs sans décalage
+    raw["_EXCEL_ROW"] = [(header_row + 2) + i for i in range(len(raw))]
+
+    raw = add_excel_color_flags_from_dropbox(raw, "Feuil1")
+
+    raw["DATE_ISO"] = raw["DATE"].apply(_clienthub_norm_iso)
+    raw = raw[raw["DATE_ISO"].notna()].copy()
+
+    today_iso = date.today().strftime("%Y-%m-%d")
+    raw = raw[raw["DATE_ISO"] <= today_iso].copy()
+
+    if "row_key" not in raw.columns:
+        raw["row_key"] = ""
+
+    try:
+        wb = openpyxl.load_workbook(BytesIO(content), data_only=False)
+        ws = wb["Feuil1"]
+        for idx in raw.index:
+            excel_row = int(raw.at[idx, "_EXCEL_ROW"])
+            rk = ws[f"ZX{excel_row}"].value
+            if rk:
+                raw.at[idx, "row_key"] = str(rk).strip()
+    except Exception:
+        pass
+
+    raw["row_key"] = raw.apply(
+        lambda r: str(r.get("row_key") or "").strip() or make_row_key_from_row(r.to_dict()),
+        axis=1,
+    )
+
+    try:
+        wb2 = openpyxl.load_workbook(BytesIO(content), data_only=False)
+        ws2 = wb2["Feuil1"]
+
+        col_p = 16
+        col_q = 17
+        fact_map = {}
+        yellow_map = {}
+
+        date_col_idx = None
+        heure_col_idx = None
+        try:
+            headers_upper = [str(c).strip().upper() for c in list(raw.columns)]
+            if "DATE" in headers_upper:
+                date_col_idx = headers_upper.index("DATE") + 1
+            if "HEURE" in headers_upper:
+                heure_col_idx = headers_upper.index("HEURE") + 1
+        except Exception:
+            date_col_idx = None
+            heure_col_idx = None
+
+        for idx in raw.index:
+            excel_row = int(raw.at[idx, "_EXCEL_ROW"])
+            cp = ws2.cell(excel_row, col_p)
+            cq = ws2.cell(excel_row, col_q)
+            fact_map[idx] = 1 if _cell_is_green(cp) and _cell_is_green(cq) else 0
+
+            dy = False
+            hy = False
+            try:
+                if date_col_idx:
+                    dy = _cell_is_yellow(ws2.cell(excel_row, date_col_idx))
+                if heure_col_idx:
+                    hy = _cell_is_yellow(ws2.cell(excel_row, heure_col_idx))
+            except Exception:
+                dy = False
+                hy = False
+            yellow_map[idx] = 1 if (dy or hy) else 0
+
+        raw["FACTURE_ENVOYEE"] = raw.index.to_series().map(fact_map).fillna(0).astype(int)
+        raw["DATE_HEURE_YELLOW"] = raw.index.to_series().map(yellow_map).fillna(0).astype(int)
+    except Exception:
+        raw["FACTURE_ENVOYEE"] = 0
+        raw["DATE_HEURE_YELLOW"] = 0
+
+    coef_map = _clienthub_load_dates_carburant_map()
+    raw["SURCHARGE_CARBURANT"] = raw.apply(
+        lambda r: _clienthub_calc_surcharge(
+            str(r.get("DATE_ISO") or ""),
+            r.get("KM"),
+            r.get("H TVA") if "H TVA" in raw.columns else r.get("HTVA"),
+            coef_map,
+        ),
+        axis=1,
+    )
+
+    # ✅ supprime les doublons métier : on garde en priorité la ligne colorée / la plus complète
+    dedup_cols = ["DATE_ISO", "HEURE", "Unnamed: 8", "DESIGNATION", "GO", "Num BDC", "NOM", "ADRESSE", "CP", "Localité"]
+    for c in dedup_cols:
+        if c not in raw.columns:
+            raw[c] = ""
+        raw[c] = raw[c].fillna("").astype(str).str.strip()
+
+    # score = priorité à la ligne facture envoyée, puis à celle qui contient le plus d'infos
+    info_cols = [c for c in ["GO", "Num BDC", "NOM", "ADRESSE", "CP", "Localité", "PAIEMENT", "Caisse", "KM", "H TVA", "HTVA", "REMARQUE", "DEMANDEUR", "IMPUTATION"] if c in raw.columns]
+    raw["_INFO_SCORE"] = raw[info_cols].apply(
+        lambda s: sum(1 for v in s if str(v or "").strip() not in {"", "0", "0.0", "nan", "None"}),
+        axis=1,
+    ) if info_cols else 0
+
+    raw = raw.sort_values(
+        by=["FACTURE_ENVOYEE", "_INFO_SCORE", "_EXCEL_ROW"],
+        ascending=[True, True, True],
+        kind="stable",
+    )
+    raw = raw.drop_duplicates(subset=dedup_cols, keep="last").copy()
+
+    raw = raw.drop(columns=["_INFO_SCORE"], errors="ignore")
+    return raw
+
+def clienthub_reset_and_rebuild_db(force=False):
+    import pandas as pd
+    from datetime import datetime
+    from database import ensure_planning_row_key_column, ensure_planning_row_key_index, ensure_surcharge_carburant_column, make_row_key_from_row
+    ensure_planning_row_key_column()
+    ensure_planning_row_key_index()
+    ensure_surcharge_carburant_column()
+    with get_connection() as conn:
+        cols_now = [r[1] for r in conn.execute("PRAGMA table_info(planning)").fetchall()]
+        if "DATE_HEURE_YELLOW" not in cols_now:
+            conn.execute('ALTER TABLE planning ADD COLUMN "DATE_HEURE_YELLOW" INTEGER DEFAULT 0')
+            conn.commit()
+    df = _clienthub_read_excel_history_df()
+    if df is None or df.empty:
+        return 0
+
+    with get_connection() as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(planning)").fetchall()]
+        # reset complet demandé pour repartir propre
+        conn.execute("DELETE FROM planning")
+        conn.commit()
+        now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        inserted = 0
+        for _, row in df.iterrows():
+            data = {}
+            for c in cols:
+                if c == "id":
+                    continue
+                if c in row.index:
+                    data[c] = sqlite_safe(row.get(c))
+            data["row_key"] = str(row.get("row_key") or "").strip() or make_row_key_from_row(row.to_dict())
+            data["DATE_ISO"] = str(row.get("DATE_ISO") or "")
+            # format DATE affichage dd/mm/YYYY
+            try:
+                data["DATE"] = pd.to_datetime(data["DATE_ISO"]).strftime("%d/%m/%Y")
+            except Exception:
+                pass
+            data["FACTURE_ENVOYEE"] = int(row.get("FACTURE_ENVOYEE") or 0)
+            data["SURCHARGE_CARBURANT"] = float(row.get("SURCHARGE_CARBURANT") or 0.0)
+            data["updated_at"] = now_iso
+            # insert direct
+            cols_sql = ",".join(f'"{k}"' for k in data.keys())
+            q = ",".join("?" for _ in data)
+            conn.execute(f"INSERT OR REPLACE INTO planning ({cols_sql}) VALUES ({q})", [sqlite_safe(v) for v in data.values()])
+            inserted += 1
+        conn.commit()
+    try:
+        rebuild_planning_views()
+    except Exception:
+        pass
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+    return inserted
+
+def _clienthub_style_facture(df):
+    try:
+        import pandas as pd
+        if df is None or df.empty:
+            return df
+        def _style_row(row):
+            styles = [''] * len(row)
+            idx_map = {col: i for i, col in enumerate(row.index)}
+            if int(row.get("FACTURE_ENVOYEE", 0) or 0) == 1:
+                for col in ["Num BDC", "NOM"]:
+                    if col in idx_map:
+                        styles[idx_map[col]] = "background-color: #d9ead3; font-weight: 700;"
+            if int(row.get("DATE_HEURE_YELLOW", 0) or 0) == 1:
+                for col in ["DATE", "HEURE"]:
+                    if col in idx_map:
+                        base = styles[idx_map[col]]
+                        styles[idx_map[col]] = (base + " " if base else "") + "background-color: #fff2cc; font-weight: 700;"
+            return styles
+        return df.style.apply(_style_row, axis=1)
+    except Exception:
+        return df
+
+def _clienthub_export_pdf_exact(df, title_txt):
+    from io import BytesIO
+    import pandas as pd
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.units import cm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+    def _to_float(v):
+        try:
+            if pd.isna(v):
+                return 0.0
+        except Exception:
+            pass
+        try:
+            return float(str(v).replace(',', '.').strip())
+        except Exception:
+            return 0.0
+
+    pdf_df = df.copy().fillna("") if df is not None else pd.DataFrame()
+    show_cols = [col for col in pdf_df.columns if col not in ["FACTURE_ENVOYEE", "DATE_HEURE_YELLOW"]]
+    compact_cols = [
+        "DATE", "HEURE", "Unnamed: 8", "DESIGNATION", "GO", "Num BDC", "NOM",
+        "CP", "Localité", "KM", "H TVA", "SURCHARGE_CARBURANT"
+    ]
+    display_cols = [c for c in compact_cols if c in show_cols] or show_cols[:12]
+
+    rename_map = {
+        "Unnamed: 8": "SENS",
+        "DESIGNATION": "DEST",
+        "Localité": "LOCALITÉ",
+        "H TVA": "PRIX OFFICIEL",
+    }
+    headers = [rename_map.get(c, c) for c in display_cols]
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=landscape(A4),
+        leftMargin=0.6 * cm,
+        rightMargin=0.6 * cm,
+        topMargin=0.7 * cm,
+        bottomMargin=0.7 * cm,
+    )
+    styles = getSampleStyleSheet()
+    story = [Paragraph(f"<b>{title_txt}</b>", styles["Title"]), Spacer(1, 0.25 * cm)]
+
+    main_data = [headers]
+    for _, row in pdf_df.iterrows():
+        main_data.append([str(row.get(col, "") or "")[:28] for col in display_cols])
+
+    available_w = doc.width
+    col_widths = []
+    for col in display_cols:
+        if col in {"DATE", "HEURE", "GO", "CP", "KM"}:
+            col_widths.append(1.45 * cm)
+        elif col in {"Unnamed: 8", "PAIEMENT"}:
+            col_widths.append(1.7 * cm)
+        elif col in {"H TVA", "SURCHARGE_CARBURANT", "Caisse", "PARKING", "ATTENTE", "PEAGE"}:
+            col_widths.append(2.0 * cm)
+        elif col in {"Num BDC"}:
+            col_widths.append(1.9 * cm)
+        elif col in {"NOM", "DESIGNATION", "Localité"}:
+            col_widths.append(2.6 * cm)
+        else:
+            col_widths.append(2.3 * cm)
+    total_w = sum(col_widths)
+    if total_w > available_w and total_w > 0:
+        ratio = available_w / total_w
+        col_widths = [w * ratio for w in col_widths]
+
+    table = Table(main_data, repeatRows=1, colWidths=col_widths)
+    style_cmds = [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#d9e2f3")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 6.2),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#9e9e9e")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7f7f7")]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]
+
+    date_idx = display_cols.index("DATE") if "DATE" in display_cols else None
+    heure_idx = display_cols.index("HEURE") if "HEURE" in display_cols else None
+    bdc_idx = display_cols.index("Num BDC") if "Num BDC" in display_cols else None
+    nom_idx = display_cols.index("NOM") if "NOM" in display_cols else None
+
+    for row_no, (_, row) in enumerate(pdf_df.iterrows(), start=1):
+        if int(row.get("FACTURE_ENVOYEE", 0) or 0) == 1:
+            for idx_col in [bdc_idx, nom_idx]:
+                if idx_col is not None:
+                    style_cmds.append(("BACKGROUND", (idx_col, row_no), (idx_col, row_no), colors.HexColor("#d9ead3")))
+                    style_cmds.append(("FONTNAME", (idx_col, row_no), (idx_col, row_no), "Helvetica-Bold"))
+        if int(row.get("DATE_HEURE_YELLOW", 0) or 0) == 1:
+            for idx_col in [date_idx, heure_idx]:
+                if idx_col is not None:
+                    style_cmds.append(("BACKGROUND", (idx_col, row_no), (idx_col, row_no), colors.HexColor("#fff2cc")))
+                    style_cmds.append(("FONTNAME", (idx_col, row_no), (idx_col, row_no), "Helvetica-Bold"))
+
+    table.setStyle(TableStyle(style_cmds))
+    story.append(table)
+    story.append(Spacer(1, 0.35 * cm))
+
+    total_km = round(sum(_to_float(v) for v in pdf_df.get("KM", pd.Series(dtype=float))), 2) if "KM" in pdf_df.columns else 0.0
+    total_official = round(sum(_to_float(v) for v in pdf_df.get("H TVA", pd.Series(dtype=float))), 2) if "H TVA" in pdf_df.columns else 0.0
+    total_surcharge = round(sum(_to_float(v) for v in pdf_df.get("SURCHARGE_CARBURANT", pd.Series(dtype=float))), 2) if "SURCHARGE_CARBURANT" in pdf_df.columns else 0.0
+    total_adjusted = round(total_official + total_surcharge, 2)
+    coef_moyen = round((total_surcharge / total_km), 4) if total_km > 0 else 0.0
+
+    story.append(Paragraph("<b>Calcul inflation / carburant</b>", styles["Heading4"]))
+    calc_data = [
+        ["Base diesel", "1.54 €/L"],
+        ["Prix officiel total", f"{total_official:.2f} €"],
+        ["Surcharge carburant totale", f"{total_surcharge:.2f} €"],
+        ["Total ajusté HTVA", f"{total_adjusted:.2f} €"],
+        ["KM total", f"{total_km:.2f} km"],
+        ["Coef moyen appliqué", f"{coef_moyen:.4f} €/km"],
+        ["Règle rappel", "Prix officiel + surcharge carburant"],
+    ]
+    calc_table = Table(calc_data, colWidths=[4.5 * cm, 4.2 * cm])
+    calc_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f4f4f4")),
+        ("BACKGROUND", (0, 2), (-1, 3), colors.HexColor("#fff2cc")),
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+        ("FONTNAME", (0, 2), (-1, 3), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#9e9e9e")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    story.append(calc_table)
+
+    doc.build(story)
+    return buf.getvalue()
+
+_old_render_tab_clients = render_tab_clients
+
+def render_tab_clients():
+    st.subheader("🔍 Clients / Historique")
+    role = str(st.session_state.get("role") or "").lower()
+    if role in {"admin", "restricted"}:
+        st.markdown("### 📑 Tableau client DB")
+        c1, c2, c3 = st.columns([1,1,1])
+        with c1:
+            if st.button("🗑️ Vider toute la DB planning", key="clienthub_reset_db"):
+                with get_connection() as conn:
+                    conn.execute("DELETE FROM planning")
+                    conn.commit()
+                try:
+                    rebuild_planning_views()
+                except Exception:
+                    pass
+                st.success("Base planning vidée.")
+        with c2:
+            if st.button("🚀 Recharger historique depuis Excel", key="clienthub_rebuild_db"):
+                n = clienthub_reset_and_rebuild_db()
+                st.success(f"Historique rechargé : {n} ligne(s).")
+        with c3:
+            st.caption("Repart sur une base propre : DB vidée puis rechargée depuis l'Excel jusqu'à aujourd'hui.")
+
+        df_full = get_planning(source="full", max_rows=50000)
+        if df_full is not None and not df_full.empty:
+            df_full = df_full.copy()
+            client_options = ["FNH","JC","BT","LEO","LBE","BUZON","KI","AC","AD","FA","LILLO"]
+            colf1, colf2, colf3 = st.columns([1,1,1])
+            with colf1:
+                client_label = st.selectbox("Client", client_options, key="clienthub_client")
+            with colf2:
+                d1 = st.date_input("Date début", value=date.today().replace(day=1), key="clienthub_d1")
+            with colf3:
+                d2 = st.date_input("Date fin", value=date.today(), key="clienthub_d2")
+
+            if "Num BDC" in df_full.columns:
+                if client_label in {"FA","AD","LILLO"}:
+                    pass
+                else:
+                    df_full = df_full[df_full["Num BDC"].fillna("").astype(str).str.upper().str.startswith(client_label)]
+            # exact date range
+            try:
+                df_full["DATE_FILT"] = pd.to_datetime(df_full["DATE"], dayfirst=True, errors="coerce").dt.date
+                df_full = df_full[(df_full["DATE_FILT"] >= d1) & (df_full["DATE_FILT"] <= d2)].copy()
+            except Exception:
+                pass
+
+            # chauffeur complementary views
+            if client_label == "FA" and "CH" in df_full.columns:
+                mask = df_full["CH"].fillna("").astype(str).str.upper().str.contains("FA|PO|RO", regex=True)
+                df_full = df_full[mask].copy()
+            elif client_label in {"AD","LILLO"} and "CH" in df_full.columns:
+                mask = df_full["CH"].fillna("").astype(str).str.upper().str.contains(client_label, regex=False)
+                df_full = df_full[mask].copy()
+
+            wanted = ["DATE","HEURE","Unnamed: 8","DESIGNATION","GO","Num BDC","NOM","ADRESSE","CP","Localité","PAIEMENT","Caisse","KM","H TVA","SURCHARGE_CARBURANT","PARKING","ATTENTE","PEAGE","ADM","REMARQUE","DEMANDEUR","IMPUTATION","FACTURE_ENVOYEE","DATE_HEURE_YELLOW"]
+            cols = [c for c in wanted if c in df_full.columns]
+            view = df_full[cols].copy().fillna("")
+            st.dataframe(_clienthub_style_facture(view), use_container_width=True, height=420)
+            pdf_bytes = _clienthub_export_pdf_exact(view, f"{client_label} du {d1.strftime('%d/%m/%Y')} au {d2.strftime('%d/%m/%Y')}")
+            st.download_button(
+                "📄 Télécharger PDF client",
+                data=pdf_bytes,
+                file_name=f"{client_label}_{d1.isoformat()}_{d2.isoformat()}.pdf",
+                mime="application/pdf",
+                key="clienthub_pdf_exact",
+                use_container_width=True,
+            )
+        else:
+            st.info("Aucune donnée en base. Recharge l'historique depuis Excel.")
+        st.markdown("---")
+    return _old_render_tab_clients()
+
+if __name__ == "__main__":
+    main()
+
+
+
+def normalize_real_km(val):
+    """
+    Règles KM :
+    - avant le 01/04/2026 : ignoré ailleurs via la date
+    - si format type "214/12" -> garder 214
+    - garder uniquement numérique > 0 et <= 999
+    - ignorer texte, dates, montants parasites, grosses valeurs
+    """
+    try:
+        if val is None:
+            return None
+
+        s = str(val).strip()
+        if not s:
+            return None
+
+        s = s.replace("€", "").replace("EUR", "").strip()
+
+        if "/" in s:
+            left = s.split("/", 1)[0].strip()
+            if left:
+                s = left
+
+        s = s.replace(",", ".").strip()
+
+        if not any(ch.isdigit() for ch in s):
+            return None
+
+        km = float(s)
+
+        if km <= 0:
+            return None
+        if km > 999:
+            return None
+
+        return int(km)
+
+    except Exception:
+        return None
 
