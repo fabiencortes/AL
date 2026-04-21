@@ -11200,6 +11200,55 @@ def _clienthub_load_dates_carburant_map():
             continue
     return out
 
+
+def normalize_real_km(val, date_iso=None):
+    """
+    Nettoie un KM Excel/app.
+    Règles :
+    - avant le 01/04/2026 : ignoré
+    - format "214/12" => 214
+    - garde uniquement une valeur numérique > 0 et <= 999
+    - ignore texte, dates, montants parasites, grosses valeurs
+    """
+    try:
+        if date_iso:
+            d = str(date_iso).strip()
+            if d and d < "2026-04-01":
+                return None
+    except Exception:
+        pass
+
+    try:
+        if val is None:
+            return None
+
+        s = str(val).strip()
+        if not s:
+            return None
+
+        s = s.replace("€", "").replace("EUR", "").strip()
+
+        if "/" in s:
+            left = s.split("/", 1)[0].strip()
+            if left:
+                s = left
+
+        s = s.replace(",", ".").strip()
+
+        if not any(ch.isdigit() for ch in s):
+            return None
+
+        km = float(s)
+
+        if km <= 0 or km > 999:
+            return None
+
+        return int(km) if float(km).is_integer() else float(km)
+
+    except Exception:
+        return None
+
+
 def _clienthub_to_float(v):
     import pandas as pd
     try:
@@ -11224,7 +11273,7 @@ def _clienthub_calc_surcharge(date_iso, km, h_tva, coef_map):
     if coef is None:
         return 0.0
     h = _clienthub_to_float(h_tva)
-    y = _clienthub_to_float(km)
+    y = normalize_real_km(km, date_iso=date_iso)
     if h in (47.5, 55.0):
         return 2.0
     if h in (115.0, 148.5):
@@ -11302,6 +11351,12 @@ def _clienthub_read_excel_history_df():
 
     today_iso = date.today().strftime("%Y-%m-%d")
     raw = raw[raw["DATE_ISO"] <= today_iso].copy()
+
+    if "KM" in raw.columns:
+        raw["KM"] = raw.apply(
+            lambda r: normalize_real_km(r.get("KM"), date_iso=str(r.get("DATE_ISO") or "")),
+            axis=1,
+        )
 
     if "row_key" not in raw.columns:
         raw["row_key"] = ""
@@ -11406,25 +11461,34 @@ def clienthub_reset_and_rebuild_db(force=False):
     import pandas as pd
     from datetime import datetime
     from database import ensure_planning_row_key_column, ensure_planning_row_key_index, ensure_surcharge_carburant_column, make_row_key_from_row
+
     ensure_planning_row_key_column()
     ensure_planning_row_key_index()
     ensure_surcharge_carburant_column()
+
     with get_connection() as conn:
         cols_now = [r[1] for r in conn.execute("PRAGMA table_info(planning)").fetchall()]
         if "DATE_HEURE_YELLOW" not in cols_now:
             conn.execute('ALTER TABLE planning ADD COLUMN "DATE_HEURE_YELLOW" INTEGER DEFAULT 0')
-            conn.commit()
+        if "FACTURE_ENVOYEE" not in cols_now:
+            conn.execute('ALTER TABLE planning ADD COLUMN "FACTURE_ENVOYEE" INTEGER DEFAULT 0')
+        if "updated_at" not in cols_now:
+            conn.execute('ALTER TABLE planning ADD COLUMN "updated_at" TEXT')
+        if "SURCHARGE_CARBURANT" not in cols_now:
+            conn.execute('ALTER TABLE planning ADD COLUMN "SURCHARGE_CARBURANT" REAL DEFAULT 0')
+        conn.commit()
+
     df = _clienthub_read_excel_history_df()
     if df is None or df.empty:
         return 0
 
     with get_connection() as conn:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(planning)").fetchall()]
-        # reset complet demandé pour repartir propre
         conn.execute("DELETE FROM planning")
         conn.commit()
         now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         inserted = 0
+
         for _, row in df.iterrows():
             data = {}
             for c in cols:
@@ -11432,22 +11496,43 @@ def clienthub_reset_and_rebuild_db(force=False):
                     continue
                 if c in row.index:
                     data[c] = sqlite_safe(row.get(c))
+
             data["row_key"] = str(row.get("row_key") or "").strip() or make_row_key_from_row(row.to_dict())
             data["DATE_ISO"] = str(row.get("DATE_ISO") or "")
-            # format DATE affichage dd/mm/YYYY
+
             try:
                 data["DATE"] = pd.to_datetime(data["DATE_ISO"]).strftime("%d/%m/%Y")
             except Exception:
                 pass
-            data["FACTURE_ENVOYEE"] = int(row.get("FACTURE_ENVOYEE") or 0)
-            data["SURCHARGE_CARBURANT"] = float(row.get("SURCHARGE_CARBURANT") or 0.0)
-            data["updated_at"] = now_iso
-            # insert direct
+
+            if "KM" in cols:
+                data["KM"] = normalize_real_km(row.get("KM"), date_iso=data.get("DATE_ISO"))
+
+            if "FACTURE_ENVOYEE" in cols:
+                try:
+                    data["FACTURE_ENVOYEE"] = int(row.get("FACTURE_ENVOYEE") or 0)
+                except Exception:
+                    data["FACTURE_ENVOYEE"] = 0
+
+            if "SURCHARGE_CARBURANT" in cols:
+                try:
+                    data["SURCHARGE_CARBURANT"] = float(row.get("SURCHARGE_CARBURANT") or 0.0)
+                except Exception:
+                    data["SURCHARGE_CARBURANT"] = 0.0
+
+            if "updated_at" in cols:
+                data["updated_at"] = now_iso
+
             cols_sql = ",".join(f'"{k}"' for k in data.keys())
             q = ",".join("?" for _ in data)
-            conn.execute(f"INSERT OR REPLACE INTO planning ({cols_sql}) VALUES ({q})", [sqlite_safe(v) for v in data.values()])
+            conn.execute(
+                f"INSERT OR REPLACE INTO planning ({cols_sql}) VALUES ({q})",
+                [sqlite_safe(v) for v in data.values()],
+            )
             inserted += 1
+
         conn.commit()
+
     try:
         rebuild_planning_views()
     except Exception:
@@ -11501,7 +11586,27 @@ def _clienthub_export_pdf_exact(df, title_txt):
             return 0.0
 
     pdf_df = df.copy().fillna("") if df is not None else pd.DataFrame()
-    show_cols = [col for col in pdf_df.columns if col not in ["FACTURE_ENVOYEE", "DATE_HEURE_YELLOW"]]
+
+    if not pdf_df.empty:
+        if "DATE_ISO" not in pdf_df.columns and "DATE" in pdf_df.columns:
+            try:
+                pdf_df["DATE_ISO"] = pd.to_datetime(pdf_df["DATE"], dayfirst=True, errors="coerce").dt.strftime("%Y-%m-%d")
+            except Exception:
+                pdf_df["DATE_ISO"] = ""
+
+        if "KM" in pdf_df.columns:
+            pdf_df["KM"] = pdf_df.apply(
+                lambda r: normalize_real_km(r.get("KM"), date_iso=str(r.get("DATE_ISO") or "")),
+                axis=1,
+            )
+
+        if "SURCHARGE_CARBURANT" in pdf_df.columns:
+            try:
+                pdf_df["SURCHARGE_CARBURANT"] = pd.to_numeric(pdf_df["SURCHARGE_CARBURANT"], errors="coerce").fillna(0.0)
+            except Exception:
+                pass
+
+    show_cols = [col for col in pdf_df.columns if col not in ["FACTURE_ENVOYEE", "DATE_HEURE_YELLOW", "DATE_ISO"]]
     compact_cols = [
         "DATE", "HEURE", "Unnamed: 8", "DESIGNATION", "GO", "Num BDC", "NOM",
         "CP", "Localité", "KM", "H TVA", "SURCHARGE_CARBURANT"
@@ -11530,7 +11635,13 @@ def _clienthub_export_pdf_exact(df, title_txt):
 
     main_data = [headers]
     for _, row in pdf_df.iterrows():
-        main_data.append([str(row.get(col, "") or "")[:28] for col in display_cols])
+        row_vals = []
+        for col in display_cols:
+            val = row.get(col, "")
+            if col == "KM":
+                val = "" if val in (None, "") else val
+            row_vals.append(str(val or "")[:28])
+        main_data.append(row_vals)
 
     available_w = doc.width
     col_widths = []
@@ -11682,6 +11793,17 @@ def render_tab_clients():
             wanted = ["DATE","HEURE","Unnamed: 8","DESIGNATION","GO","Num BDC","NOM","ADRESSE","CP","Localité","PAIEMENT","Caisse","KM","H TVA","SURCHARGE_CARBURANT","PARKING","ATTENTE","PEAGE","ADM","REMARQUE","DEMANDEUR","IMPUTATION","FACTURE_ENVOYEE","DATE_HEURE_YELLOW"]
             cols = [c for c in wanted if c in df_full.columns]
             view = df_full[cols].copy().fillna("")
+            if "KM" in view.columns:
+                date_series = None
+                if "DATE" in view.columns:
+                    try:
+                        date_series = pd.to_datetime(view["DATE"], dayfirst=True, errors="coerce").dt.strftime("%Y-%m-%d")
+                    except Exception:
+                        date_series = None
+                if date_series is not None:
+                    view["KM"] = [normalize_real_km(km, date_iso=di) for km, di in zip(view["KM"], date_series)]
+                else:
+                    view["KM"] = view["KM"].apply(normalize_real_km)
             st.dataframe(_clienthub_style_facture(view), use_container_width=True, height=420)
             pdf_bytes = _clienthub_export_pdf_exact(view, f"{client_label} du {d1.strftime('%d/%m/%Y')} au {d2.strftime('%d/%m/%Y')}")
             st.download_button(
