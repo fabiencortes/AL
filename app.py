@@ -1029,28 +1029,21 @@ def login_screen():
 
             # ✅ Force un client_id stable pour cet appareil
             cid = str(get_client_id() or "").strip()
+            remember_me_effective = True if str(user.get("role") or "").strip().lower() == "driver" else bool(remember_me)
 
             st.session_state.logged_in = True
             st.session_state.username = login_norm
             st.session_state.role = user["role"]
             st.session_state.chauffeur_code = user.get("chauffeur_code")
             st.session_state.session_token = token
-            st.session_state.remember_me = bool(remember_me)
+            st.session_state.remember_me = bool(remember_me_effective)
             st.session_state["_persist_state_saved"] = False
 
-            if remember_me:
-                # ✅ 1) Sauvegarde serveur PAR APPAREIL (anti-mix)
+            if remember_me_effective:
                 save_persistent_session(login_norm, token, True)
-
-                # ✅ 2) Sauvegarde locale APP Streamlit : cookie + localStorage uniquement
-                # (important: pas de query params pour éviter les sessions qui se mélangent)
                 set_login_cookie(f"{login_norm}|{token}")
-
-                # ✅ 3) Optionnel (fortement recommandé) : marquer l'appareil comme associé à ce login
-                # (sert à refuser un restore si l'appareil essaie de reprendre un autre chauffeur)
                 st.session_state["device_bound_login"] = login_norm
                 st.session_state["device_bound_cid"] = cid
-
             else:
                 clear_persistent_session()
                 clear_login_cookie()
@@ -1657,6 +1650,288 @@ def normalize_ch_code(ch_raw: str) -> str:
     return code
 
 
+
+
+
+def _excel_cell_is_green_real(cell) -> bool:
+    try:
+        fill = getattr(cell, "fill", None)
+        if fill is None or fill.patternType is None:
+            return False
+        fg = getattr(fill, "fgColor", None)
+        if fg is None:
+            return False
+        if getattr(fg, "type", None) == "rgb" and getattr(fg, "rgb", None):
+            rgb = str(fg.rgb).upper()
+            return rgb.endswith("00B050") or rgb.endswith("92D050") or rgb.endswith("C6EFCE") or rgb.endswith("00FF00") or rgb in {"FF00B050", "FF92D050", "FFC6EFCE", "FF00FF00"}
+        if getattr(fg, "type", None) == "indexed":
+            return fg.indexed in {3, 4, 10, 17, 35, 43, 50}
+        if getattr(fg, "type", None) == "theme":
+            try:
+                tint = float(getattr(fg, "tint", 0) or 0)
+            except Exception:
+                tint = 0
+            return True if tint <= 0.4 else False
+    except Exception:
+        return False
+    return False
+
+
+def _normalize_name_for_match(val: str) -> str:
+    import unicodedata, re as _re
+    s = str(val or "").strip().upper()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = _re.sub(r"\s+", " ", s)
+    return s
+
+
+def _planning_ch_norm(v: str) -> str:
+    return normalize_ch_code(str(v or "").upper().replace(" ", "").replace("*", "").strip())
+
+
+def sync_caisse_paid_from_excel_history(start_date=None, end_date=None) -> int:
+    import pandas as pd
+    from io import BytesIO
+    from openpyxl import load_workbook
+    from datetime import datetime, date
+
+    def _norm_date_iso(val):
+        try:
+            return _clienthub_norm_iso(val)
+        except Exception:
+            pass
+        if val is None:
+            return None
+        try:
+            dt = pd.to_datetime(val, dayfirst=True, errors="coerce")
+            if pd.isna(dt):
+                return None
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            return None
+
+    def _norm_amount(v):
+        try:
+            if v is None:
+                return 0.0
+            s = str(v).strip().replace("€", "").replace("EUR", "").replace(" ", "")
+            s = s.replace(",", ".")
+            return round(float(s), 2)
+        except Exception:
+            return 0.0
+
+    try:
+        content = download_dropbox_excel_bytes()
+        if not content:
+            return 0
+        wb = load_workbook(BytesIO(content), data_only=True, keep_vba=True)
+        if "Feuil1" not in wb.sheetnames:
+            return 0
+        ws = wb["Feuil1"]
+
+        header_row = None
+        headers = {}
+        for i in range(1, min(15, ws.max_row) + 1):
+            row_map = {}
+            vals = []
+            for c in range(1, min(80, ws.max_column) + 1):
+                v = ws.cell(row=i, column=c).value
+                s = str(v or "").strip()
+                vals.append(s.upper())
+                if s:
+                    row_map[s.upper()] = c
+            if "DATE" in vals and "HEURE" in vals:
+                header_row = i
+                headers = row_map
+                break
+        if not header_row:
+            return 0
+
+        c_date = headers.get("DATE")
+        c_heure = headers.get("HEURE")
+        c_ch = headers.get("CH")
+        c_nom = headers.get("NOM")
+        c_paiement = headers.get("PAIEMENT") or headers.get("PAIEME")
+        c_caisse = headers.get("CAISSE")
+        if not all([c_date, c_ch, c_paiement, c_caisse]):
+            return 0
+
+        s1 = pd.to_datetime(start_date, errors="coerce") if start_date is not None else None
+        s2 = pd.to_datetime(end_date, errors="coerce") if end_date is not None else None
+        start_iso = None if pd.isna(s1) else s1.strftime("%Y-%m-%d")
+        end_iso = None if pd.isna(s2) else s2.strftime("%Y-%m-%d")
+
+        excel_rows = []
+        for r in range(header_row + 1, ws.max_row + 1):
+            date_iso = _norm_date_iso(ws.cell(r, c_date).value)
+            if not date_iso:
+                continue
+            if start_iso and date_iso < start_iso:
+                continue
+            if end_iso and date_iso > end_iso:
+                continue
+            paiement = str(ws.cell(r, c_paiement).value or "").strip().lower()
+            if paiement != "caisse":
+                continue
+            amount = _norm_amount(ws.cell(r, c_caisse).value)
+            if amount <= 0:
+                continue
+            if not _excel_cell_is_green_real(ws.cell(r, c_caisse)):
+                continue
+            excel_rows.append({
+                "date_iso": date_iso,
+                "heure": normalize_time_string(ws.cell(r, c_heure).value) if c_heure else "",
+                "ch": _planning_ch_norm(ws.cell(r, c_ch).value if c_ch else ""),
+                "nom": _normalize_name_for_match(ws.cell(r, c_nom).value if c_nom else ""),
+                "amount": amount,
+                "rownum": r,
+            })
+
+        if not excel_rows:
+            return 0
+
+        with get_connection() as conn:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(planning)").fetchall()]
+            if "CAISSE_PAYEE" not in cols:
+                conn.execute('ALTER TABLE planning ADD COLUMN "CAISSE_PAYEE" INTEGER DEFAULT 0')
+            if "CAISSE_PAYEE_AT" not in cols:
+                conn.execute('ALTER TABLE planning ADD COLUMN "CAISSE_PAYEE_AT" TEXT')
+            if "CAISSE_COMMENT" not in cols:
+                conn.execute('ALTER TABLE planning ADD COLUMN "CAISSE_COMMENT" TEXT')
+            conn.commit()
+
+            db = pd.read_sql_query(
+                """
+                SELECT id, DATE_ISO, DATE, HEURE, CH, NOM, Caisse, PAIEMENT,
+                       COALESCE(CAISSE_PAYEE,0) AS CAISSE_PAYEE,
+                       COALESCE(IS_INDISPO,0) AS IS_INDISPO,
+                       COALESCE(IS_SUPERSEDED,0) AS IS_SUPERSEDED
+                FROM planning
+                WHERE COALESCE(IS_INDISPO,0)=0
+                  AND COALESCE(IS_SUPERSEDED,0)=0
+                  AND LOWER(COALESCE(PAIEMENT,''))='caisse'
+                  AND COALESCE(CAISSE_PAYEE,0)=0
+                  AND COALESCE(DATE_ISO,'') >= ?
+                  AND COALESCE(DATE_ISO,'') <= ?
+                """,
+                conn,
+                params=(start_iso or '1900-01-01', end_iso or '2999-12-31')
+            )
+            if db.empty:
+                return 0
+            db["CH_NORM"] = db.get("CH", "").map(_planning_ch_norm)
+            db["NOM_NORM"] = db.get("NOM", "").map(_normalize_name_for_match)
+            db["HEURE_NORM"] = db.get("HEURE", "").map(normalize_time_string)
+            db["CAISSE_NUM"] = pd.to_numeric(db.get("Caisse", 0), errors="coerce").fillna(0.0).round(2)
+            db["DATE_ISO"] = db["DATE_ISO"].astype(str)
+
+            used_ids = set()
+            matched_ids = []
+            for ex in excel_rows:
+                cand = db[(db["DATE_ISO"] == ex["date_iso"]) & (db["CH_NORM"] == ex["ch"]) & ((db["CAISSE_NUM"] - ex["amount"]).abs() < 0.01)].copy()
+                if cand.empty:
+                    continue
+                cand = cand[~cand["id"].isin(used_ids)].copy()
+                if cand.empty:
+                    continue
+                cand["score"] = 0
+                if ex["nom"]:
+                    cand.loc[cand["NOM_NORM"] == ex["nom"], "score"] += 10
+                if ex["heure"]:
+                    cand.loc[cand["HEURE_NORM"] == ex["heure"], "score"] += 5
+                cand["delta_heure"] = 9999
+                if ex["heure"]:
+                    def _to_min(t):
+                        try:
+                            hh, mm = str(t).split(":", 1)
+                            return int(hh) * 60 + int(mm)
+                        except Exception:
+                            return None
+                    exm = _to_min(ex["heure"])
+                    if exm is not None:
+                        vals = []
+                        for t in cand["HEURE_NORM"].tolist():
+                            tm = _to_min(t)
+                            vals.append(abs(tm - exm) if tm is not None else 9999)
+                        cand["delta_heure"] = vals
+                cand = cand.sort_values(["score", "delta_heure", "id"], ascending=[False, True, True])
+                best_id = int(cand.iloc[0]["id"])
+                used_ids.add(best_id)
+                matched_ids.append(best_id)
+
+            if not matched_ids:
+                return 0
+
+            now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            q = ",".join(["?"] * len(matched_ids))
+            sql = f"UPDATE planning SET CAISSE_PAYEE = 1, CAISSE_PAYEE_AT = COALESCE(CAISSE_PAYEE_AT, ?), CAISSE_COMMENT = CASE WHEN COALESCE(CAISSE_COMMENT,'')='' THEN 'Payée détectée depuis Excel (vert réel)' ELSE CAISSE_COMMENT END WHERE id IN ({q})"
+            conn.execute(sql, [now_iso] + matched_ids)
+            conn.commit()
+            return len(matched_ids)
+    except Exception as e:
+        print(f"⚠️ sync_caisse_paid_from_excel_history error: {e}", flush=True)
+        return 0
+
+
+def render_tab_driver_complement_history(ch_selected: str):
+    import pandas as pd
+    from datetime import date, timedelta
+
+    ch_selected = str(ch_selected or "").strip().upper()
+    st.markdown(f"### 📚 Complément chauffeur — {ch_selected}")
+    st.caption("Historique des 15 derniers jours avec surcharge carburant à jour.")
+
+    d_end = date.today()
+    d_start = d_end - timedelta(days=15)
+
+    df_hist = get_planning(
+        start_date=d_start,
+        end_date=d_end,
+        chauffeur=ch_selected,
+        type_filter=None,
+        search="",
+        max_rows=20000,
+        source="full",
+    )
+
+    if df_hist is None or df_hist.empty:
+        st.info("Aucun transfert trouvé sur les 15 derniers jours.")
+        return
+
+    if "IS_INDISPO" in df_hist.columns:
+        df_hist = df_hist[df_hist["IS_INDISPO"].fillna(0).astype(int) == 0].copy()
+    if "IS_SUPERSEDED" in df_hist.columns:
+        df_hist = df_hist[df_hist["IS_SUPERSEDED"].fillna(0).astype(int) == 0].copy()
+
+    ch_series = df_hist.get("CH", pd.Series("", index=df_hist.index)).fillna("").astype(str).str.upper().str.strip()
+    ch_norm = normalize_ch_code(ch_selected)
+    mask = (
+        (ch_series == ch_selected)
+        | (ch_series == f"{ch_selected}*")
+        | (ch_series.str.replace("*", "", regex=False).str.replace(" ", "", regex=False).str.startswith(ch_norm))
+    )
+    df_hist = _sort_df_by_date_heure(df_hist[mask].copy())
+
+    if df_hist.empty:
+        st.info("Aucun transfert trouvé sur les 15 derniers jours.")
+        return
+
+    cols = ["DATE","HEURE","CH","Unnamed: 8","DESIGNATION","GO","Num BDC","NOM","ADRESSE","CP","Localité","PAIEMENT","Caisse","KM","H TVA"]
+    cols = add_surcharge_column_if_allowed(cols)
+    for c in cols:
+        if c not in df_hist.columns:
+            df_hist[c] = ""
+    df_show = df_hist[cols].copy()
+
+    if "SURCHARGE_CARBURANT" in df_show.columns:
+        try:
+            sur = pd.to_numeric(df_show["SURCHARGE_CARBURANT"], errors="coerce").fillna(0.0)
+            st.metric("⛽ Total surcharge (15 jours)", f"{sur.sum():.2f} €")
+        except Exception:
+            pass
+
+    st.dataframe(df_show, use_container_width=True, height=520)
 
 def render_excel_modified_indicator():
     """Affiche un indicateur 'Excel modifié depuis X min' (source Dropbox)."""
@@ -10471,14 +10746,19 @@ def render_tab_calcul_heures():
 
                 render_excel_modified_indicator()
 
-                if st.button("🔄 Rafraîchir la caisse depuis Excel"):
-                        request_soft_refresh("caisse")
-
                 # ----------------- Période -----------------
                 today = date.today()
                 d1 = today - timedelta(days=60)
                 if d1 < date(2026, 1, 1):
                         d1 = date(2026, 1, 1)
+
+                if st.button("🔄 Rafraîchir la caisse depuis Excel"):
+                        n_sync_caisse = sync_caisse_paid_from_excel_history(start_date=d1, end_date=today)
+                        if n_sync_caisse > 0:
+                                st.success(f"✅ {n_sync_caisse} ligne(s) caisse marquée(s) payée(s) depuis Excel")
+                        else:
+                                st.info("Aucune nouvelle caisse payée détectée dans Excel.")
+                        request_soft_refresh("caisse")
 
                 # ----------------- Chauffeur -----------------
                 chs = get_chauffeurs_for_ui()
@@ -11078,11 +11358,21 @@ def main():
             st.error("Aucun code chauffeur configuré.")
             return
 
-        tab1, tab2 = st.tabs(["🚖 Mon planning", "🚫 Mes indispos"])
-        with tab1:
-            render_tab_chauffeur_driver()
-        with tab2:
-            render_tab_indispo_driver(ch_code)
+        ch_norm = str(ch_code or "").strip().upper()
+        if ch_norm in {"FA", "AD"}:
+            tab1, tab2, tab3 = st.tabs(["🚖 Mon planning", "📚 Complément 15 jours", "🚫 Mes indispos"])
+            with tab1:
+                render_tab_chauffeur_driver()
+            with tab2:
+                render_tab_driver_complement_history(ch_norm)
+            with tab3:
+                render_tab_indispo_driver(ch_code)
+        else:
+            tab1, tab2 = st.tabs(["🚖 Mon planning", "🚫 Mes indispos"])
+            with tab1:
+                render_tab_chauffeur_driver()
+            with tab2:
+                render_tab_indispo_driver(ch_code)
 
     # ==================== ERREUR ============================
     else:
@@ -11200,55 +11490,6 @@ def _clienthub_load_dates_carburant_map():
             continue
     return out
 
-
-def normalize_real_km(val, date_iso=None):
-    """
-    Nettoie un KM Excel/app.
-    Règles :
-    - avant le 01/04/2026 : ignoré
-    - format "214/12" => 214
-    - garde uniquement une valeur numérique > 0 et <= 999
-    - ignore texte, dates, montants parasites, grosses valeurs
-    """
-    try:
-        if date_iso:
-            d = str(date_iso).strip()
-            if d and d < "2026-04-01":
-                return None
-    except Exception:
-        pass
-
-    try:
-        if val is None:
-            return None
-
-        s = str(val).strip()
-        if not s:
-            return None
-
-        s = s.replace("€", "").replace("EUR", "").strip()
-
-        if "/" in s:
-            left = s.split("/", 1)[0].strip()
-            if left:
-                s = left
-
-        s = s.replace(",", ".").strip()
-
-        if not any(ch.isdigit() for ch in s):
-            return None
-
-        km = float(s)
-
-        if km <= 0 or km > 999:
-            return None
-
-        return int(km) if float(km).is_integer() else float(km)
-
-    except Exception:
-        return None
-
-
 def _clienthub_to_float(v):
     import pandas as pd
     try:
@@ -11273,7 +11514,7 @@ def _clienthub_calc_surcharge(date_iso, km, h_tva, coef_map):
     if coef is None:
         return 0.0
     h = _clienthub_to_float(h_tva)
-    y = normalize_real_km(km, date_iso=date_iso)
+    y = _clienthub_to_float(km)
     if h in (47.5, 55.0):
         return 2.0
     if h in (115.0, 148.5):
@@ -11351,12 +11592,6 @@ def _clienthub_read_excel_history_df():
 
     today_iso = date.today().strftime("%Y-%m-%d")
     raw = raw[raw["DATE_ISO"] <= today_iso].copy()
-
-    if "KM" in raw.columns:
-        raw["KM"] = raw.apply(
-            lambda r: normalize_real_km(r.get("KM"), date_iso=str(r.get("DATE_ISO") or "")),
-            axis=1,
-        )
 
     if "row_key" not in raw.columns:
         raw["row_key"] = ""
@@ -11461,34 +11696,25 @@ def clienthub_reset_and_rebuild_db(force=False):
     import pandas as pd
     from datetime import datetime
     from database import ensure_planning_row_key_column, ensure_planning_row_key_index, ensure_surcharge_carburant_column, make_row_key_from_row
-
     ensure_planning_row_key_column()
     ensure_planning_row_key_index()
     ensure_surcharge_carburant_column()
-
     with get_connection() as conn:
         cols_now = [r[1] for r in conn.execute("PRAGMA table_info(planning)").fetchall()]
         if "DATE_HEURE_YELLOW" not in cols_now:
             conn.execute('ALTER TABLE planning ADD COLUMN "DATE_HEURE_YELLOW" INTEGER DEFAULT 0')
-        if "FACTURE_ENVOYEE" not in cols_now:
-            conn.execute('ALTER TABLE planning ADD COLUMN "FACTURE_ENVOYEE" INTEGER DEFAULT 0')
-        if "updated_at" not in cols_now:
-            conn.execute('ALTER TABLE planning ADD COLUMN "updated_at" TEXT')
-        if "SURCHARGE_CARBURANT" not in cols_now:
-            conn.execute('ALTER TABLE planning ADD COLUMN "SURCHARGE_CARBURANT" REAL DEFAULT 0')
-        conn.commit()
-
+            conn.commit()
     df = _clienthub_read_excel_history_df()
     if df is None or df.empty:
         return 0
 
     with get_connection() as conn:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(planning)").fetchall()]
+        # reset complet demandé pour repartir propre
         conn.execute("DELETE FROM planning")
         conn.commit()
         now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         inserted = 0
-
         for _, row in df.iterrows():
             data = {}
             for c in cols:
@@ -11496,43 +11722,22 @@ def clienthub_reset_and_rebuild_db(force=False):
                     continue
                 if c in row.index:
                     data[c] = sqlite_safe(row.get(c))
-
             data["row_key"] = str(row.get("row_key") or "").strip() or make_row_key_from_row(row.to_dict())
             data["DATE_ISO"] = str(row.get("DATE_ISO") or "")
-
+            # format DATE affichage dd/mm/YYYY
             try:
                 data["DATE"] = pd.to_datetime(data["DATE_ISO"]).strftime("%d/%m/%Y")
             except Exception:
                 pass
-
-            if "KM" in cols:
-                data["KM"] = normalize_real_km(row.get("KM"), date_iso=data.get("DATE_ISO"))
-
-            if "FACTURE_ENVOYEE" in cols:
-                try:
-                    data["FACTURE_ENVOYEE"] = int(row.get("FACTURE_ENVOYEE") or 0)
-                except Exception:
-                    data["FACTURE_ENVOYEE"] = 0
-
-            if "SURCHARGE_CARBURANT" in cols:
-                try:
-                    data["SURCHARGE_CARBURANT"] = float(row.get("SURCHARGE_CARBURANT") or 0.0)
-                except Exception:
-                    data["SURCHARGE_CARBURANT"] = 0.0
-
-            if "updated_at" in cols:
-                data["updated_at"] = now_iso
-
+            data["FACTURE_ENVOYEE"] = int(row.get("FACTURE_ENVOYEE") or 0)
+            data["SURCHARGE_CARBURANT"] = float(row.get("SURCHARGE_CARBURANT") or 0.0)
+            data["updated_at"] = now_iso
+            # insert direct
             cols_sql = ",".join(f'"{k}"' for k in data.keys())
             q = ",".join("?" for _ in data)
-            conn.execute(
-                f"INSERT OR REPLACE INTO planning ({cols_sql}) VALUES ({q})",
-                [sqlite_safe(v) for v in data.values()],
-            )
+            conn.execute(f"INSERT OR REPLACE INTO planning ({cols_sql}) VALUES ({q})", [sqlite_safe(v) for v in data.values()])
             inserted += 1
-
         conn.commit()
-
     try:
         rebuild_planning_views()
     except Exception:
@@ -11586,27 +11791,7 @@ def _clienthub_export_pdf_exact(df, title_txt):
             return 0.0
 
     pdf_df = df.copy().fillna("") if df is not None else pd.DataFrame()
-
-    if not pdf_df.empty:
-        if "DATE_ISO" not in pdf_df.columns and "DATE" in pdf_df.columns:
-            try:
-                pdf_df["DATE_ISO"] = pd.to_datetime(pdf_df["DATE"], dayfirst=True, errors="coerce").dt.strftime("%Y-%m-%d")
-            except Exception:
-                pdf_df["DATE_ISO"] = ""
-
-        if "KM" in pdf_df.columns:
-            pdf_df["KM"] = pdf_df.apply(
-                lambda r: normalize_real_km(r.get("KM"), date_iso=str(r.get("DATE_ISO") or "")),
-                axis=1,
-            )
-
-        if "SURCHARGE_CARBURANT" in pdf_df.columns:
-            try:
-                pdf_df["SURCHARGE_CARBURANT"] = pd.to_numeric(pdf_df["SURCHARGE_CARBURANT"], errors="coerce").fillna(0.0)
-            except Exception:
-                pass
-
-    show_cols = [col for col in pdf_df.columns if col not in ["FACTURE_ENVOYEE", "DATE_HEURE_YELLOW", "DATE_ISO"]]
+    show_cols = [col for col in pdf_df.columns if col not in ["FACTURE_ENVOYEE", "DATE_HEURE_YELLOW"]]
     compact_cols = [
         "DATE", "HEURE", "Unnamed: 8", "DESIGNATION", "GO", "Num BDC", "NOM",
         "CP", "Localité", "KM", "H TVA", "SURCHARGE_CARBURANT"
@@ -11635,13 +11820,7 @@ def _clienthub_export_pdf_exact(df, title_txt):
 
     main_data = [headers]
     for _, row in pdf_df.iterrows():
-        row_vals = []
-        for col in display_cols:
-            val = row.get(col, "")
-            if col == "KM":
-                val = "" if val in (None, "") else val
-            row_vals.append(str(val or "")[:28])
-        main_data.append(row_vals)
+        main_data.append([str(row.get(col, "") or "")[:28] for col in display_cols])
 
     available_w = doc.width
     col_widths = []
@@ -11793,17 +11972,6 @@ def render_tab_clients():
             wanted = ["DATE","HEURE","Unnamed: 8","DESIGNATION","GO","Num BDC","NOM","ADRESSE","CP","Localité","PAIEMENT","Caisse","KM","H TVA","SURCHARGE_CARBURANT","PARKING","ATTENTE","PEAGE","ADM","REMARQUE","DEMANDEUR","IMPUTATION","FACTURE_ENVOYEE","DATE_HEURE_YELLOW"]
             cols = [c for c in wanted if c in df_full.columns]
             view = df_full[cols].copy().fillna("")
-            if "KM" in view.columns:
-                date_series = None
-                if "DATE" in view.columns:
-                    try:
-                        date_series = pd.to_datetime(view["DATE"], dayfirst=True, errors="coerce").dt.strftime("%Y-%m-%d")
-                    except Exception:
-                        date_series = None
-                if date_series is not None:
-                    view["KM"] = [normalize_real_km(km, date_iso=di) for km, di in zip(view["KM"], date_series)]
-                else:
-                    view["KM"] = view["KM"].apply(normalize_real_km)
             st.dataframe(_clienthub_style_facture(view), use_container_width=True, height=420)
             pdf_bytes = _clienthub_export_pdf_exact(view, f"{client_label} du {d1.strftime('%d/%m/%Y')} au {d2.strftime('%d/%m/%Y')}")
             st.download_button(
@@ -11821,46 +11989,3 @@ def render_tab_clients():
 
 if __name__ == "__main__":
     main()
-
-
-
-def normalize_real_km(val):
-    """
-    Règles KM :
-    - avant le 01/04/2026 : ignoré ailleurs via la date
-    - si format type "214/12" -> garder 214
-    - garder uniquement numérique > 0 et <= 999
-    - ignorer texte, dates, montants parasites, grosses valeurs
-    """
-    try:
-        if val is None:
-            return None
-
-        s = str(val).strip()
-        if not s:
-            return None
-
-        s = s.replace("€", "").replace("EUR", "").strip()
-
-        if "/" in s:
-            left = s.split("/", 1)[0].strip()
-            if left:
-                s = left
-
-        s = s.replace(",", ".").strip()
-
-        if not any(ch.isdigit() for ch in s):
-            return None
-
-        km = float(s)
-
-        if km <= 0:
-            return None
-        if km > 999:
-            return None
-
-        return int(km)
-
-    except Exception:
-        return None
-
