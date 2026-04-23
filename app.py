@@ -391,6 +391,7 @@ import threading
 import streamlit.components.v1 as components
 
 LOGIN_PERSIST_KEY = "al_session"
+LOGIN_USER_KEY = "al_login"
 LOGIN_CLIENT_KEY = "al_cid"
 LOGIN_CLIENT_STORAGE_KEY = "al_cid_local"
 LOGIN_BOOTSTRAP_FLAG = "al_bootstrap_done"
@@ -478,6 +479,7 @@ def bootstrap_login_persistence():
         <script>
         (function() {{
             const sessionKey = {_js_quote(LOGIN_PERSIST_KEY)};
+            const loginKey = {_js_quote(LOGIN_USER_KEY)};
             const clientStorageKey = {_js_quote(LOGIN_CLIENT_STORAGE_KEY)};
             const clientParam = {_js_quote(LOGIN_CLIENT_KEY)};
             const bootFlag = {_js_quote(LOGIN_BOOTSTRAP_FLAG)};
@@ -536,6 +538,7 @@ def bootstrap_login_persistence():
             const w = getBestWin();
             const cid = ensureClientId(w);
             const sess = safeGetLocal(w, sessionKey);
+            const savedLogin = safeGetLocal(w, loginKey);
 
             if (cid) {{
                 safeSetCookie(w, clientParam, cid);
@@ -545,6 +548,11 @@ def bootstrap_login_persistence():
             if (sess) {{
                 safeSetCookie(w, sessionKey, sess);
                 safeSetLocal(w, sessionKey, sess);
+            }}
+
+            if (savedLogin) {{
+                safeSetCookie(w, loginKey, savedLogin);
+                safeSetLocal(w, loginKey, savedLogin);
             }}
 
             let url;
@@ -567,6 +575,11 @@ def bootstrap_login_persistence():
 
             if (sess && url.searchParams.get(sessionKey) !== sess) {{
                 url.searchParams.set(sessionKey, sess);
+                changed = true;
+            }}
+
+            if (savedLogin && url.searchParams.get(loginKey) !== savedLogin) {{
+                url.searchParams.set(loginKey, savedLogin);
                 changed = true;
             }}
 
@@ -684,6 +697,72 @@ def get_login_cookie():
 
     return None
 
+
+def load_persistent_session_by_login(login: str | None):
+    login = str(login or "").strip().lower()
+    if not login:
+        return None
+
+    ensure_persistent_sessions_table()
+
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT login, token, expires_at
+                FROM persistent_sessions
+                WHERE login = ?
+                  AND active = 1
+                  AND remember_me = 1
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT 1
+                """,
+                (login,),
+            ).fetchone()
+    except Exception as e:
+        print(f"⚠️ load_persistent_session_by_login error: {e}", flush=True)
+        return None
+
+    if not row:
+        return None
+
+    login_db, token, expires_at = row
+    try:
+        if expires_at and datetime.fromisoformat(str(expires_at)) < datetime.now():
+            return None
+    except Exception:
+        pass
+
+    login_db = str(login_db or "").strip().lower()
+    token = str(token or "").strip()
+    if not login_db or not token:
+        return None
+
+    return f"{login_db}|{token}"
+
+def get_bound_login_cookie():
+    for key in (LOGIN_USER_KEY,):
+        try:
+            val = st.query_params.get(key)
+            if isinstance(val, list):
+                val = val[0] if val else None
+            val = str(val or "").strip().lower()
+            if val:
+                return val
+        except Exception:
+            pass
+
+        try:
+            ctx = getattr(st, "context", None)
+            cookies = getattr(ctx, "cookies", None)
+            if cookies:
+                val = str(cookies.get(key) or "").strip().lower()
+                if val:
+                    return val
+        except Exception:
+            pass
+
+    return None
 
 def load_persistent_session_from_server():
     client_id = str(get_client_id() or "").strip()
@@ -851,12 +930,14 @@ def get_trusted_device_token() -> str | None:
     except Exception:
         return None
 
-def set_login_cookie(token: str):
+def set_login_cookie(token: str, login: str | None = None):
     token = str(token or "").strip()
     if not token:
         return
 
+    login = str(login or "").strip().lower()
     token_js = _js_quote(token)
+    login_js = _js_quote(login)
     max_age = int(LOGIN_PERSIST_HOURS * 3600)
 
     # ✅ APP Streamlit: cookie + localStorage uniquement
@@ -865,9 +946,11 @@ def set_login_cookie(token: str):
         <script>
         (function() {{
             const sessionKey = "{LOGIN_PERSIST_KEY}";
+            const loginKey = "{LOGIN_USER_KEY}";
             const clientKey = "{LOGIN_CLIENT_STORAGE_KEY}";
             const clientParam = "{LOGIN_CLIENT_KEY}";
             const sessionValue = {token_js};
+            const loginValue = {login_js};
             const maxAge = {max_age};
 
             function getBestWin() {{
@@ -907,6 +990,12 @@ def set_login_cookie(token: str):
             safeSetLocal(sessionKey, sessionValue);
             safeSetCookie(sessionKey, sessionValue);
 
+            // login mémorisé pour Streamlit App
+            if (loginValue) {{
+                safeSetLocal(loginKey, loginValue);
+                safeSetCookie(loginKey, loginValue);
+            }}
+
             // client_id
             safeSetLocal(clientKey, cid);
             safeSetCookie(clientParam, cid);
@@ -915,18 +1004,19 @@ def set_login_cookie(token: str):
         """,
         height=0,
     )
+
 def clear_login_cookie():
     components.html(
         f"""
         <script>
         (function() {{
             const sessionKey = {_js_quote(LOGIN_PERSIST_KEY)};
+            const loginKey = {_js_quote(LOGIN_USER_KEY)};
             const clientParam = {_js_quote(LOGIN_CLIENT_KEY)};
             const w = (function() {{ try {{ return window.parent || window; }} catch(e) {{ return window; }} }})();
 
             function clearCookie(k) {{
                 try {{
-                    // On tente de supprimer en mode https (Secure) et en mode http
                     if (w.location && w.location.protocol === "https:") {{
                         w.document.cookie = k + "=; path=/; max-age=0; SameSite=None; Secure";
                     }}
@@ -937,12 +1027,15 @@ def clear_login_cookie():
             }}
 
             clearCookie(sessionKey);
+            clearCookie(loginKey);
             clearCookie(clientParam);
 
             try {{ w.localStorage.removeItem(sessionKey); }} catch (e) {{}}
+            try {{ w.localStorage.removeItem(loginKey); }} catch (e) {{}}
             try {{
                 const url = new URL(w.location.href);
                 url.searchParams.delete(sessionKey);
+                url.searchParams.delete(loginKey);
                 url.searchParams.delete(clientParam);
                 w.history.replaceState({{}}, "", url.toString());
             }} catch (e) {{}}
@@ -956,9 +1049,16 @@ def restore_login_from_cookie():
     if st.session_state.get("logged_in"):
         return False
 
+    bound_login = (
+        str(get_device_bound_login() or "").strip().lower()
+        or str(get_bound_login_cookie() or "").strip().lower()
+    )
+
     raw = get_login_cookie()
     if not raw:
         raw = load_persistent_session_from_server()
+    if not raw and bound_login:
+        raw = load_persistent_session_by_login(bound_login)
     if not raw:
         return False
 
@@ -981,10 +1081,8 @@ def restore_login_from_cookie():
         return False
 
     # ✅ Anti-mix : si cet appareil est déjà lié à un autre login, on refuse la restauration auto
-    bound = get_device_bound_login()
+    bound = str(get_device_bound_login() or "").strip().lower()
     if bound and bound != login:
-        # Optionnel: on peut nettoyer le cookie session pour éviter une boucle de mauvais restore
-        # clear_login_cookie()
         return False
 
     user = USERS.get(login)
@@ -997,9 +1095,20 @@ def restore_login_from_cookie():
     st.session_state.chauffeur_code = user.get("chauffeur_code")
     st.session_state.session_token = token
     st.session_state.remember_me = True
+    st.session_state["_persist_state_saved"] = True
 
     # ✅ On "bind" l'appareil à ce login après une restauration réussie
     set_device_bound_login(login)
+    try:
+        st.session_state["device_bound_cid"] = str(get_client_id() or "").strip()
+    except Exception:
+        pass
+
+    # ✅ Repose le cookie/login localement si on a restauré depuis le serveur
+    try:
+        set_login_cookie(f"{login}|{token}", login)
+    except Exception:
+        pass
 
     return True
 # ============================================================
@@ -1029,7 +1138,9 @@ def login_screen():
 
             # ✅ Force un client_id stable pour cet appareil
             cid = str(get_client_id() or "").strip()
-            remember_me_effective = True if str(user.get("role") or "").strip().lower() == "driver" else bool(remember_me)
+
+            role_norm = str(user.get("role") or "").strip().lower()
+            remember_me_effective = True if role_norm == "driver" else bool(remember_me)
 
             st.session_state.logged_in = True
             st.session_state.username = login_norm
@@ -1040,8 +1151,13 @@ def login_screen():
             st.session_state["_persist_state_saved"] = False
 
             if remember_me_effective:
+                # ✅ 1) Sauvegarde serveur PAR APPAREIL (anti-mix)
                 save_persistent_session(login_norm, token, True)
-                set_login_cookie(f"{login_norm}|{token}")
+
+                # ✅ 2) Sauvegarde locale APP Streamlit : cookie + localStorage + login
+                set_login_cookie(f"{login_norm}|{token}", login_norm)
+
+                # ✅ 3) Appareil lié à CE chauffeur jusqu'à déconnexion volontaire
                 st.session_state["device_bound_login"] = login_norm
                 st.session_state["device_bound_cid"] = cid
             else:
@@ -11147,7 +11263,7 @@ def main():
         cid = str(get_client_id() or "").strip()
         sess = get_login_cookie()
 
-        if st.session_state.BOOTSTRAP_TRY < 1 and (not cid or not sess):
+        if st.session_state.BOOTSTRAP_TRY < 3 and (not cid or (not sess and not get_bound_login_cookie())):
             st.session_state.BOOTSTRAP_TRY += 1
             st.rerun()
     else:
@@ -11695,57 +11811,107 @@ def _clienthub_read_excel_history_df():
 def clienthub_reset_and_rebuild_db(force=False):
     import pandas as pd
     from datetime import datetime
-    from database import ensure_planning_row_key_column, ensure_planning_row_key_index, ensure_surcharge_carburant_column, make_row_key_from_row
+    from database import (
+        ensure_planning_row_key_column,
+        ensure_planning_row_key_index,
+        ensure_surcharge_carburant_column,
+        make_row_key_from_row,
+    )
+
     ensure_planning_row_key_column()
     ensure_planning_row_key_index()
     ensure_surcharge_carburant_column()
+
+    # 🔒 Garantit le schéma minimal AVANT lecture / rebuild
     with get_connection() as conn:
         cols_now = [r[1] for r in conn.execute("PRAGMA table_info(planning)").fetchall()]
-        if "DATE_HEURE_YELLOW" not in cols_now:
-            conn.execute('ALTER TABLE planning ADD COLUMN "DATE_HEURE_YELLOW" INTEGER DEFAULT 0')
-            conn.commit()
+        wanted_cols = {
+            "DATE_HEURE_YELLOW": 'ALTER TABLE planning ADD COLUMN "DATE_HEURE_YELLOW" INTEGER DEFAULT 0',
+            "FACTURE_ENVOYEE": 'ALTER TABLE planning ADD COLUMN "FACTURE_ENVOYEE" INTEGER DEFAULT 0',
+            "SURCHARGE_CARBURANT": 'ALTER TABLE planning ADD COLUMN "SURCHARGE_CARBURANT" REAL DEFAULT 0',
+            "updated_at": 'ALTER TABLE planning ADD COLUMN "updated_at" TEXT',
+            "row_key": 'ALTER TABLE planning ADD COLUMN "row_key" TEXT',
+            "DATE_ISO": 'ALTER TABLE planning ADD COLUMN "DATE_ISO" TEXT',
+        }
+        for col_name, sql in wanted_cols.items():
+            if col_name not in cols_now:
+                conn.execute(sql)
+        conn.commit()
+
     df = _clienthub_read_excel_history_df()
     if df is None or df.empty:
         return 0
 
     with get_connection() as conn:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(planning)").fetchall()]
+
         # reset complet demandé pour repartir propre
         conn.execute("DELETE FROM planning")
         conn.commit()
+
         now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         inserted = 0
+
         for _, row in df.iterrows():
             data = {}
+
+            # 1) recopie uniquement les colonnes vraiment présentes en DB
             for c in cols:
                 if c == "id":
                     continue
                 if c in row.index:
                     data[c] = sqlite_safe(row.get(c))
-            data["row_key"] = str(row.get("row_key") or "").strip() or make_row_key_from_row(row.to_dict())
-            data["DATE_ISO"] = str(row.get("DATE_ISO") or "")
-            # format DATE affichage dd/mm/YYYY
-            try:
-                data["DATE"] = pd.to_datetime(data["DATE_ISO"]).strftime("%d/%m/%Y")
-            except Exception:
-                pass
-            data["FACTURE_ENVOYEE"] = int(row.get("FACTURE_ENVOYEE") or 0)
-            data["SURCHARGE_CARBURANT"] = float(row.get("SURCHARGE_CARBURANT") or 0.0)
-            data["updated_at"] = now_iso
-            # insert direct
+
+            # 2) champs calculés / sécurisés uniquement si la colonne existe
+            if "row_key" in cols:
+                data["row_key"] = str(row.get("row_key") or "").strip() or make_row_key_from_row(row.to_dict())
+
+            if "DATE_ISO" in cols:
+                data["DATE_ISO"] = str(row.get("DATE_ISO") or "")
+
+            if "DATE" in cols:
+                try:
+                    data["DATE"] = pd.to_datetime(str(row.get("DATE_ISO") or "")).strftime("%d/%m/%Y")
+                except Exception:
+                    if "DATE" in row.index:
+                        data["DATE"] = sqlite_safe(row.get("DATE"))
+
+            if "FACTURE_ENVOYEE" in cols:
+                try:
+                    data["FACTURE_ENVOYEE"] = int(row.get("FACTURE_ENVOYEE") or 0)
+                except Exception:
+                    data["FACTURE_ENVOYEE"] = 0
+
+            if "SURCHARGE_CARBURANT" in cols:
+                try:
+                    data["SURCHARGE_CARBURANT"] = float(row.get("SURCHARGE_CARBURANT") or 0.0)
+                except Exception:
+                    data["SURCHARGE_CARBURANT"] = 0.0
+
+            if "updated_at" in cols:
+                data["updated_at"] = now_iso
+
+            # 3) insert seulement sur les colonnes réellement présentes
             cols_sql = ",".join(f'"{k}"' for k in data.keys())
             q = ",".join("?" for _ in data)
-            conn.execute(f"INSERT OR REPLACE INTO planning ({cols_sql}) VALUES ({q})", [sqlite_safe(v) for v in data.values()])
+            conn.execute(
+                f"INSERT OR REPLACE INTO planning ({cols_sql}) VALUES ({q})",
+                [sqlite_safe(v) for v in data.values()]
+            )
             inserted += 1
+
         conn.commit()
+
     try:
         rebuild_planning_views()
     except Exception:
         pass
+
     try:
         st.cache_data.clear()
     except Exception:
         pass
+
     return inserted
 
 def _clienthub_style_facture(df):
