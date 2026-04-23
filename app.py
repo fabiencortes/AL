@@ -12155,3 +12155,69 @@ def render_tab_clients():
 
 if __name__ == "__main__":
     main()
+
+
+
+def render_driver_caisse_badge(ch_code):
+    """
+    Badge chauffeur = même logique que l'admin :
+    somme des paiements 'caisse' non marqués payés.
+    """
+    import pandas as pd
+    from datetime import date
+
+    ch_code = str(ch_code or "").strip().upper()
+    if not ch_code:
+        return 0.0
+
+    start_date = date(date.today().year, 1, 1)
+    end_date = date.today()
+
+    try:
+        df = get_planning(
+            start_date=start_date,
+            end_date=end_date,
+            chauffeur=ch_code,
+            type_filter=None,
+            search="",
+            max_rows=50000,
+            source="full",
+        )
+    except Exception:
+        return 0.0
+
+    if df is None or df.empty:
+        return 0.0
+
+    if "IS_INDISPO" in df.columns:
+        df = df[df["IS_INDISPO"].fillna(0).astype(int) == 0].copy()
+    if "IS_SUPERSEDED" in df.columns:
+        df = df[df["IS_SUPERSEDED"].fillna(0).astype(int) == 0].copy()
+
+    if "CH" in df.columns:
+        ch_series = (
+            df["CH"].fillna("")
+            .astype(str)
+            .str.upper()
+            .str.replace("*", "", regex=False)
+            .str.replace(" ", "", regex=False)
+            .str.strip()
+        )
+        ch_norm = normalize_ch_code(ch_code)
+        df = df[ch_series.str.startswith(ch_norm)].copy()
+
+    pay_norm = df.get("PAIEMENT", pd.Series("", index=df.index)).fillna("").astype(str).str.strip().str.lower()
+    df = df[pay_norm == "caisse"].copy()
+
+    if "CAISSE_PAYEE" in df.columns:
+        df = df[df["CAISSE_PAYEE"].fillna(0).astype(int) == 0].copy()
+
+    caisse_col = "Caisse" if "Caisse" in df.columns else ("CAISSE" if "CAISSE" in df.columns else None)
+    if not caisse_col or df.empty:
+        return 0.0
+
+    total_due = pd.to_numeric(df[caisse_col], errors="coerce").fillna(0.0)
+    total_due = float(total_due[total_due > 0].sum())
+
+    return round(total_due, 2)
+
