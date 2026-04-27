@@ -56,6 +56,7 @@ from email.mime.application import MIMEApplication
 import pandas as pd
 import requests
 from openpyxl import load_workbook
+from openpyxl.utils import column_index_from_string
 from io import BytesIO
 import streamlit as st
 import database as _database
@@ -405,6 +406,10 @@ def _js_quote(val: str) -> str:
 
 
 def ensure_persistent_sessions_table():
+    """
+    Table sessions persistantes compatible anciennes DB.
+    Corrige le cas où la table existe déjà sans colonne sid.
+    """
     try:
         with get_connection() as conn:
             conn.execute(
@@ -422,8 +427,28 @@ def ensure_persistent_sessions_table():
                 )
                 """
             )
+
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(persistent_sessions)").fetchall()]
+
+            wanted = {
+                "sid": 'ALTER TABLE persistent_sessions ADD COLUMN sid TEXT',
+                "login": 'ALTER TABLE persistent_sessions ADD COLUMN login TEXT',
+                "token": 'ALTER TABLE persistent_sessions ADD COLUMN token TEXT',
+                "remember_me": 'ALTER TABLE persistent_sessions ADD COLUMN remember_me INTEGER DEFAULT 1',
+                "active": 'ALTER TABLE persistent_sessions ADD COLUMN active INTEGER DEFAULT 1',
+                "created_at": 'ALTER TABLE persistent_sessions ADD COLUMN created_at TEXT',
+                "updated_at": 'ALTER TABLE persistent_sessions ADD COLUMN updated_at TEXT',
+                "expires_at": 'ALTER TABLE persistent_sessions ADD COLUMN expires_at TEXT',
+            }
+
+            for col, sql in wanted.items():
+                if col not in cols:
+                    conn.execute(sql)
+
             conn.execute("CREATE INDEX IF NOT EXISTS idx_persistent_sid ON persistent_sessions(sid)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_persistent_login ON persistent_sessions(login)")
             conn.commit()
+
     except Exception as e:
         print(f"⚠️ ensure_persistent_sessions_table error: {e}", flush=True)
 
@@ -10443,6 +10468,210 @@ def _match_rule_minutes(rules_norm, ch, sens, dest):
     return 0
 
 
+
+def read_caisse_unpaid_from_xlsm(start_date=None, end_date=None, ch_filter=None):
+    """
+    Source de vérité pour la caisse : le fichier XLSM.
+    - Caisse VERTE dans Excel = déjà réglée => on ignore définitivement.
+    - Caisse BLANCHE / non verte = encore à payer => on garde.
+    Ne dépend pas de CAISSE_PAYEE en DB pour le calcul affiché chauffeur.
+    """
+    from io import BytesIO
+    from datetime import datetime, date
+    import pandas as pd
+    import re
+
+    try:
+        from openpyxl import load_workbook
+    except Exception as e:
+        print(f"⚠️ openpyxl indisponible read_caisse_unpaid_from_xlsm: {e}", flush=True)
+        return pd.DataFrame()
+
+    def _norm_date_iso(v):
+        try:
+            if v is None:
+                return ""
+            if isinstance(v, (datetime, date)):
+                return v.strftime("%Y-%m-%d")
+            if isinstance(v, (int, float)) and not pd.isna(v):
+                if 20000 <= float(v) <= 60000:
+                    dt = pd.to_datetime(float(v), unit="D", origin="1899-12-30", errors="coerce")
+                    if not pd.isna(dt):
+                        return dt.strftime("%Y-%m-%d")
+            s = str(v).strip()
+            if not s or s.lower() in {"nan", "none", "nat"}:
+                return ""
+            dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
+            if not pd.isna(dt):
+                return dt.strftime("%Y-%m-%d")
+            s2 = re.sub(r"^(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)\s+", "", s.lower()).strip()
+            months = {
+                "janvier": "01", "février": "02", "fevrier": "02", "mars": "03", "avril": "04",
+                "mai": "05", "juin": "06", "juillet": "07", "août": "08", "aout": "08",
+                "septembre": "09", "octobre": "10", "novembre": "11", "décembre": "12", "decembre": "12",
+            }
+            m = re.match(r"^(\d{1,2})\s+([a-zéûôîàç]+)\s+(\d{4})$", s2)
+            if m:
+                dd = int(m.group(1))
+                mm = months.get(m.group(2))
+                yy = int(m.group(3))
+                if mm:
+                    return f"{yy:04d}-{mm}-{dd:02d}"
+        except Exception:
+            return ""
+        return ""
+
+    def _norm_ch(v):
+        try:
+            return normalize_ch_code(str(v or "").upper().replace("*", "").replace(" ", "").strip())
+        except Exception:
+            return str(v or "").upper().replace("*", "").replace(" ", "").strip()
+
+    def _num(v):
+        try:
+            if v is None:
+                return 0.0
+            s = str(v).strip().replace("€", "").replace(" ", "").replace(",", ".")
+            if not s or s.lower() in {"nan", "none", "nat"}:
+                return 0.0
+            return float(s)
+        except Exception:
+            return 0.0
+
+    def _is_green_cell(cell):
+        try:
+            fill = cell.fill
+            if fill is None or fill.patternType is None:
+                return False
+
+            fg = fill.fgColor
+            if fg is None:
+                return False
+
+            if fg.type == "rgb" and fg.rgb:
+                rgb = str(fg.rgb).upper()
+                return (
+                    rgb.endswith("C6EFCE") or
+                    rgb.endswith("92D050") or
+                    rgb.endswith("00B050") or
+                    rgb.endswith("00FF00") or
+                    rgb in {"FFC6EFCE", "FF92D050", "FF00B050", "FF00FF00"}
+                )
+
+            if fg.type == "indexed":
+                return fg.indexed in {4, 43, 50}
+
+            # Attention : on ne considère PAS tous les thèmes comme vert.
+            # Un thème peut être autre chose, donc par sécurité il reste "non vert"
+            # sauf RGB/indexed clair.
+            return False
+        except Exception:
+            return False
+
+    try:
+        content = download_dropbox_excel_bytes()
+        if not content:
+            try:
+                from utils import get_dropbox_excel_cached
+                content = get_dropbox_excel_cached()
+            except Exception:
+                content = None
+        if not content:
+            return pd.DataFrame()
+
+        wb = load_workbook(BytesIO(content), data_only=False)
+        if "Feuil1" not in wb.sheetnames:
+            return pd.DataFrame()
+        ws = wb["Feuil1"]
+
+        header_row = None
+        for r in range(1, min(ws.max_row, 15) + 1):
+            vals = [str(ws.cell(r, c).value or "").strip().upper() for c in range(1, min(ws.max_column, 90) + 1)]
+            if "DATE" in vals and "HEURE" in vals:
+                header_row = r
+                break
+        if header_row is None:
+            return pd.DataFrame()
+
+        headers = {}
+        for c in range(1, ws.max_column + 1):
+            name = str(ws.cell(header_row, c).value or "").strip()
+            if name:
+                headers[name.upper()] = c
+
+        c_date = headers.get("DATE")
+        c_heure = headers.get("HEURE")
+        c_ch = headers.get("CH")
+        c_sens = headers.get("UNNAMED: 8")
+        c_designation = headers.get("DESIGNATION")
+        c_nom = headers.get("NOM")
+        c_adresse = headers.get("ADRESSE")
+        c_cp = headers.get("CP")
+        c_loc = headers.get("LOCALITÉ") or headers.get("LOCALITE")
+        c_paiement = headers.get("PAIEMENT")
+        c_caisse = headers.get("CAISSE") or headers.get("CAISSE ")
+        c_bdc = headers.get("NUM BDC") or headers.get("NUM_BDC") or headers.get("BDC")
+
+        if not (c_date and c_ch and c_paiement and c_caisse):
+            return pd.DataFrame()
+
+        s1 = pd.to_datetime(start_date, errors="coerce") if start_date is not None else pd.NaT
+        s2 = pd.to_datetime(end_date, errors="coerce") if end_date is not None else pd.NaT
+        ch_filter_norm = _norm_ch(ch_filter) if ch_filter else ""
+
+        rows = []
+        for r in range(header_row + 1, ws.max_row + 1):
+            date_iso = _norm_date_iso(ws.cell(r, c_date).value)
+            if not date_iso:
+                continue
+            if not pd.isna(s1) and date_iso < s1.strftime("%Y-%m-%d"):
+                continue
+            if not pd.isna(s2) and date_iso > s2.strftime("%Y-%m-%d"):
+                continue
+
+            paiement = str(ws.cell(r, c_paiement).value or "").strip().lower()
+            if paiement != "caisse":
+                continue
+
+            caisse_val = _num(ws.cell(r, c_caisse).value)
+            if caisse_val <= 0:
+                continue
+
+            ch_norm = _norm_ch(ws.cell(r, c_ch).value)
+            if ch_filter_norm and not ch_norm.startswith(ch_filter_norm):
+                continue
+
+            is_green = _is_green_cell(ws.cell(r, c_caisse))
+
+            # RÈGLE DEMANDÉE :
+            # vert = payé, on ne le garde pas dans ce qui est à payer
+            if is_green:
+                continue
+
+            rows.append({
+                "EXCEL_ROW": r,
+                "DATE_ISO": date_iso,
+                "DATE": pd.to_datetime(date_iso).strftime("%d/%m/%Y"),
+                "HEURE": normalize_time_string(ws.cell(r, c_heure).value) if c_heure else "",
+                "CH": ch_norm,
+                "Unnamed: 8": str(ws.cell(r, c_sens).value or "").strip() if c_sens else "",
+                "DESIGNATION": str(ws.cell(r, c_designation).value or "").strip() if c_designation else "",
+                "Num BDC": str(ws.cell(r, c_bdc).value or "").strip() if c_bdc else "",
+                "NOM": str(ws.cell(r, c_nom).value or "").strip() if c_nom else "",
+                "ADRESSE": str(ws.cell(r, c_adresse).value or "").strip() if c_adresse else "",
+                "CP": str(ws.cell(r, c_cp).value or "").strip() if c_cp else "",
+                "Localité": str(ws.cell(r, c_loc).value or "").strip() if c_loc else "",
+                "PAIEMENT": "caisse",
+                "Caisse": caisse_val,
+            })
+
+        return pd.DataFrame(rows)
+
+    except Exception as e:
+        print(f"⚠️ read_caisse_unpaid_from_xlsm error: {e}", flush=True)
+        return pd.DataFrame()
+
+
 def force_sync_caisse_green_from_excel(start_date=None, end_date=None, ch_filter=None) -> int:
     """
     Synchronisation robuste caisse Excel -> DB.
@@ -11286,9 +11515,9 @@ def render_tab_calcul_heures():
                 if st.button("🔄 Rafraîchir la caisse depuis Excel"):
                         n_sync_caisse = force_sync_caisse_green_from_excel(start_date=d1, end_date=today)
                         if n_sync_caisse > 0:
-                                st.success(f"✅ {n_sync_caisse} ligne(s) caisse marquée(s) payée(s) depuis Excel")
+                                st.success(f"✅ {n_sync_caisse} ligne(s) caisse verte(s) synchronisée(s). Le montant chauffeur lit maintenant directement les caisses blanches du XLSM.")
                         else:
-                                st.info("Aucune nouvelle caisse payée détectée dans Excel.")
+                                st.info("Aucune nouvelle caisse verte à synchroniser. Le montant chauffeur est calculé directement sur les caisses blanches/non vertes du XLSM.")
                         request_soft_refresh("caisse")
 
                 # ----------------- Chauffeur -----------------
@@ -12574,6 +12803,30 @@ if __name__ == "__main__":
 
 
 
+
+def render_driver_caisse_details_from_xlsm(ch_code):
+    """
+    Tableau détail caisse chauffeur depuis XLSM :
+    n'affiche que les caisses blanches/non vertes.
+    """
+    from datetime import date
+    import pandas as pd
+
+    ch_code = str(ch_code or "").strip().upper()
+    start_date = date(date.today().year, 1, 1)
+    end_date = date.today()
+
+    df_cash = read_caisse_unpaid_from_xlsm(start_date=start_date, end_date=end_date, ch_filter=ch_code)
+
+    if df_cash is None or df_cash.empty:
+        st.success("✅ Aucune caisse à remettre selon l'Excel.")
+        return
+
+    total_due = pd.to_numeric(df_cash["Caisse"], errors="coerce").fillna(0.0).sum()
+    st.warning(f"💶 Caisse à remettre : {float(total_due):.2f} €")
+    st.dataframe(df_cash, use_container_width=True, height=360)
+
+
 def render_driver_caisse_badge(ch_code):
     """
     Montant caisse chauffeur = même logique admin + synchro silencieuse des cellules vertes Excel.
@@ -12655,3 +12908,53 @@ def render_driver_caisse_badge(ch_code):
     return round(total_due, 2)
 
 
+
+def render_driver_caisse_details_from_xlsm(ch_code):
+    """
+    Tableau détail caisse chauffeur depuis XLSM :
+    n'affiche que les caisses blanches/non vertes.
+    """
+    from datetime import date
+    import pandas as pd
+
+    ch_code = str(ch_code or "").strip().upper()
+    start_date = date(date.today().year, 1, 1)
+    end_date = date.today()
+
+    df_cash = read_caisse_unpaid_from_xlsm(start_date=start_date, end_date=end_date, ch_filter=ch_code)
+
+    if df_cash is None or df_cash.empty:
+        st.success("✅ Aucune caisse à remettre selon l'Excel.")
+        return
+
+    total_due = pd.to_numeric(df_cash["Caisse"], errors="coerce").fillna(0.0).sum()
+    st.warning(f"💶 Caisse à remettre : {float(total_due):.2f} €")
+    st.dataframe(df_cash, use_container_width=True, height=360)
+
+
+def render_driver_caisse_badge(ch_code):
+    """
+    Montant caisse chauffeur basé sur la SOURCE EXACTE demandée :
+    le fichier XLSM.
+    - caisse verte dans XLSM => payée, ignorée
+    - caisse blanche/non verte dans XLSM => à payer
+    """
+    import pandas as pd
+    from datetime import date
+
+    ch_code = str(ch_code or "").strip().upper()
+    if not ch_code:
+        return 0.0
+
+    start_date = date(date.today().year, 1, 1)
+    end_date = date.today()
+
+    try:
+        df_cash = read_caisse_unpaid_from_xlsm(start_date=start_date, end_date=end_date, ch_filter=ch_code)
+        if df_cash is None or df_cash.empty:
+            return 0.0
+        total_due = pd.to_numeric(df_cash["Caisse"], errors="coerce").fillna(0.0)
+        return round(float(total_due[total_due > 0].sum()), 2)
+    except Exception as e:
+        print(f"⚠️ render_driver_caisse_badge XLSM source failed: {e}", flush=True)
+        return 0.0
