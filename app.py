@@ -11011,7 +11011,7 @@ def render_tab_calcul_heures():
                         d1 = date(2026, 1, 1)
 
                 if st.button("🔄 Rafraîchir la caisse depuis Excel"):
-                        n_sync_caisse = sync_caisse_paid_from_excel_history(start_date=d1, end_date=today)
+                        n_sync_caisse = force_sync_caisse_green_from_excel(start_date=d1, end_date=today)
                         if n_sync_caisse > 0:
                                 st.success(f"✅ {n_sync_caisse} ligne(s) caisse marquée(s) payée(s) depuis Excel")
                         else:
@@ -12300,10 +12300,286 @@ if __name__ == "__main__":
 
 
 
+
+def force_sync_caisse_green_from_excel(start_date=None, end_date=None, ch_filter=None) -> int:
+    """
+    Synchronisation robuste caisse Excel -> DB.
+    Lit directement le XLSM avec openpyxl, détecte la vraie couleur verte sur la cellule Caisse,
+    puis marque CAISSE_PAYEE=1 en DB.
+    Matching volontairement large pour éviter que des lignes vertes restent à payer côté chauffeur :
+    date + chauffeur + montant, puis fallback date + montant + nom.
+    """
+    from io import BytesIO
+    from datetime import datetime, date
+    import pandas as pd
+    import re
+    try:
+        from openpyxl import load_workbook
+    except Exception as e:
+        print(f"⚠️ openpyxl indisponible force_sync_caisse_green_from_excel: {e}", flush=True)
+        return 0
+
+    def _norm_date_iso(v):
+        try:
+            if v is None:
+                return ""
+            if isinstance(v, (datetime, date)):
+                return v.strftime("%Y-%m-%d")
+            if isinstance(v, (int, float)) and not pd.isna(v):
+                if 20000 <= float(v) <= 60000:
+                    dt = pd.to_datetime(float(v), unit="D", origin="1899-12-30", errors="coerce")
+                    if not pd.isna(dt):
+                        return dt.strftime("%Y-%m-%d")
+            s = str(v).strip()
+            if not s or s.lower() in {"nan", "none", "nat"}:
+                return ""
+            dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
+            if not pd.isna(dt):
+                return dt.strftime("%Y-%m-%d")
+            s2 = re.sub(r"^(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)\s+", "", s.lower()).strip()
+            months = {
+                "janvier": "01", "février": "02", "fevrier": "02", "mars": "03", "avril": "04",
+                "mai": "05", "juin": "06", "juillet": "07", "août": "08", "aout": "08",
+                "septembre": "09", "octobre": "10", "novembre": "11", "décembre": "12", "decembre": "12",
+            }
+            m = re.match(r"^(\d{1,2})\s+([a-zéûôîàç]+)\s+(\d{4})$", s2)
+            if m:
+                dd = int(m.group(1)); mm = months.get(m.group(2)); yy = int(m.group(3))
+                if mm:
+                    return f"{yy:04d}-{mm}-{dd:02d}"
+        except Exception:
+            return ""
+        return ""
+
+    def _norm_ch(v):
+        try:
+            return normalize_ch_code(str(v or "").upper().replace("*", "").replace(" ", "").strip())
+        except Exception:
+            return str(v or "").upper().replace("*", "").replace(" ", "").strip()
+
+    def _num(v):
+        try:
+            if v is None:
+                return 0.0
+            s = str(v).strip().replace("€", "").replace(" ", "").replace(",", ".")
+            if not s or s.lower() in {"nan", "none", "nat"}:
+                return 0.0
+            return float(s)
+        except Exception:
+            return 0.0
+
+    def _is_green_cell(cell):
+        try:
+            fill = cell.fill
+            if fill is None or fill.patternType is None:
+                return False
+            fg = fill.fgColor
+            if fg is None:
+                return False
+            rgb = ""
+            if fg.type == "rgb" and fg.rgb:
+                rgb = str(fg.rgb).upper()
+                # verts Excel fréquents : C6EFCE / 92D050 / 00B050 / 00FF00
+                return (
+                    rgb.endswith("C6EFCE") or rgb.endswith("92D050") or
+                    rgb.endswith("00B050") or rgb.endswith("00FF00") or
+                    rgb in {"FFC6EFCE", "FF92D050", "FF00B050", "FF00FF00"}
+                )
+            if fg.type == "indexed":
+                return fg.indexed in {4, 43, 50}
+            # Les thèmes peuvent représenter du vert dans certains fichiers.
+            # On évite de tout accepter : seulement si la cellule a bien un fill solide.
+            if fg.type == "theme" and fill.patternType == "solid":
+                return True
+        except Exception:
+            return False
+        return False
+
+    try:
+        content = download_dropbox_excel_bytes()
+        if not content:
+            content = None
+            try:
+                from utils import get_dropbox_excel_cached
+                content = get_dropbox_excel_cached()
+            except Exception:
+                pass
+        if not content:
+            return 0
+
+        wb = load_workbook(BytesIO(content), data_only=False)
+        if "Feuil1" not in wb.sheetnames:
+            return 0
+        ws = wb["Feuil1"]
+
+        # header row detection
+        header_row = None
+        for r in range(1, min(ws.max_row, 15) + 1):
+            vals = [str(ws.cell(r, c).value or "").strip().upper() for c in range(1, min(ws.max_column, 80) + 1)]
+            if "DATE" in vals and "HEURE" in vals:
+                header_row = r
+                break
+        if header_row is None:
+            return 0
+
+        headers = {}
+        for c in range(1, ws.max_column + 1):
+            name = str(ws.cell(header_row, c).value or "").strip()
+            if name:
+                headers[name.upper()] = c
+
+        c_date = headers.get("DATE")
+        c_heure = headers.get("HEURE")
+        c_ch = headers.get("CH")
+        c_nom = headers.get("NOM")
+        c_paiement = headers.get("PAIEMENT")
+        c_caisse = headers.get("CAISSE") or headers.get("CAISSE ")
+        if not (c_date and c_ch and c_paiement and c_caisse):
+            return 0
+
+        s1 = pd.to_datetime(start_date, errors="coerce") if start_date is not None else pd.NaT
+        s2 = pd.to_datetime(end_date, errors="coerce") if end_date is not None else pd.NaT
+        ch_filter_norm = _norm_ch(ch_filter) if ch_filter else ""
+
+        excel_paid = []
+        for r in range(header_row + 1, ws.max_row + 1):
+            date_iso = _norm_date_iso(ws.cell(r, c_date).value)
+            if not date_iso:
+                continue
+            if not pd.isna(s1) and date_iso < s1.strftime("%Y-%m-%d"):
+                continue
+            if not pd.isna(s2) and date_iso > s2.strftime("%Y-%m-%d"):
+                continue
+
+            paiement = str(ws.cell(r, c_paiement).value or "").strip().lower()
+            if paiement != "caisse":
+                continue
+
+            caisse_val = _num(ws.cell(r, c_caisse).value)
+            if caisse_val <= 0:
+                continue
+
+            if not _is_green_cell(ws.cell(r, c_caisse)):
+                continue
+
+            ch_norm = _norm_ch(ws.cell(r, c_ch).value)
+            if ch_filter_norm and not ch_norm.startswith(ch_filter_norm):
+                continue
+
+            excel_paid.append({
+                "DATE_ISO": date_iso,
+                "HEURE": normalize_time_string(ws.cell(r, c_heure).value) if c_heure else "",
+                "CH": ch_norm,
+                "NOM": str(ws.cell(r, c_nom).value or "").strip().upper() if c_nom else "",
+                "CAISSE": caisse_val,
+            })
+
+        if not excel_paid:
+            return 0
+
+        now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        updated = 0
+
+        with get_connection() as conn:
+            cols = [x[1] for x in conn.execute("PRAGMA table_info(planning)").fetchall()]
+            if "CAISSE_PAYEE" not in cols:
+                conn.execute('ALTER TABLE planning ADD COLUMN "CAISSE_PAYEE" INTEGER DEFAULT 0')
+            if "CAISSE_PAYEE_AT" not in cols:
+                conn.execute('ALTER TABLE planning ADD COLUMN "CAISSE_PAYEE_AT" TEXT')
+            if "CAISSE_COMMENT" not in cols:
+                conn.execute('ALTER TABLE planning ADD COLUMN "CAISSE_COMMENT" TEXT')
+            conn.commit()
+
+            for p in excel_paid:
+                # 1) date + chauffeur + montant + nom (+ heure si possible)
+                params = [now_iso, p["DATE_ISO"], f'{p["CH"]}%', p["CAISSE"], p["NOM"]]
+                sql = """
+                    UPDATE planning
+                    SET CAISSE_PAYEE = 1,
+                        CAISSE_PAYEE_AT = COALESCE(CAISSE_PAYEE_AT, ?),
+                        CAISSE_COMMENT = CASE
+                            WHEN COALESCE(CAISSE_COMMENT,'') = '' THEN 'Payée détectée depuis Excel (vert)'
+                            ELSE CAISSE_COMMENT
+                        END
+                    WHERE COALESCE(IS_INDISPO,0)=0
+                      AND COALESCE(IS_SUPERSEDED,0)=0
+                      AND LOWER(TRIM(COALESCE(PAIEMENT,'')))='caisse'
+                      AND COALESCE(CAISSE_PAYEE,0)=0
+                      AND COALESCE(DATE_ISO,'')=?
+                      AND UPPER(REPLACE(REPLACE(COALESCE(CH,''),'*',''),' ','')) LIKE ?
+                      AND ABS(COALESCE(CAST(REPLACE(REPLACE(Caisse, ',', '.'), '€', '') AS REAL),0) - ?) < 0.01
+                      AND UPPER(TRIM(COALESCE(NOM,'')))=?
+                """
+                cur = conn.execute(sql, params)
+                cnt = int(cur.rowcount or 0)
+
+                # 2) fallback date + chauffeur + montant
+                if cnt == 0:
+                    cur = conn.execute(
+                        """
+                        UPDATE planning
+                        SET CAISSE_PAYEE = 1,
+                            CAISSE_PAYEE_AT = COALESCE(CAISSE_PAYEE_AT, ?),
+                            CAISSE_COMMENT = CASE
+                                WHEN COALESCE(CAISSE_COMMENT,'') = '' THEN 'Payée détectée depuis Excel (vert)'
+                                ELSE CAISSE_COMMENT
+                            END
+                        WHERE COALESCE(IS_INDISPO,0)=0
+                          AND COALESCE(IS_SUPERSEDED,0)=0
+                          AND LOWER(TRIM(COALESCE(PAIEMENT,'')))='caisse'
+                          AND COALESCE(CAISSE_PAYEE,0)=0
+                          AND COALESCE(DATE_ISO,'')=?
+                          AND UPPER(REPLACE(REPLACE(COALESCE(CH,''),'*',''),' ','')) LIKE ?
+                          AND ABS(COALESCE(CAST(REPLACE(REPLACE(Caisse, ',', '.'), '€', '') AS REAL),0) - ?) < 0.01
+                        """,
+                        (now_iso, p["DATE_ISO"], f'{p["CH"]}%', p["CAISSE"]),
+                    )
+                    cnt = int(cur.rowcount or 0)
+
+                # 3) fallback date + nom + montant
+                if cnt == 0 and p["NOM"]:
+                    cur = conn.execute(
+                        """
+                        UPDATE planning
+                        SET CAISSE_PAYEE = 1,
+                            CAISSE_PAYEE_AT = COALESCE(CAISSE_PAYEE_AT, ?),
+                            CAISSE_COMMENT = CASE
+                                WHEN COALESCE(CAISSE_COMMENT,'') = '' THEN 'Payée détectée depuis Excel (vert)'
+                                ELSE CAISSE_COMMENT
+                            END
+                        WHERE COALESCE(IS_INDISPO,0)=0
+                          AND COALESCE(IS_SUPERSEDED,0)=0
+                          AND LOWER(TRIM(COALESCE(PAIEMENT,'')))='caisse'
+                          AND COALESCE(CAISSE_PAYEE,0)=0
+                          AND COALESCE(DATE_ISO,'')=?
+                          AND UPPER(TRIM(COALESCE(NOM,'')))=?
+                          AND ABS(COALESCE(CAST(REPLACE(REPLACE(Caisse, ',', '.'), '€', '') AS REAL),0) - ?) < 0.01
+                        """,
+                        (now_iso, p["DATE_ISO"], p["NOM"], p["CAISSE"]),
+                    )
+                    cnt = int(cur.rowcount or 0)
+
+                updated += cnt
+
+            conn.commit()
+
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+
+        return int(updated)
+
+    except Exception as e:
+        print(f"⚠️ force_sync_caisse_green_from_excel error: {e}", flush=True)
+        return 0
+
+
+
 def render_driver_caisse_badge(ch_code):
     """
-    Badge chauffeur = même logique que l'admin :
-    somme des paiements 'caisse' non marqués payés.
+    Montant caisse chauffeur = même logique admin + synchro silencieuse des cellules vertes Excel.
+    Cela évite que des caisses déjà vertes dans Excel restent affichées à payer.
     """
     import pandas as pd
     from datetime import date
@@ -12315,16 +12591,24 @@ def render_driver_caisse_badge(ch_code):
     start_date = date(date.today().year, 1, 1)
     end_date = date.today()
 
+    # 🔄 Avant de calculer, on marque en DB les lignes vertes Excel comme payées.
+    try:
+        force_sync_caisse_green_from_excel(start_date=start_date, end_date=end_date, ch_filter=ch_code)
+    except Exception as e:
+        print(f"⚠️ driver caisse force sync skipped: {e}", flush=True)
+
     try:
         df = get_planning(
             start_date=start_date,
             end_date=end_date,
-            chauffeur=ch_code,
+            chauffeur=None,
             type_filter=None,
             search="",
             max_rows=50000,
             source="full",
         )
+    except TypeError:
+        df = get_planning(start_date=start_date, end_date=end_date, max_rows=50000, source="full")
     except Exception:
         return 0.0
 
@@ -12348,18 +12632,28 @@ def render_driver_caisse_badge(ch_code):
         ch_norm = normalize_ch_code(ch_code)
         df = df[ch_series.str.startswith(ch_norm)].copy()
 
+    if df.empty:
+        return 0.0
+
     pay_norm = df.get("PAIEMENT", pd.Series("", index=df.index)).fillna("").astype(str).str.strip().str.lower()
     df = df[pay_norm == "caisse"].copy()
+
+    if df.empty:
+        return 0.0
 
     if "CAISSE_PAYEE" in df.columns:
         df = df[df["CAISSE_PAYEE"].fillna(0).astype(int) == 0].copy()
 
+    if df.empty:
+        return 0.0
+
     caisse_col = "Caisse" if "Caisse" in df.columns else ("CAISSE" if "CAISSE" in df.columns else None)
-    if not caisse_col or df.empty:
+    if not caisse_col:
         return 0.0
 
     total_due = pd.to_numeric(df[caisse_col], errors="coerce").fillna(0.0)
     total_due = float(total_due[total_due > 0].sum())
 
     return round(total_due, 2)
+
 
