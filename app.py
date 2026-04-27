@@ -7778,49 +7778,27 @@ def render_tab_chauffeur_driver():
     # ===================================================
     # 💶 BADGE — CAISSE À REMETTRE
     # ===================================================
-    # IMPORTANT :
-    # même calcul que l'admin "Caisse non rentrée (60 jours)"
-    # même source : table planning DB
-    # mêmes filtres : 60 jours, caisse, non payée, non indispo, non superseded
+    # SOURCE DE VÉRITÉ = XLSM :
+    # - cellule Caisse verte = payé, on ignore
+    # - cellule Caisse blanche/non verte = à remettre
     has_caisse_due = False
     total_caisse_due = 0.0
-
     d1_caisse = today - timedelta(days=60)
     if d1_caisse < date(2026, 1, 1):
         d1_caisse = date(2026, 1, 1)
 
-    with get_connection() as conn:
-        df_badge = pd.read_sql_query(
-            """
-            SELECT *
-            FROM planning
-            WHERE
-                COALESCE(IS_INDISPO,0) = 0
-                AND COALESCE(IS_SUPERSEDED,0) = 0
-                AND LOWER(COALESCE(PAIEMENT,'')) = 'caisse'
-                AND COALESCE(CAISSE_PAYEE,0) = 0
-                AND DATE_ISO >= ?
-                AND DATE_ISO <= ?
-            ORDER BY DATE_ISO, HEURE
-            """,
-            conn,
-            params=(d1_caisse.isoformat(), today.isoformat()),
+    try:
+        df_badge = read_caisse_unpaid_from_xlsm(
+            start_date=d1_caisse,
+            end_date=today,
+            ch_filter=ch_selected,
         )
+    except Exception as e:
+        print(f"⚠️ caisse XLSM chauffeur error: {e}", flush=True)
+        df_badge = pd.DataFrame()
 
-    if not df_badge.empty and "CH" in df_badge.columns:
-        ch_norm = normalize_ch_code(ch_selected)
-        df_badge = df_badge[
-            df_badge["CH"]
-            .fillna("")
-            .astype(str)
-            .str.upper()
-            .str.replace("*", "", regex=False)
-            .str.replace(" ", "", regex=False)
-            .str.startswith(ch_norm)
-        ].copy()
-
-    if not df_badge.empty:
-        df_badge["Caisse"] = pd.to_numeric(df_badge.get("Caisse", 0), errors="coerce").fillna(0.0)
+    if df_badge is not None and not df_badge.empty:
+        df_badge["Caisse"] = pd.to_numeric(df_badge["Caisse"], errors="coerce").fillna(0.0)
         df_badge = df_badge[df_badge["Caisse"] > 0].copy()
         total_caisse_due = float(df_badge["Caisse"].sum()) if not df_badge.empty else 0.0
         has_caisse_due = total_caisse_due > 0
@@ -7840,9 +7818,9 @@ def render_tab_chauffeur_driver():
         )
 
         if st.toggle("🧾 Voir le détail de la caisse", False):
-            detail_cols = ["DATE", "HEURE", "CH", "NOM", "DESIGNATION", "ADRESSE", "PAX", "PAIEMENT", "Caisse"]
+            detail_cols = ["EXCEL_ROW", "DATE", "HEURE", "CH", "NOM", "DESIGNATION", "ADRESSE", "PAX", "PAIEMENT", "Caisse"]
             detail_cols = [c for c in detail_cols if c in df_badge.columns]
-            st.caption(f"Calcul identique à l'admin : période du {d1_caisse.strftime('%d/%m/%Y')} au {today.strftime('%d/%m/%Y')}.")
+            st.caption(f"Source : XLSM Feuil1 — caisses blanches/non vertes du {d1_caisse.strftime('%d/%m/%Y')} au {today.strftime('%d/%m/%Y')}.")
             st.dataframe(df_badge[detail_cols] if detail_cols else df_badge, use_container_width=True, height=300)
     else:
         st.success("✅ Aucune caisse à remettre pour le moment.")
@@ -11539,9 +11517,9 @@ def render_tab_calcul_heures():
                 if st.button("🔄 Rafraîchir la caisse depuis Excel"):
                         n_sync_caisse = force_sync_caisse_green_from_excel(start_date=d1, end_date=today)
                         if n_sync_caisse > 0:
-                                st.success(f"✅ {n_sync_caisse} ligne(s) caisse verte(s) synchronisée(s). Le montant chauffeur lit maintenant directement les caisses blanches du XLSM.")
+                                st.success(f"✅ {n_sync_caisse} ligne(s) caisse verte(s) synchronisée(s). Les montants admin et chauffeur lisent directement les caisses blanches/non vertes du XLSM.")
                         else:
-                                st.info("Aucune nouvelle caisse verte à synchroniser. Le montant chauffeur est calculé directement sur les caisses blanches/non vertes du XLSM.")
+                                st.info("Aucune nouvelle caisse verte à synchroniser. Les montants admin et chauffeur sont calculés directement sur les caisses blanches/non vertes du XLSM.")
                         request_soft_refresh("caisse")
 
                 # ----------------- Chauffeur -----------------
@@ -11554,24 +11532,19 @@ def render_tab_calcul_heures():
                         ch_filter = None
 
                 # ==================================================
-                # 🔒 LECTURE DB DIRECTE (PAS get_planning)
+                # 🔒 SOURCE DE VÉRITÉ CAISSE = XLSM
                 # ==================================================
-                with get_connection() as conn:
-                        df_cash = pd.read_sql_query(
-                                """
-                                SELECT *
-                                FROM planning
-                                WHERE
-                                        COALESCE(IS_INDISPO,0) = 0
-                                        AND COALESCE(IS_SUPERSEDED,0) = 0
-                                        AND LOWER(COALESCE(PAIEMENT,'')) = 'caisse'
-                                        AND DATE_ISO >= ?
-                                        AND DATE_ISO <= ?
-                                ORDER BY DATE_ISO, HEURE
-                                """,
-                                conn,
-                                params=(d1.isoformat(), today.isoformat()),
+                # - cellule Caisse verte = payée => ignorée
+                # - cellule Caisse blanche/non verte = à remettre
+                try:
+                        df_cash = read_caisse_unpaid_from_xlsm(
+                                start_date=d1,
+                                end_date=today,
+                                ch_filter=None,
                         )
+                except Exception as e:
+                        st.error(f"Erreur lecture caisse XLSM : {e}")
+                        df_cash = pd.DataFrame()
 
 
                 # ==================================================
@@ -11580,8 +11553,6 @@ def render_tab_calcul_heures():
                 if not df_cash.empty:
                         df_cash2 = df_cash.copy()
                         df_cash2["Caisse"] = pd.to_numeric(df_cash2.get("Caisse", 0), errors="coerce").fillna(0.0)
-                        if "CAISSE_PAYEE" in df_cash2.columns:
-                                df_cash2 = df_cash2[df_cash2["CAISSE_PAYEE"].fillna(0).astype(int).eq(0)]
                         recap = (
                                 df_cash2.groupby(df_cash2["CH"].fillna("").astype(str).str.strip().str.upper())["Caisse"]
                                 .sum()
@@ -11597,7 +11568,7 @@ def render_tab_calcul_heures():
                 # DEBUG
                 if not df_cash.empty:
                         st.caption(
-                                f"DEBUG caisse — lignes chargées : {len(df_cash)} | "
+                                f"Source caisse XLSM — caisses blanches/non vertes : {len(df_cash)} | "
                                 f"date min = {df_cash['DATE_ISO'].min()} | "
                                 f"date max = {df_cash['DATE_ISO'].max()}"
                         )
@@ -11636,28 +11607,6 @@ def render_tab_calcul_heures():
                 if df_cash.empty:
                         st.success("✅ Aucune caisse à rentrer")
                         st.stop()
-
-                # ----------------- Dernière caisse payée -----------------
-                try:
-                        last_paid = get_last_caisse_paid_dates(ch_filter)
-                except Exception:
-                        last_paid = {}
-
-                if last_paid:
-                        df_cash["_date_iso"] = pd.to_datetime(df_cash["DATE_ISO"], errors="coerce")
-
-                        def _after_last_paid(row):
-                                ch_norm = normalize_ch_code(str(row.get("CH", "")))
-                                lp = last_paid.get(ch_norm)
-                                if not lp:
-                                        return True
-                                try:
-                                        return row["_date_iso"].date() > datetime.fromisoformat(lp).date()
-                                except Exception:
-                                        return True
-
-                        df_cash = df_cash[df_cash.apply(_after_last_paid, axis=1)]
-                        df_cash = df_cash.drop(columns=["_date_iso"], errors="ignore")
 
                 # ----------------- Non payées uniquement -----------------
                 if "CAISSE_PAYEE" in df_cash.columns:
