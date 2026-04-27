@@ -12804,49 +12804,36 @@ if __name__ == "__main__":
 
 
 
+
 def render_driver_caisse_details_from_xlsm(ch_code):
     """
-    Tableau détail caisse chauffeur depuis XLSM :
-    n'affiche que les caisses blanches/non vertes.
+    Détail caisse chauffeur aligné sur admin.
+    Le nom de la fonction est conservé pour compatibilité avec le reste de l'app.
     """
-    from datetime import date
-    import pandas as pd
-
-    ch_code = str(ch_code or "").strip().upper()
-    start_date = date(date.today().year, 1, 1)
-    end_date = date.today()
-
-    df_cash = read_caisse_unpaid_from_xlsm(start_date=start_date, end_date=end_date, ch_filter=ch_code)
+    total_due, df_cash = get_caisse_due_total_admin_logic(ch_code=ch_code)
 
     if df_cash is None or df_cash.empty:
-        st.success("✅ Aucune caisse à remettre selon l'Excel.")
+        st.success("✅ Aucune caisse à remettre.")
         return
 
-    total_due = pd.to_numeric(df_cash["Caisse"], errors="coerce").fillna(0.0).sum()
     st.warning(f"💶 Caisse à remettre : {float(total_due):.2f} €")
     st.dataframe(df_cash, use_container_width=True, height=360)
 
-
-def render_driver_caisse_badge(ch_code):
+def get_caisse_due_total_admin_logic(ch_code=None):
     """
-    Montant caisse chauffeur = même logique admin + synchro silencieuse des cellules vertes Excel.
-    Cela évite que des caisses déjà vertes dans Excel restent affichées à payer.
+    Calcul caisse identique admin/chauffeur :
+    - source DB planning full
+    - depuis le 1er janvier jusqu'à aujourd'hui
+    - PAIEMENT = caisse
+    - CAISSE_PAYEE != 1
+    - ignore IS_INDISPO / IS_SUPERSEDED
+    - filtre chauffeur si ch_code fourni
     """
     import pandas as pd
     from datetime import date
 
-    ch_code = str(ch_code or "").strip().upper()
-    if not ch_code:
-        return 0.0
-
     start_date = date(date.today().year, 1, 1)
     end_date = date.today()
-
-    # 🔄 Avant de calculer, on marque en DB les lignes vertes Excel comme payées.
-    try:
-        force_sync_caisse_green_from_excel(start_date=start_date, end_date=end_date, ch_filter=ch_code)
-    except Exception as e:
-        print(f"⚠️ driver caisse force sync skipped: {e}", flush=True)
 
     try:
         df = get_planning(
@@ -12860,18 +12847,20 @@ def render_driver_caisse_badge(ch_code):
         )
     except TypeError:
         df = get_planning(start_date=start_date, end_date=end_date, max_rows=50000, source="full")
-    except Exception:
-        return 0.0
+    except Exception as e:
+        print(f"⚠️ get_caisse_due_total_admin_logic error: {e}", flush=True)
+        return 0.0, pd.DataFrame()
 
     if df is None or df.empty:
-        return 0.0
+        return 0.0, pd.DataFrame()
 
     if "IS_INDISPO" in df.columns:
         df = df[df["IS_INDISPO"].fillna(0).astype(int) == 0].copy()
     if "IS_SUPERSEDED" in df.columns:
         df = df[df["IS_SUPERSEDED"].fillna(0).astype(int) == 0].copy()
 
-    if "CH" in df.columns:
+    if ch_code and "CH" in df.columns:
+        ch_norm = normalize_ch_code(str(ch_code or "").strip().upper())
         ch_series = (
             df["CH"].fillna("")
             .astype(str)
@@ -12880,34 +12869,37 @@ def render_driver_caisse_badge(ch_code):
             .str.replace(" ", "", regex=False)
             .str.strip()
         )
-        ch_norm = normalize_ch_code(ch_code)
+        # même logique large que l'admin : FA reprend FA / FA* / FADO...
         df = df[ch_series.str.startswith(ch_norm)].copy()
 
     if df.empty:
-        return 0.0
+        return 0.0, pd.DataFrame()
 
     pay_norm = df.get("PAIEMENT", pd.Series("", index=df.index)).fillna("").astype(str).str.strip().str.lower()
     df = df[pay_norm == "caisse"].copy()
-
-    if df.empty:
-        return 0.0
 
     if "CAISSE_PAYEE" in df.columns:
         df = df[df["CAISSE_PAYEE"].fillna(0).astype(int) == 0].copy()
 
     if df.empty:
-        return 0.0
+        return 0.0, pd.DataFrame()
 
     caisse_col = "Caisse" if "Caisse" in df.columns else ("CAISSE" if "CAISSE" in df.columns else None)
     if not caisse_col:
-        return 0.0
+        return 0.0, pd.DataFrame()
 
-    total_due = pd.to_numeric(df[caisse_col], errors="coerce").fillna(0.0)
-    total_due = float(total_due[total_due > 0].sum())
+    vals = pd.to_numeric(df[caisse_col], errors="coerce").fillna(0.0)
+    total = float(vals[vals > 0].sum())
+    return round(total, 2), df
 
-    return round(total_due, 2)
 
 
+def render_driver_caisse_badge(ch_code):
+    """
+    Montant caisse chauffeur aligné exactement sur le calcul admin.
+    """
+    total, _ = get_caisse_due_total_admin_logic(ch_code=ch_code)
+    return total
 
 def render_driver_caisse_details_from_xlsm(ch_code):
     """
@@ -12930,6 +12922,81 @@ def render_driver_caisse_details_from_xlsm(ch_code):
     total_due = pd.to_numeric(df_cash["Caisse"], errors="coerce").fillna(0.0).sum()
     st.warning(f"💶 Caisse à remettre : {float(total_due):.2f} €")
     st.dataframe(df_cash, use_container_width=True, height=360)
+
+
+
+def get_caisse_due_total_admin_logic(ch_code=None):
+    """
+    Calcul caisse identique admin/chauffeur :
+    - source DB planning full
+    - depuis le 1er janvier jusqu'à aujourd'hui
+    - PAIEMENT = caisse
+    - CAISSE_PAYEE != 1
+    - ignore IS_INDISPO / IS_SUPERSEDED
+    - filtre chauffeur si ch_code fourni
+    """
+    import pandas as pd
+    from datetime import date
+
+    start_date = date(date.today().year, 1, 1)
+    end_date = date.today()
+
+    try:
+        df = get_planning(
+            start_date=start_date,
+            end_date=end_date,
+            chauffeur=None,
+            type_filter=None,
+            search="",
+            max_rows=50000,
+            source="full",
+        )
+    except TypeError:
+        df = get_planning(start_date=start_date, end_date=end_date, max_rows=50000, source="full")
+    except Exception as e:
+        print(f"⚠️ get_caisse_due_total_admin_logic error: {e}", flush=True)
+        return 0.0, pd.DataFrame()
+
+    if df is None or df.empty:
+        return 0.0, pd.DataFrame()
+
+    if "IS_INDISPO" in df.columns:
+        df = df[df["IS_INDISPO"].fillna(0).astype(int) == 0].copy()
+    if "IS_SUPERSEDED" in df.columns:
+        df = df[df["IS_SUPERSEDED"].fillna(0).astype(int) == 0].copy()
+
+    if ch_code and "CH" in df.columns:
+        ch_norm = normalize_ch_code(str(ch_code or "").strip().upper())
+        ch_series = (
+            df["CH"].fillna("")
+            .astype(str)
+            .str.upper()
+            .str.replace("*", "", regex=False)
+            .str.replace(" ", "", regex=False)
+            .str.strip()
+        )
+        # même logique large que l'admin : FA reprend FA / FA* / FADO...
+        df = df[ch_series.str.startswith(ch_norm)].copy()
+
+    if df.empty:
+        return 0.0, pd.DataFrame()
+
+    pay_norm = df.get("PAIEMENT", pd.Series("", index=df.index)).fillna("").astype(str).str.strip().str.lower()
+    df = df[pay_norm == "caisse"].copy()
+
+    if "CAISSE_PAYEE" in df.columns:
+        df = df[df["CAISSE_PAYEE"].fillna(0).astype(int) == 0].copy()
+
+    if df.empty:
+        return 0.0, pd.DataFrame()
+
+    caisse_col = "Caisse" if "Caisse" in df.columns else ("CAISSE" if "CAISSE" in df.columns else None)
+    if not caisse_col:
+        return 0.0, pd.DataFrame()
+
+    vals = pd.to_numeric(df[caisse_col], errors="coerce").fillna(0.0)
+    total = float(vals[vals > 0].sum())
+    return round(total, 2), df
 
 
 def render_driver_caisse_badge(ch_code):
