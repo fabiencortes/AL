@@ -930,17 +930,15 @@ def get_trusted_device_token() -> str | None:
     except Exception:
         return None
 
+
 def set_login_cookie(token: str, login: str | None = None):
     token = str(token or "").strip()
     if not token:
         return
-
     login = str(login or "").strip().lower()
     token_js = _js_quote(token)
     login_js = _js_quote(login)
     max_age = int(LOGIN_PERSIST_HOURS * 3600)
-
-    # ✅ APP Streamlit: cookie + localStorage uniquement
     components.html(
         f"""
         <script>
@@ -968,7 +966,6 @@ def set_login_cookie(token: str, login: str | None = None):
                 }} catch (e) {{}}
                 return "; path=/; max-age=" + maxAge + "; SameSite=Lax";
             }}
-
             function safeGetLocal(key) {{
                 try {{ return w.localStorage.getItem(key) || ""; }} catch(e) {{ return ""; }}
             }}
@@ -979,24 +976,18 @@ def set_login_cookie(token: str, login: str | None = None):
                 try {{ w.document.cookie = key + "=" + encodeURIComponent(val) + cookieFlags(); }} catch(e) {{}}
             }}
 
-            // client_id stable par appareil (localStorage)
             let cid = safeGetLocal(clientKey);
             if (!cid) {{
                 cid = "cid-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
                 safeSetLocal(clientKey, cid);
             }}
 
-            // session
             safeSetLocal(sessionKey, sessionValue);
             safeSetCookie(sessionKey, sessionValue);
-
-            // login mémorisé pour Streamlit App
             if (loginValue) {{
                 safeSetLocal(loginKey, loginValue);
                 safeSetCookie(loginKey, loginValue);
             }}
-
-            // client_id
             safeSetLocal(clientKey, cid);
             safeSetCookie(clientParam, cid);
         }})();
@@ -1004,6 +995,7 @@ def set_login_cookie(token: str, login: str | None = None):
         """,
         height=0,
     )
+
 
 def clear_login_cookie():
     components.html(
@@ -1025,11 +1017,9 @@ def clear_login_cookie():
                     w.document.cookie = k + "=; path=/; max-age=0; SameSite=Lax";
                 }} catch (e) {{}}
             }}
-
             clearCookie(sessionKey);
             clearCookie(loginKey);
             clearCookie(clientParam);
-
             try {{ w.localStorage.removeItem(sessionKey); }} catch (e) {{}}
             try {{ w.localStorage.removeItem(loginKey); }} catch (e) {{}}
             try {{
@@ -1045,15 +1035,14 @@ def clear_login_cookie():
         height=0,
     )
 
+
 def restore_login_from_cookie():
     if st.session_state.get("logged_in"):
         return False
-
     bound_login = (
         str(get_device_bound_login() or "").strip().lower()
         or str(get_bound_login_cookie() or "").strip().lower()
     )
-
     raw = get_login_cookie()
     if not raw:
         raw = load_persistent_session_from_server()
@@ -1061,34 +1050,26 @@ def restore_login_from_cookie():
         raw = load_persistent_session_by_login(bound_login)
     if not raw:
         return False
-
     try:
         raw = unquote(str(raw).strip())
     except Exception:
         raw = str(raw).strip()
-
-    if not raw:
+    if not raw or "|" not in raw:
         return False
-
     try:
         login, token = raw.split("|", 1)
     except Exception:
         return False
-
     login = str(login or "").strip().lower()
     token = str(token or "").strip()
     if not login or not token:
         return False
-
-    # ✅ Anti-mix : si cet appareil est déjà lié à un autre login, on refuse la restauration auto
     bound = str(get_device_bound_login() or "").strip().lower()
     if bound and bound != login:
         return False
-
     user = USERS.get(login)
     if not user:
         return False
-
     st.session_state.logged_in = True
     st.session_state.username = login
     st.session_state.role = user.get("role")
@@ -1096,26 +1077,16 @@ def restore_login_from_cookie():
     st.session_state.session_token = token
     st.session_state.remember_me = True
     st.session_state["_persist_state_saved"] = True
-
-    # ✅ On "bind" l'appareil à ce login après une restauration réussie
     set_device_bound_login(login)
     try:
         st.session_state["device_bound_cid"] = str(get_client_id() or "").strip()
     except Exception:
         pass
-
-    # ✅ Repose le cookie/login localement si on a restauré depuis le serveur
     try:
         set_login_cookie(f"{login}|{token}", login)
     except Exception:
         pass
-
     return True
-# ============================================================
-#   LOGIN SCREEN
-# ============================================================
-
-from datetime import datetime
 
 def login_screen():
     st.title("🚐 Airports-Lines — Planning chauffeurs (DB)")
@@ -1990,64 +1961,180 @@ def sync_caisse_paid_from_excel_history(start_date=None, end_date=None) -> int:
         return 0
 
 
+
+def _safe_float_amount(v, default=0.0):
+    try:
+        if v is None:
+            return default
+        s = str(v).strip().replace("€", "").replace(" ", "").replace(",", ".")
+        if not s or s.lower() in {"nan", "none", "nat"}:
+            return default
+        return float(s)
+    except Exception:
+        return default
+
+
+def get_latest_fuel_price_for_date(target_date):
+    import pandas as pd
+    try:
+        d_iso = pd.to_datetime(target_date, errors="coerce")
+        if pd.isna(d_iso):
+            return None
+        d_iso = d_iso.strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+    candidate_tables = ["fuel_prices", "fuel_price_history", "dates_carburant", "carburant_prices", "fuel_surcharge_prices"]
+    candidate_date_cols = ["date", "DATE", "date_iso", "DATE_ISO", "jour", "JOUR"]
+    candidate_price_cols = ["price", "prix", "PRICE", "PRIX", "diesel", "DIESEL", "prix_diesel", "PRIX_DIESEL"]
+
+    with get_connection() as conn:
+        try:
+            tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        except Exception:
+            return None
+
+        for table in candidate_tables:
+            if table not in tables:
+                continue
+            try:
+                cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{table}")').fetchall()]
+            except Exception:
+                continue
+
+            dcol = next((c for c in candidate_date_cols if c in cols), None)
+            pcol = next((c for c in candidate_price_cols if c in cols), None)
+            if not dcol or not pcol:
+                continue
+
+            try:
+                sql = f'SELECT "{pcol}" FROM "{table}" WHERE date("{dcol}") <= date(?) ORDER BY date("{dcol}") DESC LIMIT 1'
+                row = conn.execute(sql, (d_iso,)).fetchone()
+                if row and row[0] is not None:
+                    val = _safe_float_amount(row[0], None)
+                    if val and val > 0:
+                        return float(val)
+            except Exception:
+                continue
+
+    return None
+
+
+def compute_surcharge_for_row_display(row):
+    import pandas as pd
+    from datetime import date
+    try:
+        existing = _safe_float_amount(row.get("SURCHARGE_CARBURANT"), 0.0)
+        if existing > 0:
+            return round(existing, 2)
+
+        d = pd.to_datetime(row.get("DATE_ISO") or row.get("DATE"), dayfirst=True, errors="coerce")
+        if pd.isna(d):
+            return 0.0
+        if d.date() < date(2026, 4, 1):
+            return 0.0
+
+        km = normalize_real_km(row.get("KM"))
+        if not km:
+            return 0.0
+
+        price = get_latest_fuel_price_for_date(d.date())
+        if price is None:
+            return 0.0
+
+        delta = float(price) - 1.54
+        if delta <= 0:
+            return 0.0
+
+        return round((float(km) * 8.0 / 100.0) * delta, 2)
+    except Exception:
+        return 0.0
+
+
 def render_tab_driver_complement_history(ch_selected: str):
     import pandas as pd
     from datetime import date, timedelta
 
     ch_selected = str(ch_selected or "").strip().upper()
     st.markdown(f"### 📚 Complément chauffeur — {ch_selected}")
-    st.caption("Historique des 15 derniers jours avec surcharge carburant à jour.")
+    st.caption("Historique des 15 derniers jours calendrier avec surcharge carburant à jour si disponible.")
 
     d_end = date.today()
     d_start = d_end - timedelta(days=15)
 
-    df_hist = get_planning(
-        start_date=d_start,
-        end_date=d_end,
-        chauffeur=ch_selected,
-        type_filter=None,
-        search="",
-        max_rows=20000,
-        source="full",
-    )
+    try:
+        df_hist = get_planning(
+            start_date=d_start,
+            end_date=d_end,
+            chauffeur=None,
+            type_filter=None,
+            search="",
+            max_rows=50000,
+            source="full",
+        )
+    except TypeError:
+        df_hist = get_planning(start_date=d_start, end_date=d_end, max_rows=50000, source="full")
 
     if df_hist is None or df_hist.empty:
         st.info("Aucun transfert trouvé sur les 15 derniers jours.")
         return
+
+    if "DATE_ISO" in df_hist.columns:
+        dser = pd.to_datetime(df_hist["DATE_ISO"], errors="coerce")
+    else:
+        dser = pd.to_datetime(df_hist.get("DATE", ""), dayfirst=True, errors="coerce")
+    df_hist = df_hist[(dser.dt.date >= d_start) & (dser.dt.date <= d_end)].copy()
 
     if "IS_INDISPO" in df_hist.columns:
         df_hist = df_hist[df_hist["IS_INDISPO"].fillna(0).astype(int) == 0].copy()
     if "IS_SUPERSEDED" in df_hist.columns:
         df_hist = df_hist[df_hist["IS_SUPERSEDED"].fillna(0).astype(int) == 0].copy()
 
-    ch_series = df_hist.get("CH", pd.Series("", index=df_hist.index)).fillna("").astype(str).str.upper().str.strip()
-    ch_norm = normalize_ch_code(ch_selected)
-    mask = (
-        (ch_series == ch_selected)
-        | (ch_series == f"{ch_selected}*")
-        | (ch_series.str.replace("*", "", regex=False).str.replace(" ", "", regex=False).str.startswith(ch_norm))
-    )
-    df_hist = _sort_df_by_date_heure(df_hist[mask].copy())
+    if "CH" in df_hist.columns:
+        ch_series = df_hist["CH"].fillna("").astype(str).str.upper().str.replace("*", "", regex=False).str.replace(" ", "", regex=False).str.strip()
+        ch_norm = normalize_ch_code(ch_selected)
+        df_hist = df_hist[ch_series.str.startswith(ch_norm)].copy()
 
     if df_hist.empty:
         st.info("Aucun transfert trouvé sur les 15 derniers jours.")
         return
 
-    cols = ["DATE","HEURE","CH","Unnamed: 8","DESIGNATION","GO","Num BDC","NOM","ADRESSE","CP","Localité","PAIEMENT","Caisse","KM","H TVA"]
-    cols = add_surcharge_column_if_allowed(cols)
+    try:
+        df_hist = _sort_df_by_date_heure(df_hist)
+    except Exception:
+        pass
+
+    if "SURCHARGE_CARBURANT" not in df_hist.columns:
+        df_hist["SURCHARGE_CARBURANT"] = 0.0
+    df_hist["SURCHARGE_CARBURANT"] = df_hist.apply(compute_surcharge_for_row_display, axis=1)
+
+    cols = ["DATE", "HEURE", "CH", "Unnamed: 8", "DESIGNATION", "GO", "Num BDC", "NOM", "ADRESSE", "CP", "Localité", "PAIEMENT", "Caisse", "KM", "H TVA", "SURCHARGE_CARBURANT"]
     for c in cols:
         if c not in df_hist.columns:
             df_hist[c] = ""
+
     df_show = df_hist[cols].copy()
 
-    if "SURCHARGE_CARBURANT" in df_show.columns:
-        try:
-            sur = pd.to_numeric(df_show["SURCHARGE_CARBURANT"], errors="coerce").fillna(0.0)
-            st.metric("⛽ Total surcharge (15 jours)", f"{sur.sum():.2f} €")
-        except Exception:
-            pass
+    try:
+        sur = pd.to_numeric(df_show["SURCHARGE_CARBURANT"], errors="coerce").fillna(0.0)
+        st.metric("⛽ Total surcharge (15 jours)", f"{sur.sum():.2f} €")
+    except Exception:
+        pass
 
-    st.dataframe(df_show, use_container_width=True, height=520)
+    st.caption(f"Période affichée : du {d_start.strftime('%d/%m/%Y')} au {d_end.strftime('%d/%m/%Y')}.")
+    st.dataframe(df_show, use_container_width=True, height=560)
+
+    try:
+        pdf = export_chauffeur_planning_table_pdf(df_show, f"{ch_selected}_15j")
+        st.download_button(
+            "⬇️ Télécharger le PDF complément 15 jours",
+            data=pdf,
+            file_name=f"planning_complement_{ch_selected}_{d_start.strftime('%Y%m%d')}_{d_end.strftime('%Y%m%d')}.pdf",
+            mime="application/pdf",
+            key=f"driver_complement_pdf_dl_{ch_selected}",
+        )
+    except Exception:
+        pass
 
 def render_excel_modified_indicator():
     """Affiche un indicateur 'Excel modifié depuis X min' (source Dropbox)."""
@@ -9913,7 +10000,62 @@ def _rules_prepare(df_rules: pd.DataFrame) -> pd.DataFrame:
     df = df[df["minutes_norm"] > 0]
 
     return df
+
+
+def get_last_chauffeur_confirmations(limit: int = 10):
+    import pandas as pd
+    try:
+        limit = max(1, min(int(limit or 10), 50))
+    except Exception:
+        limit = 10
+
+    with get_connection() as conn:
+        try:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(planning)").fetchall()]
+        except Exception:
+            cols = []
+
+        wanted = ["DATE", "HEURE", "CH", "NOM", "DESIGNATION", "Unnamed: 8", "ACK_AT", "ACK_TRAJET", "ACK_PROBLEME", "CONFIRMED", "CONFIRMED_AT"]
+        if "ACK_AT" in cols:
+            select_cols = [f'"{c}"' for c in wanted if c in cols]
+            if select_cols:
+                try:
+                    sql = f"""
+                        SELECT {", ".join(select_cols)}
+                        FROM planning
+                        WHERE COALESCE(ACK_AT,'') != ''
+                        ORDER BY ACK_AT DESC
+                        LIMIT ?
+                    """
+                    df = pd.read_sql_query(sql, conn, params=(limit,))
+                    if df is not None and not df.empty:
+                        return df
+                except Exception:
+                    pass
+
+    return pd.DataFrame()
+
 def render_tab_confirmation_chauffeur():
+
+    st.markdown("### 🕘 10 dernières réponses chauffeur")
+    try:
+        df_last_ack = get_last_chauffeur_confirmations(10)
+        if df_last_ack is None or df_last_ack.empty:
+            st.caption("Aucune réponse chauffeur récente. C’est normal si aucun chauffeur n’a encore confirmé/répondu depuis son app.")
+        else:
+            df_show_ack = df_last_ack.rename(columns={
+                "ACK_AT": "Répondu le",
+                "ACK_TRAJET": "Trajet compris",
+                "ACK_PROBLEME": "Commentaire / problème",
+                "CONFIRMED": "Confirmé admin",
+                "CONFIRMED_AT": "Confirmé le",
+                "Unnamed: 8": "Sens",
+            })
+            st.dataframe(df_show_ack, use_container_width=True, height=280)
+    except Exception as e:
+        st.warning(f"Impossible d'afficher les dernières réponses chauffeur : {e}")
+    st.divider()
+
     st.subheader("✅ Confirmation chauffeur")
     st.caption(
         "Validation définitive des navettes après réponse chauffeur. "
