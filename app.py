@@ -56,6 +56,7 @@ from email.mime.application import MIMEApplication
 import pandas as pd
 import requests
 from openpyxl import load_workbook
+from openpyxl.utils import column_index_from_string
 from io import BytesIO
 import streamlit as st
 import database as _database
@@ -391,6 +392,7 @@ import threading
 import streamlit.components.v1 as components
 
 LOGIN_PERSIST_KEY = "al_session"
+LOGIN_USER_KEY = "al_login"
 LOGIN_CLIENT_KEY = "al_cid"
 LOGIN_CLIENT_STORAGE_KEY = "al_cid_local"
 LOGIN_BOOTSTRAP_FLAG = "al_bootstrap_done"
@@ -404,6 +406,10 @@ def _js_quote(val: str) -> str:
 
 
 def ensure_persistent_sessions_table():
+    """
+    Table sessions persistantes compatible anciennes DB.
+    Corrige le cas où la table existe déjà sans colonne sid.
+    """
     try:
         with get_connection() as conn:
             conn.execute(
@@ -421,8 +427,28 @@ def ensure_persistent_sessions_table():
                 )
                 """
             )
+
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(persistent_sessions)").fetchall()]
+
+            wanted = {
+                "sid": 'ALTER TABLE persistent_sessions ADD COLUMN sid TEXT',
+                "login": 'ALTER TABLE persistent_sessions ADD COLUMN login TEXT',
+                "token": 'ALTER TABLE persistent_sessions ADD COLUMN token TEXT',
+                "remember_me": 'ALTER TABLE persistent_sessions ADD COLUMN remember_me INTEGER DEFAULT 1',
+                "active": 'ALTER TABLE persistent_sessions ADD COLUMN active INTEGER DEFAULT 1',
+                "created_at": 'ALTER TABLE persistent_sessions ADD COLUMN created_at TEXT',
+                "updated_at": 'ALTER TABLE persistent_sessions ADD COLUMN updated_at TEXT',
+                "expires_at": 'ALTER TABLE persistent_sessions ADD COLUMN expires_at TEXT',
+            }
+
+            for col, sql in wanted.items():
+                if col not in cols:
+                    conn.execute(sql)
+
             conn.execute("CREATE INDEX IF NOT EXISTS idx_persistent_sid ON persistent_sessions(sid)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_persistent_login ON persistent_sessions(login)")
             conn.commit()
+
     except Exception as e:
         print(f"⚠️ ensure_persistent_sessions_table error: {e}", flush=True)
 
@@ -478,6 +504,7 @@ def bootstrap_login_persistence():
         <script>
         (function() {{
             const sessionKey = {_js_quote(LOGIN_PERSIST_KEY)};
+            const loginKey = {_js_quote(LOGIN_USER_KEY)};
             const clientStorageKey = {_js_quote(LOGIN_CLIENT_STORAGE_KEY)};
             const clientParam = {_js_quote(LOGIN_CLIENT_KEY)};
             const bootFlag = {_js_quote(LOGIN_BOOTSTRAP_FLAG)};
@@ -536,6 +563,7 @@ def bootstrap_login_persistence():
             const w = getBestWin();
             const cid = ensureClientId(w);
             const sess = safeGetLocal(w, sessionKey);
+            const savedLogin = safeGetLocal(w, loginKey);
 
             if (cid) {{
                 safeSetCookie(w, clientParam, cid);
@@ -545,6 +573,11 @@ def bootstrap_login_persistence():
             if (sess) {{
                 safeSetCookie(w, sessionKey, sess);
                 safeSetLocal(w, sessionKey, sess);
+            }}
+
+            if (savedLogin) {{
+                safeSetCookie(w, loginKey, savedLogin);
+                safeSetLocal(w, loginKey, savedLogin);
             }}
 
             let url;
@@ -567,6 +600,11 @@ def bootstrap_login_persistence():
 
             if (sess && url.searchParams.get(sessionKey) !== sess) {{
                 url.searchParams.set(sessionKey, sess);
+                changed = true;
+            }}
+
+            if (savedLogin && url.searchParams.get(loginKey) !== savedLogin) {{
+                url.searchParams.set(loginKey, savedLogin);
                 changed = true;
             }}
 
@@ -684,6 +722,72 @@ def get_login_cookie():
 
     return None
 
+
+def load_persistent_session_by_login(login: str | None):
+    login = str(login or "").strip().lower()
+    if not login:
+        return None
+
+    ensure_persistent_sessions_table()
+
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT login, token, expires_at
+                FROM persistent_sessions
+                WHERE login = ?
+                  AND active = 1
+                  AND remember_me = 1
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT 1
+                """,
+                (login,),
+            ).fetchone()
+    except Exception as e:
+        print(f"⚠️ load_persistent_session_by_login error: {e}", flush=True)
+        return None
+
+    if not row:
+        return None
+
+    login_db, token, expires_at = row
+    try:
+        if expires_at and datetime.fromisoformat(str(expires_at)) < datetime.now():
+            return None
+    except Exception:
+        pass
+
+    login_db = str(login_db or "").strip().lower()
+    token = str(token or "").strip()
+    if not login_db or not token:
+        return None
+
+    return f"{login_db}|{token}"
+
+def get_bound_login_cookie():
+    for key in (LOGIN_USER_KEY,):
+        try:
+            val = st.query_params.get(key)
+            if isinstance(val, list):
+                val = val[0] if val else None
+            val = str(val or "").strip().lower()
+            if val:
+                return val
+        except Exception:
+            pass
+
+        try:
+            ctx = getattr(st, "context", None)
+            cookies = getattr(ctx, "cookies", None)
+            if cookies:
+                val = str(cookies.get(key) or "").strip().lower()
+                if val:
+                    return val
+        except Exception:
+            pass
+
+    return None
 
 def load_persistent_session_from_server():
     client_id = str(get_client_id() or "").strip()
@@ -851,23 +955,25 @@ def get_trusted_device_token() -> str | None:
     except Exception:
         return None
 
-def set_login_cookie(token: str):
+
+def set_login_cookie(token: str, login: str | None = None):
     token = str(token or "").strip()
     if not token:
         return
-
+    login = str(login or "").strip().lower()
     token_js = _js_quote(token)
+    login_js = _js_quote(login)
     max_age = int(LOGIN_PERSIST_HOURS * 3600)
-
-    # ✅ APP Streamlit: cookie + localStorage uniquement
     components.html(
         f"""
         <script>
         (function() {{
             const sessionKey = "{LOGIN_PERSIST_KEY}";
+            const loginKey = "{LOGIN_USER_KEY}";
             const clientKey = "{LOGIN_CLIENT_STORAGE_KEY}";
             const clientParam = "{LOGIN_CLIENT_KEY}";
             const sessionValue = {token_js};
+            const loginValue = {login_js};
             const maxAge = {max_age};
 
             function getBestWin() {{
@@ -885,7 +991,6 @@ def set_login_cookie(token: str):
                 }} catch (e) {{}}
                 return "; path=/; max-age=" + maxAge + "; SameSite=Lax";
             }}
-
             function safeGetLocal(key) {{
                 try {{ return w.localStorage.getItem(key) || ""; }} catch(e) {{ return ""; }}
             }}
@@ -896,18 +1001,18 @@ def set_login_cookie(token: str):
                 try {{ w.document.cookie = key + "=" + encodeURIComponent(val) + cookieFlags(); }} catch(e) {{}}
             }}
 
-            // client_id stable par appareil (localStorage)
             let cid = safeGetLocal(clientKey);
             if (!cid) {{
                 cid = "cid-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
                 safeSetLocal(clientKey, cid);
             }}
 
-            // session
             safeSetLocal(sessionKey, sessionValue);
             safeSetCookie(sessionKey, sessionValue);
-
-            // client_id
+            if (loginValue) {{
+                safeSetLocal(loginKey, loginValue);
+                safeSetCookie(loginKey, loginValue);
+            }}
             safeSetLocal(clientKey, cid);
             safeSetCookie(clientParam, cid);
         }})();
@@ -915,18 +1020,20 @@ def set_login_cookie(token: str):
         """,
         height=0,
     )
+
+
 def clear_login_cookie():
     components.html(
         f"""
         <script>
         (function() {{
             const sessionKey = {_js_quote(LOGIN_PERSIST_KEY)};
+            const loginKey = {_js_quote(LOGIN_USER_KEY)};
             const clientParam = {_js_quote(LOGIN_CLIENT_KEY)};
             const w = (function() {{ try {{ return window.parent || window; }} catch(e) {{ return window; }} }})();
 
             function clearCookie(k) {{
                 try {{
-                    // On tente de supprimer en mode https (Secure) et en mode http
                     if (w.location && w.location.protocol === "https:") {{
                         w.document.cookie = k + "=; path=/; max-age=0; SameSite=None; Secure";
                     }}
@@ -935,14 +1042,15 @@ def clear_login_cookie():
                     w.document.cookie = k + "=; path=/; max-age=0; SameSite=Lax";
                 }} catch (e) {{}}
             }}
-
             clearCookie(sessionKey);
+            clearCookie(loginKey);
             clearCookie(clientParam);
-
             try {{ w.localStorage.removeItem(sessionKey); }} catch (e) {{}}
+            try {{ w.localStorage.removeItem(loginKey); }} catch (e) {{}}
             try {{
                 const url = new URL(w.location.href);
                 url.searchParams.delete(sessionKey);
+                url.searchParams.delete(loginKey);
                 url.searchParams.delete(clientParam);
                 w.history.replaceState({{}}, "", url.toString());
             }} catch (e) {{}}
@@ -952,61 +1060,58 @@ def clear_login_cookie():
         height=0,
     )
 
+
 def restore_login_from_cookie():
     if st.session_state.get("logged_in"):
         return False
-
+    bound_login = (
+        str(get_device_bound_login() or "").strip().lower()
+        or str(get_bound_login_cookie() or "").strip().lower()
+    )
     raw = get_login_cookie()
     if not raw:
         raw = load_persistent_session_from_server()
+    if not raw and bound_login:
+        raw = load_persistent_session_by_login(bound_login)
     if not raw:
         return False
-
     try:
         raw = unquote(str(raw).strip())
     except Exception:
         raw = str(raw).strip()
-
-    if not raw:
+    if not raw or "|" not in raw:
         return False
-
     try:
         login, token = raw.split("|", 1)
     except Exception:
         return False
-
     login = str(login or "").strip().lower()
     token = str(token or "").strip()
     if not login or not token:
         return False
-
-    # ✅ Anti-mix : si cet appareil est déjà lié à un autre login, on refuse la restauration auto
-    bound = get_device_bound_login()
+    bound = str(get_device_bound_login() or "").strip().lower()
     if bound and bound != login:
-        # Optionnel: on peut nettoyer le cookie session pour éviter une boucle de mauvais restore
-        # clear_login_cookie()
         return False
-
     user = USERS.get(login)
     if not user:
         return False
-
     st.session_state.logged_in = True
     st.session_state.username = login
     st.session_state.role = user.get("role")
     st.session_state.chauffeur_code = user.get("chauffeur_code")
     st.session_state.session_token = token
     st.session_state.remember_me = True
-
-    # ✅ On "bind" l'appareil à ce login après une restauration réussie
+    st.session_state["_persist_state_saved"] = True
     set_device_bound_login(login)
-
+    try:
+        st.session_state["device_bound_cid"] = str(get_client_id() or "").strip()
+    except Exception:
+        pass
+    try:
+        set_login_cookie(f"{login}|{token}", login)
+    except Exception:
+        pass
     return True
-# ============================================================
-#   LOGIN SCREEN
-# ============================================================
-
-from datetime import datetime
 
 def login_screen():
     st.title("🚐 Airports-Lines — Planning chauffeurs (DB)")
@@ -1030,27 +1135,27 @@ def login_screen():
             # ✅ Force un client_id stable pour cet appareil
             cid = str(get_client_id() or "").strip()
 
+            role_norm = str(user.get("role") or "").strip().lower()
+            remember_me_effective = True if role_norm == "driver" else bool(remember_me)
+
             st.session_state.logged_in = True
             st.session_state.username = login_norm
             st.session_state.role = user["role"]
             st.session_state.chauffeur_code = user.get("chauffeur_code")
             st.session_state.session_token = token
-            st.session_state.remember_me = bool(remember_me)
+            st.session_state.remember_me = bool(remember_me_effective)
             st.session_state["_persist_state_saved"] = False
 
-            if remember_me:
+            if remember_me_effective:
                 # ✅ 1) Sauvegarde serveur PAR APPAREIL (anti-mix)
                 save_persistent_session(login_norm, token, True)
 
-                # ✅ 2) Sauvegarde locale APP Streamlit : cookie + localStorage uniquement
-                # (important: pas de query params pour éviter les sessions qui se mélangent)
-                set_login_cookie(f"{login_norm}|{token}")
+                # ✅ 2) Sauvegarde locale APP Streamlit : cookie + localStorage + login
+                set_login_cookie(f"{login_norm}|{token}", login_norm)
 
-                # ✅ 3) Optionnel (fortement recommandé) : marquer l'appareil comme associé à ce login
-                # (sert à refuser un restore si l'appareil essaie de reprendre un autre chauffeur)
+                # ✅ 3) Appareil lié à CE chauffeur jusqu'à déconnexion volontaire
                 st.session_state["device_bound_login"] = login_norm
                 st.session_state["device_bound_cid"] = cid
-
             else:
                 clear_persistent_session()
                 clear_login_cookie()
@@ -1657,6 +1762,404 @@ def normalize_ch_code(ch_raw: str) -> str:
     return code
 
 
+
+
+
+def _excel_cell_is_green_real(cell) -> bool:
+    try:
+        fill = getattr(cell, "fill", None)
+        if fill is None or fill.patternType is None:
+            return False
+        fg = getattr(fill, "fgColor", None)
+        if fg is None:
+            return False
+        if getattr(fg, "type", None) == "rgb" and getattr(fg, "rgb", None):
+            rgb = str(fg.rgb).upper()
+            return rgb.endswith("00B050") or rgb.endswith("92D050") or rgb.endswith("C6EFCE") or rgb.endswith("00FF00") or rgb in {"FF00B050", "FF92D050", "FFC6EFCE", "FF00FF00"}
+        if getattr(fg, "type", None) == "indexed":
+            return fg.indexed in {3, 4, 10, 17, 35, 43, 50}
+        if getattr(fg, "type", None) == "theme":
+            try:
+                tint = float(getattr(fg, "tint", 0) or 0)
+            except Exception:
+                tint = 0
+            return True if tint <= 0.4 else False
+    except Exception:
+        return False
+    return False
+
+
+def _normalize_name_for_match(val: str) -> str:
+    import unicodedata, re as _re
+    s = str(val or "").strip().upper()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = _re.sub(r"\s+", " ", s)
+    return s
+
+
+def _planning_ch_norm(v: str) -> str:
+    return normalize_ch_code(str(v or "").upper().replace(" ", "").replace("*", "").strip())
+
+
+def sync_caisse_paid_from_excel_history(start_date=None, end_date=None) -> int:
+    import pandas as pd
+    from io import BytesIO
+    from openpyxl import load_workbook
+    from datetime import datetime, date
+
+    def _norm_date_iso(val):
+        try:
+            return _clienthub_norm_iso(val)
+        except Exception:
+            pass
+        if val is None:
+            return None
+        try:
+            dt = pd.to_datetime(val, dayfirst=True, errors="coerce")
+            if pd.isna(dt):
+                return None
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            return None
+
+    def _norm_amount(v):
+        try:
+            if v is None:
+                return 0.0
+            s = str(v).strip().replace("€", "").replace("EUR", "").replace(" ", "")
+            s = s.replace(",", ".")
+            return round(float(s), 2)
+        except Exception:
+            return 0.0
+
+    try:
+        content = download_dropbox_excel_bytes()
+        if not content:
+            return 0
+        wb = load_workbook(BytesIO(content), data_only=True, keep_vba=True)
+        if "Feuil1" not in wb.sheetnames:
+            return 0
+        ws = wb["Feuil1"]
+
+        header_row = None
+        headers = {}
+        for i in range(1, min(15, ws.max_row) + 1):
+            row_map = {}
+            vals = []
+            for c in range(1, min(80, ws.max_column) + 1):
+                v = ws.cell(row=i, column=c).value
+                s = str(v or "").strip()
+                vals.append(s.upper())
+                if s:
+                    row_map[s.upper()] = c
+            if "DATE" in vals and "HEURE" in vals:
+                header_row = i
+                headers = row_map
+                break
+        if not header_row:
+            return 0
+
+        c_date = headers.get("DATE")
+        c_heure = headers.get("HEURE")
+        c_ch = headers.get("CH")
+        c_nom = headers.get("NOM")
+        c_paiement = headers.get("PAIEMENT") or headers.get("PAIEME")
+        c_caisse = headers.get("CAISSE")
+        if not all([c_date, c_ch, c_paiement, c_caisse]):
+            return 0
+
+        s1 = pd.to_datetime(start_date, errors="coerce") if start_date is not None else None
+        s2 = pd.to_datetime(end_date, errors="coerce") if end_date is not None else None
+        start_iso = None if pd.isna(s1) else s1.strftime("%Y-%m-%d")
+        end_iso = None if pd.isna(s2) else s2.strftime("%Y-%m-%d")
+
+        excel_rows = []
+        for r in range(header_row + 1, ws.max_row + 1):
+            date_iso = _norm_date_iso(ws.cell(r, c_date).value)
+            if not date_iso:
+                continue
+            if start_iso and date_iso < start_iso:
+                continue
+            if end_iso and date_iso > end_iso:
+                continue
+            paiement = str(ws.cell(r, c_paiement).value or "").strip().lower()
+            if paiement != "caisse":
+                continue
+            amount = _norm_amount(ws.cell(r, c_caisse).value)
+            if amount <= 0:
+                continue
+            if not _excel_cell_is_green_real(ws.cell(r, c_caisse)):
+                continue
+            excel_rows.append({
+                "date_iso": date_iso,
+                "heure": normalize_time_string(ws.cell(r, c_heure).value) if c_heure else "",
+                "ch": _planning_ch_norm(ws.cell(r, c_ch).value if c_ch else ""),
+                "nom": _normalize_name_for_match(ws.cell(r, c_nom).value if c_nom else ""),
+                "amount": amount,
+                "rownum": r,
+            })
+
+        if not excel_rows:
+            return 0
+
+        with get_connection() as conn:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(planning)").fetchall()]
+            if "CAISSE_PAYEE" not in cols:
+                conn.execute('ALTER TABLE planning ADD COLUMN "CAISSE_PAYEE" INTEGER DEFAULT 0')
+            if "CAISSE_PAYEE_AT" not in cols:
+                conn.execute('ALTER TABLE planning ADD COLUMN "CAISSE_PAYEE_AT" TEXT')
+            if "CAISSE_COMMENT" not in cols:
+                conn.execute('ALTER TABLE planning ADD COLUMN "CAISSE_COMMENT" TEXT')
+            conn.commit()
+
+            db = pd.read_sql_query(
+                """
+                SELECT id, DATE_ISO, DATE, HEURE, CH, NOM, Caisse, PAIEMENT,
+                       COALESCE(CAISSE_PAYEE,0) AS CAISSE_PAYEE,
+                       COALESCE(IS_INDISPO,0) AS IS_INDISPO,
+                       COALESCE(IS_SUPERSEDED,0) AS IS_SUPERSEDED
+                FROM planning
+                WHERE COALESCE(IS_INDISPO,0)=0
+                  AND COALESCE(IS_SUPERSEDED,0)=0
+                  AND LOWER(COALESCE(PAIEMENT,''))='caisse'
+                  AND COALESCE(CAISSE_PAYEE,0)=0
+                  AND COALESCE(DATE_ISO,'') >= ?
+                  AND COALESCE(DATE_ISO,'') <= ?
+                """,
+                conn,
+                params=(start_iso or '1900-01-01', end_iso or '2999-12-31')
+            )
+            if db.empty:
+                return 0
+            db["CH_NORM"] = db.get("CH", "").map(_planning_ch_norm)
+            db["NOM_NORM"] = db.get("NOM", "").map(_normalize_name_for_match)
+            db["HEURE_NORM"] = db.get("HEURE", "").map(normalize_time_string)
+            db["CAISSE_NUM"] = pd.to_numeric(db.get("Caisse", 0), errors="coerce").fillna(0.0).round(2)
+            db["DATE_ISO"] = db["DATE_ISO"].astype(str)
+
+            used_ids = set()
+            matched_ids = []
+            for ex in excel_rows:
+                cand = db[(db["DATE_ISO"] == ex["date_iso"]) & (db["CH_NORM"] == ex["ch"]) & ((db["CAISSE_NUM"] - ex["amount"]).abs() < 0.01)].copy()
+                if cand.empty:
+                    continue
+                cand = cand[~cand["id"].isin(used_ids)].copy()
+                if cand.empty:
+                    continue
+                cand["score"] = 0
+                if ex["nom"]:
+                    cand.loc[cand["NOM_NORM"] == ex["nom"], "score"] += 10
+                if ex["heure"]:
+                    cand.loc[cand["HEURE_NORM"] == ex["heure"], "score"] += 5
+                cand["delta_heure"] = 9999
+                if ex["heure"]:
+                    def _to_min(t):
+                        try:
+                            hh, mm = str(t).split(":", 1)
+                            return int(hh) * 60 + int(mm)
+                        except Exception:
+                            return None
+                    exm = _to_min(ex["heure"])
+                    if exm is not None:
+                        vals = []
+                        for t in cand["HEURE_NORM"].tolist():
+                            tm = _to_min(t)
+                            vals.append(abs(tm - exm) if tm is not None else 9999)
+                        cand["delta_heure"] = vals
+                cand = cand.sort_values(["score", "delta_heure", "id"], ascending=[False, True, True])
+                best_id = int(cand.iloc[0]["id"])
+                used_ids.add(best_id)
+                matched_ids.append(best_id)
+
+            if not matched_ids:
+                return 0
+
+            now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            q = ",".join(["?"] * len(matched_ids))
+            sql = f"UPDATE planning SET CAISSE_PAYEE = 1, CAISSE_PAYEE_AT = COALESCE(CAISSE_PAYEE_AT, ?), CAISSE_COMMENT = CASE WHEN COALESCE(CAISSE_COMMENT,'')='' THEN 'Payée détectée depuis Excel (vert réel)' ELSE CAISSE_COMMENT END WHERE id IN ({q})"
+            conn.execute(sql, [now_iso] + matched_ids)
+            conn.commit()
+            return len(matched_ids)
+    except Exception as e:
+        print(f"⚠️ sync_caisse_paid_from_excel_history error: {e}", flush=True)
+        return 0
+
+
+
+def _safe_float_amount(v, default=0.0):
+    try:
+        if v is None:
+            return default
+        s = str(v).strip().replace("€", "").replace(" ", "").replace(",", ".")
+        if not s or s.lower() in {"nan", "none", "nat"}:
+            return default
+        return float(s)
+    except Exception:
+        return default
+
+
+def get_latest_fuel_price_for_date(target_date):
+    import pandas as pd
+    try:
+        d_iso = pd.to_datetime(target_date, errors="coerce")
+        if pd.isna(d_iso):
+            return None
+        d_iso = d_iso.strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+    candidate_tables = ["fuel_prices", "fuel_price_history", "dates_carburant", "carburant_prices", "fuel_surcharge_prices"]
+    candidate_date_cols = ["date", "DATE", "date_iso", "DATE_ISO", "jour", "JOUR"]
+    candidate_price_cols = ["price", "prix", "PRICE", "PRIX", "diesel", "DIESEL", "prix_diesel", "PRIX_DIESEL"]
+
+    with get_connection() as conn:
+        try:
+            tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        except Exception:
+            return None
+
+        for table in candidate_tables:
+            if table not in tables:
+                continue
+            try:
+                cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{table}")').fetchall()]
+            except Exception:
+                continue
+
+            dcol = next((c for c in candidate_date_cols if c in cols), None)
+            pcol = next((c for c in candidate_price_cols if c in cols), None)
+            if not dcol or not pcol:
+                continue
+
+            try:
+                sql = f'SELECT "{pcol}" FROM "{table}" WHERE date("{dcol}") <= date(?) ORDER BY date("{dcol}") DESC LIMIT 1'
+                row = conn.execute(sql, (d_iso,)).fetchone()
+                if row and row[0] is not None:
+                    val = _safe_float_amount(row[0], None)
+                    if val and val > 0:
+                        return float(val)
+            except Exception:
+                continue
+
+    return None
+
+
+def compute_surcharge_for_row_display(row):
+    import pandas as pd
+    from datetime import date
+    try:
+        existing = _safe_float_amount(row.get("SURCHARGE_CARBURANT"), 0.0)
+        if existing > 0:
+            return round(existing, 2)
+
+        d = pd.to_datetime(row.get("DATE_ISO") or row.get("DATE"), dayfirst=True, errors="coerce")
+        if pd.isna(d):
+            return 0.0
+        if d.date() < date(2026, 4, 1):
+            return 0.0
+
+        km = normalize_real_km(row.get("KM"))
+        if not km:
+            return 0.0
+
+        price = get_latest_fuel_price_for_date(d.date())
+        if price is None:
+            return 0.0
+
+        delta = float(price) - 1.54
+        if delta <= 0:
+            return 0.0
+
+        return round((float(km) * 8.0 / 100.0) * delta, 2)
+    except Exception:
+        return 0.0
+
+
+def render_tab_driver_complement_history(ch_selected: str):
+    import pandas as pd
+    from datetime import date, timedelta
+
+    ch_selected = str(ch_selected or "").strip().upper()
+    st.markdown(f"### 📚 Complément chauffeur — {ch_selected}")
+    st.caption("Historique des 15 derniers jours calendrier avec surcharge carburant à jour si disponible.")
+
+    d_end = date.today()
+    d_start = d_end - timedelta(days=15)
+
+    try:
+        df_hist = get_planning(
+            start_date=d_start,
+            end_date=d_end,
+            chauffeur=None,
+            type_filter=None,
+            search="",
+            max_rows=50000,
+            source="full",
+        )
+    except TypeError:
+        df_hist = get_planning(start_date=d_start, end_date=d_end, max_rows=50000, source="full")
+
+    if df_hist is None or df_hist.empty:
+        st.info("Aucun transfert trouvé sur les 15 derniers jours.")
+        return
+
+    if "DATE_ISO" in df_hist.columns:
+        dser = pd.to_datetime(df_hist["DATE_ISO"], errors="coerce")
+    else:
+        dser = pd.to_datetime(df_hist.get("DATE", ""), dayfirst=True, errors="coerce")
+    df_hist = df_hist[(dser.dt.date >= d_start) & (dser.dt.date <= d_end)].copy()
+
+    if "IS_INDISPO" in df_hist.columns:
+        df_hist = df_hist[df_hist["IS_INDISPO"].fillna(0).astype(int) == 0].copy()
+    if "IS_SUPERSEDED" in df_hist.columns:
+        df_hist = df_hist[df_hist["IS_SUPERSEDED"].fillna(0).astype(int) == 0].copy()
+
+    if "CH" in df_hist.columns:
+        ch_series = df_hist["CH"].fillna("").astype(str).str.upper().str.replace("*", "", regex=False).str.replace(" ", "", regex=False).str.strip()
+        ch_norm = normalize_ch_code(ch_selected)
+        df_hist = df_hist[ch_series.str.startswith(ch_norm)].copy()
+
+    if df_hist.empty:
+        st.info("Aucun transfert trouvé sur les 15 derniers jours.")
+        return
+
+    try:
+        df_hist = _sort_df_by_date_heure(df_hist)
+    except Exception:
+        pass
+
+    if "SURCHARGE_CARBURANT" not in df_hist.columns:
+        df_hist["SURCHARGE_CARBURANT"] = 0.0
+    df_hist["SURCHARGE_CARBURANT"] = df_hist.apply(compute_surcharge_for_row_display, axis=1)
+
+    cols = ["DATE", "HEURE", "CH", "Unnamed: 8", "DESIGNATION", "GO", "Num BDC", "NOM", "ADRESSE", "CP", "Localité", "PAIEMENT", "Caisse", "KM", "H TVA", "SURCHARGE_CARBURANT"]
+    for c in cols:
+        if c not in df_hist.columns:
+            df_hist[c] = ""
+
+    df_show = df_hist[cols].copy()
+
+    try:
+        sur = pd.to_numeric(df_show["SURCHARGE_CARBURANT"], errors="coerce").fillna(0.0)
+        st.metric("⛽ Total surcharge (15 jours)", f"{sur.sum():.2f} €")
+    except Exception:
+        pass
+
+    st.caption(f"Période affichée : du {d_start.strftime('%d/%m/%Y')} au {d_end.strftime('%d/%m/%Y')}.")
+    st.dataframe(df_show, use_container_width=True, height=560)
+
+    try:
+        pdf = export_chauffeur_planning_table_pdf(df_show, f"{ch_selected}_15j")
+        st.download_button(
+            "⬇️ Télécharger le PDF complément 15 jours",
+            data=pdf,
+            file_name=f"planning_complement_{ch_selected}_{d_start.strftime('%Y%m%d')}_{d_end.strftime('%Y%m%d')}.pdf",
+            mime="application/pdf",
+            key=f"driver_complement_pdf_dl_{ch_selected}",
+        )
+    except Exception:
+        pass
 
 def render_excel_modified_indicator():
     """Affiche un indicateur 'Excel modifié depuis X min' (source Dropbox)."""
@@ -4400,19 +4903,310 @@ def _send_planning_next_4_days_to_all(*, want_pdf: bool = True) -> dict:
     return recap
 
 
-def _topbar_sync_db_and_refresh(*, also_send_next4: bool = False):
-    """Bouton top-bar : MAJ DB depuis Dropbox puis rafraîchit l'UI.
-    Option: envoi aussi le planning des 3 prochains jours.
+
+# ============================================================
+#   🚀 SYNCHRO PLANNING RAPIDE RÉELLE — FEUIL1 UNIQUEMENT J -> J+7
+# ============================================================
+def sync_planning_j7_force_fast(excel_sync_ts: str | None = None, *, ui: bool = True) -> int:
     """
-    from datetime import datetime
+    Bouton MAJ rapide :
+    - force le téléchargement du dernier XLSM Dropbox (pas de cache)
+    - lit uniquement Feuil1
+    - synchronise uniquement aujourd'hui + les 7 jours suivants
+    - ne touche pas Feuil2/Feuil3/chauffeurs
+    - ne modifie pas le XLSM
+    - ne synchronise pas les couleurs/caisse
+    """
+    import re
+    import pandas as pd
+    from io import BytesIO
+    from datetime import datetime, date, timedelta
+
+    def _ui_info(msg):
+        if ui:
+            st.info(msg)
+        else:
+            print(msg, flush=True)
+
+    def _ui_warn(msg):
+        if ui:
+            st.warning(msg)
+        else:
+            print(f"⚠️ {msg}", flush=True)
+
+    # 1) Force lecture Dropbox — aucune lecture cache
+    content = download_dropbox_excel_bytes(DROPBOX_FILE_PATH)
+    if not content:
+        _ui_warn("Impossible de télécharger le XLSM Dropbox.")
+        return 0
+
+    # 2) Lecture Feuil1 uniquement + détection entête DATE/HEURE
+    bio = BytesIO(content)
+    try:
+        raw = pd.read_excel(bio, sheet_name="Feuil1", header=None, engine="openpyxl").fillna("")
+    except Exception as e:
+        _ui_warn(f"Lecture Feuil1 impossible : {e}")
+        return 0
+
+    header_row = None
+    for i in range(min(15, len(raw))):
+        vals = raw.iloc[i].astype(str).str.strip().str.upper().tolist()
+        if "DATE" in vals and "HEURE" in vals:
+            header_row = i
+            break
+    if header_row is None:
+        _ui_warn("Entête DATE/HEURE introuvable dans Feuil1.")
+        return 0
+
+    df_excel = pd.read_excel(BytesIO(content), sheet_name="Feuil1", header=header_row, engine="openpyxl").fillna("")
+    if df_excel.empty:
+        _ui_info("Feuil1 vide.")
+        return 0
+
+    # 3) Normalisation date rapide + filtre J -> J+7
+    today = date.today()
+    end_day = today + timedelta(days=7)
+    today_iso = today.strftime("%Y-%m-%d")
+    end_iso = end_day.strftime("%Y-%m-%d")
+    now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _norm_date_iso(val):
+        if val is None:
+            return None
+        if isinstance(val, (datetime, date)):
+            return val.strftime("%Y-%m-%d")
+        try:
+            if isinstance(val, (int, float)) and not pd.isna(val) and 20000 <= float(val) <= 60000:
+                dt = pd.to_datetime(float(val), unit="D", origin="1899-12-30", errors="coerce")
+                if not pd.isna(dt):
+                    return dt.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+        s0 = str(val or "").strip()
+        if not s0 or s0.lower() in {"nan", "none", "nat"}:
+            return None
+        s = s0.lower()
+        # retire le jour écrit en français
+        s = re.sub(r"^(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)\s+", "", s).strip()
+        months = {
+            "janvier":"01", "février":"02", "fevrier":"02", "mars":"03", "avril":"04",
+            "mai":"05", "juin":"06", "juillet":"07", "août":"08", "aout":"08",
+            "septembre":"09", "octobre":"10", "novembre":"11", "décembre":"12", "decembre":"12",
+        }
+        m = re.match(r"^(\d{1,2})\s+([a-zéèêûùôîïàç]+)\s+(\d{4})$", s)
+        if m and m.group(2) in months:
+            return f"{int(m.group(3)):04d}-{months[m.group(2)]}-{int(m.group(1)):02d}"
+        try:
+            dt = pd.to_datetime(s0, dayfirst=True, errors="coerce")
+            if not pd.isna(dt):
+                return dt.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+        return None
+
+    if "DATE" not in df_excel.columns:
+        _ui_warn("Colonne DATE absente.")
+        return 0
+
+    df_excel["DATE_ISO"] = df_excel["DATE"].apply(_norm_date_iso)
+    df_excel = df_excel[df_excel["DATE_ISO"].notna()].copy()
+    df_excel = df_excel[(df_excel["DATE_ISO"] >= today_iso) & (df_excel["DATE_ISO"] <= end_iso)].copy()
+    if df_excel.empty:
+        _ui_info("Aucune ligne à synchroniser entre aujourd'hui et J+7.")
+        return 0
+
+    df_excel["DATE"] = pd.to_datetime(df_excel["DATE_ISO"], errors="coerce").dt.strftime("%d/%m/%Y")
+    if "HEURE" in df_excel.columns:
+        df_excel["HEURE"] = df_excel["HEURE"].apply(normalize_time_string).fillna("")
+    else:
+        df_excel["HEURE"] = ""
+
+    # 4) Flags minimum sans relire les couleurs Excel
+    for c, default in {
+        "IS_INDISPO": 0,
+        "IS_BUREAU": 0,
+        "IS_SUPERSEDED": 0,
+        "CH_COLOR": "",
+        "CAISSE_COLOR": "",
+    }.items():
+        if c not in df_excel.columns:
+            df_excel[c] = default
+
+    # 5) EXCEL_UID + row_key
+    def _norm_txt_uid(v):
+        return str(v or "").strip().lower()
+
+    def _make_excel_uid(row):
+        num_bdc = _norm_txt_uid(row.get("Num BDC") or row.get("NUM BDC") or row.get("BDC"))
+        vol = _norm_txt_uid(row.get("N° Vol") or row.get("N°Vol") or row.get("N Vol") or row.get("VOL"))
+        nom = _norm_txt_uid(row.get("NOM"))
+        adresse = _norm_txt_uid(row.get("ADRESSE"))
+        cp = _norm_txt_uid(row.get("CP"))
+        loc = _norm_txt_uid(row.get("Localité") or row.get("LOCALITE"))
+        designation = _norm_txt_uid(row.get("DESIGNATION") or row.get("DESTINATION"))
+        sens = _norm_txt_uid(row.get("Unnamed: 8"))
+        if num_bdc:
+            return f"BDC|{num_bdc}|{nom}"
+        if vol:
+            return f"VOL|{vol}|{nom}"
+        return "|".join(["FALLBACK", nom, adresse, cp, loc, designation, sens])
+
+    df_excel["EXCEL_UID"] = df_excel.apply(_make_excel_uid, axis=1)
+    df_excel["row_key"] = df_excel.apply(lambda r: str(r.get("row_key") or "").strip() or make_row_key_from_row(r.to_dict()), axis=1)
+    df_excel = df_excel[df_excel["row_key"].astype(str).str.strip() != ""].copy()
+    df_excel = df_excel.drop_duplicates(subset=["row_key"]).copy()
+
+    planning_cols = get_planning_table_columns()
+
+    # Colonnes minimales à créer seulement si elles manquent vraiment, pas de création de tables annexes
+    with get_connection() as conn:
+        existing_cols = [r[1] for r in conn.execute("PRAGMA table_info(planning)").fetchall()]
+        for col, ddl in {
+            "DATE_ISO": 'ALTER TABLE planning ADD COLUMN "DATE_ISO" TEXT',
+            "row_key": 'ALTER TABLE planning ADD COLUMN "row_key" TEXT',
+            "updated_at": 'ALTER TABLE planning ADD COLUMN "updated_at" TEXT',
+            "IS_SUPERSEDED": 'ALTER TABLE planning ADD COLUMN "IS_SUPERSEDED" INTEGER DEFAULT 0',
+            "EXCEL_UID": 'ALTER TABLE planning ADD COLUMN "EXCEL_UID" TEXT',
+            "IS_INDISPO": 'ALTER TABLE planning ADD COLUMN "IS_INDISPO" INTEGER DEFAULT 0',
+            "IS_BUREAU": 'ALTER TABLE planning ADD COLUMN "IS_BUREAU" INTEGER DEFAULT 0',
+            "LOCKED_BY_APP": 'ALTER TABLE planning ADD COLUMN "LOCKED_BY_APP" INTEGER DEFAULT 0',
+        }.items():
+            if col not in existing_cols:
+                conn.execute(ddl)
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_planning_row_key ON planning(row_key)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_planning_date_iso ON planning(DATE_ISO)")
+        except Exception:
+            pass
+        conn.commit()
+
+    planning_cols = get_planning_table_columns()
+
+    EXCEL_TO_DB_COLS = {
+        "NUM BDC": "Num BDC",
+        "Num BDC": "Num BDC",
+        "BDC": "Num BDC",
+        "Paiement": "PAIEMENT",
+        "Caisse": "Caisse",
+        "REH": "Reh",
+        "Reh": "Reh",
+        "Siège": "Siège",
+        "SIEGE": "Siège",
+        "N° Vol": "N° Vol",
+    }
+
+    # 6) Préserve confirmations/caisse payée si même row_key, puis remplace J -> J+7
+    with get_connection() as conn:
+        cur = conn.cursor()
+        prev_rows = cur.execute(
+            """
+            SELECT row_key, CONFIRMED, CONFIRMED_AT, ACK_AT, ACK_TEXT, CAISSE_PAYEE, CAISSE_PAYEE_AT, CAISSE_COMMENT
+            FROM planning
+            WHERE COALESCE(row_key,'') != ''
+              AND date(COALESCE(DATE_ISO, DATE)) BETWEEN date(?) AND date(?)
+            """,
+            (today_iso, end_iso),
+        ).fetchall()
+        prev_map = {str(r[0]): r[1:] for r in prev_rows}
+
+        cur.execute(
+            """
+            DELETE FROM planning
+            WHERE date(
+                CASE
+                    WHEN COALESCE(DATE_ISO,'') != '' THEN DATE_ISO
+                    WHEN LENGTH(DATE) = 10 AND substr(DATE,3,1)='/' THEN substr(DATE,7,4)||'-'||substr(DATE,4,2)||'-'||substr(DATE,1,2)
+                    ELSE DATE
+                END
+            ) BETWEEN date(?) AND date(?)
+              AND (LOCKED_BY_APP IS NULL OR LOCKED_BY_APP=0)
+            """,
+            (today_iso, end_iso),
+        )
+
+        inserts = 0
+        for _, row in df_excel.iterrows():
+            rk = str(row.get("row_key") or "").strip()
+            if not rk:
+                continue
+            data = {}
+            for col in df_excel.columns:
+                if col in planning_cols and col != "id":
+                    data[col] = sqlite_safe(row.get(col))
+            for excel_col, db_col in EXCEL_TO_DB_COLS.items():
+                if excel_col in df_excel.columns and db_col in planning_cols:
+                    data[db_col] = sqlite_safe(row.get(excel_col))
+            if excel_sync_ts and "EXCEL_SYNC_TS" in planning_cols:
+                data["EXCEL_SYNC_TS"] = excel_sync_ts
+            data["row_key"] = rk
+            if "updated_at" in planning_cols:
+                data["updated_at"] = now_iso
+            if "IS_SUPERSEDED" in planning_cols:
+                data["IS_SUPERSEDED"] = 0
+            if "EXCEL_UID" in planning_cols:
+                data["EXCEL_UID"] = sqlite_safe(row.get("EXCEL_UID"))
+
+            prev = prev_map.get(rk)
+            if prev:
+                names = ["CONFIRMED", "CONFIRMED_AT", "ACK_AT", "ACK_TEXT", "CAISSE_PAYEE", "CAISSE_PAYEE_AT", "CAISSE_COMMENT"]
+                for name, val in zip(names, prev):
+                    if name in planning_cols:
+                        data[name] = val
+
+            cols_ins = [c for c in data.keys() if c in planning_cols]
+            if not cols_ins:
+                continue
+            col_sql = ", ".join([f'"{c}"' for c in cols_ins])
+            placeholders = ", ".join(["?"] * len(cols_ins))
+            values = [data[c] for c in cols_ins]
+            try:
+                cur.execute(f"INSERT INTO planning ({col_sql}) VALUES ({placeholders})", values)
+                inserts += 1
+            except Exception as e:
+                print(f"⚠️ insert planning J7 skipped: {e}", flush=True)
+
+        conn.commit()
+
+    # 7) Vue planning immédiatement mise à jour
+    rebuild_planning_views()
+
+    # 8) Cache ciblé
+    try:
+        get_planning.clear()
+    except Exception:
+        pass
+    try:
+        get_chauffeur_planning.clear()
+    except Exception:
+        pass
+    try:
+        load_planning_for_period.clear()
+    except Exception:
+        pass
 
     try:
-        with st.spinner("🔄 Synchronisation Dropbox → DB…"):
-            # force un refresh même si Dropbox n’a pas changé : on passe un ts unique
-            try:
-                sync_planning_from_today(excel_sync_ts=datetime.now().isoformat(), ui=True)
-            except TypeError:
-                sync_planning_from_today(ui=True)
+        set_meta("excel_last_forced_sync_at", datetime.now().isoformat(timespec="seconds"))
+    except Exception:
+        pass
+    if ui:
+        st.session_state["last_sync_time"] = datetime.now().strftime("%H:%M")
+
+    return int(inserts)
+
+def _topbar_sync_db_and_refresh(*, also_send_next4: bool = False):
+    """MAJ rapide : force Feuil1 XLSM et synchronise uniquement J -> J+7."""
+    from datetime import datetime
+    if st.session_state.get("sync_running"):
+        st.warning("⏳ Une mise à jour est déjà en cours.")
+        return
+    st.session_state["sync_running"] = True
+    try:
+        with st.spinner("🔄 Lecture forcée XLSM → planning J à J+7…"):
+            inserted = sync_planning_j7_force_fast(
+                excel_sync_ts=datetime.now().isoformat(timespec="seconds"),
+                ui=True,
+            )
+        st.success(f"✅ Planning J à J+7 mis à jour : {inserted} ligne(s) chargée(s).")
 
         if also_send_next4:
             with st.spinner("📧 Envoi planning (3 prochains jours)…"):
@@ -4421,17 +5215,15 @@ def _topbar_sync_db_and_refresh(*, also_send_next4: bool = False):
                     f"📧 Envoi terminé — envoyés: {recap['sent']} | vides: {recap['skipped_empty']} | emails manquants: {recap['missing_email']} | erreurs: {recap['errors']}"
                 )
 
-        # refresh UI
+        # Pas de st.rerun brutal : on invalide uniquement le cache utile.
         try:
-            st.cache_data.clear()
+            st.session_state.setdefault("tab_refresh", {})["planning"] = _time.time()
         except Exception:
             pass
-        st.rerun()
     except Exception as e:
         st.error(f"❌ Erreur MAJ DB Dropbox: {e}")
-
-#   TOP BAR (INFORMATIONS UTILISATEUR + DECONNEXION)
-# ============================================================
+    finally:
+        st.session_state["sync_running"] = False
 
 
 def render_top_bar():
@@ -7275,30 +8067,29 @@ def render_tab_chauffeur_driver():
     # ===================================================
     # 💶 BADGE — CAISSE À REMETTRE
     # ===================================================
+    # SOURCE DE VÉRITÉ = XLSM :
+    # - cellule Caisse verte = payé, on ignore
+    # - cellule Caisse blanche/non verte = à remettre
     has_caisse_due = False
     total_caisse_due = 0.0
-    start_date = date(2026, 1, 1)
+    d1_caisse = today - timedelta(days=60)
+    if d1_caisse < date(2026, 1, 1):
+        d1_caisse = date(2026, 1, 1)
 
-    with get_connection() as conn:
-        df_badge = pd.read_sql_query(
-            """
-            SELECT DATE, HEURE, NOM, DESIGNATION, ADRESSE, PAX, PAIEMENT, Caisse
-            FROM planning
-            WHERE COALESCE(IS_INDISPO,0)=0
-              AND COALESCE(IS_SUPERSEDED,0)=0
-              AND LOWER(COALESCE(PAIEMENT,''))='caisse'
-              AND COALESCE(CAISSE_PAYEE,0)=0
-              AND DATE_ISO BETWEEN ? AND ?
-              AND UPPER(REPLACE(REPLACE(CH,'*',''),' ','')) LIKE ?
-            ORDER BY DATE_ISO, HEURE
-            """,
-            conn,
-            params=(start_date.isoformat(), today.isoformat(), f"{normalize_ch_code(ch_selected)}%"),
+    try:
+        df_badge = read_caisse_unpaid_from_xlsm(
+            start_date=d1_caisse,
+            end_date=today,
+            ch_filter=ch_selected,
         )
+    except Exception as e:
+        print(f"⚠️ caisse XLSM chauffeur error: {e}", flush=True)
+        df_badge = pd.DataFrame()
 
-    if not df_badge.empty:
+    if df_badge is not None and not df_badge.empty:
         df_badge["Caisse"] = pd.to_numeric(df_badge["Caisse"], errors="coerce").fillna(0.0)
-        total_caisse_due = float(df_badge["Caisse"].sum())
+        df_badge = df_badge[df_badge["Caisse"] > 0].copy()
+        total_caisse_due = float(df_badge["Caisse"].sum()) if not df_badge.empty else 0.0
         has_caisse_due = total_caisse_due > 0
 
     if has_caisse_due:
@@ -7316,7 +8107,10 @@ def render_tab_chauffeur_driver():
         )
 
         if st.toggle("🧾 Voir le détail de la caisse", False):
-            st.dataframe(df_badge, use_container_width=True, height=300)
+            detail_cols = ["EXCEL_ROW", "DATE", "HEURE", "CH", "NOM", "DESIGNATION", "ADRESSE", "PAX", "PAIEMENT", "Caisse"]
+            detail_cols = [c for c in detail_cols if c in df_badge.columns]
+            st.caption(f"Source : XLSM Feuil1 — caisses blanches/non vertes du {d1_caisse.strftime('%d/%m/%Y')} au {today.strftime('%d/%m/%Y')}.")
+            st.dataframe(df_badge[detail_cols] if detail_cols else df_badge, use_container_width=True, height=300)
     else:
         st.success("✅ Aucune caisse à remettre pour le moment.")
 
@@ -9522,7 +10316,62 @@ def _rules_prepare(df_rules: pd.DataFrame) -> pd.DataFrame:
     df = df[df["minutes_norm"] > 0]
 
     return df
+
+
+def get_last_chauffeur_confirmations(limit: int = 10):
+    import pandas as pd
+    try:
+        limit = max(1, min(int(limit or 10), 50))
+    except Exception:
+        limit = 10
+
+    with get_connection() as conn:
+        try:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(planning)").fetchall()]
+        except Exception:
+            cols = []
+
+        wanted = ["DATE", "HEURE", "CH", "NOM", "DESIGNATION", "Unnamed: 8", "ACK_AT", "ACK_TRAJET", "ACK_PROBLEME", "CONFIRMED", "CONFIRMED_AT"]
+        if "ACK_AT" in cols:
+            select_cols = [f'"{c}"' for c in wanted if c in cols]
+            if select_cols:
+                try:
+                    sql = f"""
+                        SELECT {", ".join(select_cols)}
+                        FROM planning
+                        WHERE COALESCE(ACK_AT,'') != ''
+                        ORDER BY ACK_AT DESC
+                        LIMIT ?
+                    """
+                    df = pd.read_sql_query(sql, conn, params=(limit,))
+                    if df is not None and not df.empty:
+                        return df
+                except Exception:
+                    pass
+
+    return pd.DataFrame()
+
 def render_tab_confirmation_chauffeur():
+
+    st.markdown("### 🕘 10 dernières réponses chauffeur")
+    try:
+        df_last_ack = get_last_chauffeur_confirmations(10)
+        if df_last_ack is None or df_last_ack.empty:
+            st.caption("Aucune réponse chauffeur récente. C’est normal si aucun chauffeur n’a encore confirmé/répondu depuis son app.")
+        else:
+            df_show_ack = df_last_ack.rename(columns={
+                "ACK_AT": "Répondu le",
+                "ACK_TRAJET": "Trajet compris",
+                "ACK_PROBLEME": "Commentaire / problème",
+                "CONFIRMED": "Confirmé admin",
+                "CONFIRMED_AT": "Confirmé le",
+                "Unnamed: 8": "Sens",
+            })
+            st.dataframe(df_show_ack, use_container_width=True, height=280)
+    except Exception as e:
+        st.warning(f"Impossible d'afficher les dernières réponses chauffeur : {e}")
+    st.divider()
+
     st.subheader("✅ Confirmation chauffeur")
     st.caption(
         "Validation définitive des navettes après réponse chauffeur. "
@@ -9909,6 +10758,483 @@ def _match_rule_minutes(rules_norm, ch, sens, dest):
 
     return 0
 
+
+
+def read_caisse_unpaid_from_xlsm(start_date=None, end_date=None, ch_filter=None):
+    """
+    Source de vérité pour la caisse : le fichier XLSM.
+    - Caisse VERTE dans Excel = déjà réglée => on ignore définitivement.
+    - Caisse BLANCHE / non verte = encore à payer => on garde.
+    Ne dépend pas de CAISSE_PAYEE en DB pour le calcul affiché chauffeur.
+    """
+    from io import BytesIO
+    from datetime import datetime, date
+    import pandas as pd
+    import re
+
+    try:
+        from openpyxl import load_workbook
+    except Exception as e:
+        print(f"⚠️ openpyxl indisponible read_caisse_unpaid_from_xlsm: {e}", flush=True)
+        return pd.DataFrame()
+
+    def _norm_date_iso(v):
+        try:
+            if v is None:
+                return ""
+            if isinstance(v, (datetime, date)):
+                return v.strftime("%Y-%m-%d")
+            if isinstance(v, (int, float)) and not pd.isna(v):
+                if 20000 <= float(v) <= 60000:
+                    dt = pd.to_datetime(float(v), unit="D", origin="1899-12-30", errors="coerce")
+                    if not pd.isna(dt):
+                        return dt.strftime("%Y-%m-%d")
+            s = str(v).strip()
+            if not s or s.lower() in {"nan", "none", "nat"}:
+                return ""
+            dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
+            if not pd.isna(dt):
+                return dt.strftime("%Y-%m-%d")
+            s2 = re.sub(r"^(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)\s+", "", s.lower()).strip()
+            months = {
+                "janvier": "01", "février": "02", "fevrier": "02", "mars": "03", "avril": "04",
+                "mai": "05", "juin": "06", "juillet": "07", "août": "08", "aout": "08",
+                "septembre": "09", "octobre": "10", "novembre": "11", "décembre": "12", "decembre": "12",
+            }
+            m = re.match(r"^(\d{1,2})\s+([a-zéûôîàç]+)\s+(\d{4})$", s2)
+            if m:
+                dd = int(m.group(1))
+                mm = months.get(m.group(2))
+                yy = int(m.group(3))
+                if mm:
+                    return f"{yy:04d}-{mm}-{dd:02d}"
+        except Exception:
+            return ""
+        return ""
+
+    def _norm_ch(v):
+        try:
+            return normalize_ch_code(str(v or "").upper().replace("*", "").replace(" ", "").strip())
+        except Exception:
+            return str(v or "").upper().replace("*", "").replace(" ", "").strip()
+
+    def _num(v):
+        try:
+            if v is None:
+                return 0.0
+            s = str(v).strip().replace("€", "").replace(" ", "").replace(",", ".")
+            if not s or s.lower() in {"nan", "none", "nat"}:
+                return 0.0
+            return float(s)
+        except Exception:
+            return 0.0
+
+    def _is_green_cell(cell):
+        try:
+            fill = cell.fill
+            if fill is None or fill.patternType is None:
+                return False
+
+            fg = fill.fgColor
+            if fg is None:
+                return False
+
+            if fg.type == "rgb" and fg.rgb:
+                rgb = str(fg.rgb).upper()
+                return (
+                    rgb.endswith("C6EFCE") or
+                    rgb.endswith("92D050") or
+                    rgb.endswith("00B050") or
+                    rgb.endswith("00FF00") or
+                    rgb in {"FFC6EFCE", "FF92D050", "FF00B050", "FF00FF00"}
+                )
+
+            if fg.type == "indexed":
+                return fg.indexed in {4, 43, 50}
+
+            # Attention : on ne considère PAS tous les thèmes comme vert.
+            # Un thème peut être autre chose, donc par sécurité il reste "non vert"
+            # sauf RGB/indexed clair.
+            return False
+        except Exception:
+            return False
+
+    try:
+        content = download_dropbox_excel_bytes()
+        if not content:
+            try:
+                from utils import get_dropbox_excel_cached
+                content = get_dropbox_excel_cached()
+            except Exception:
+                content = None
+        if not content:
+            return pd.DataFrame()
+
+        wb = load_workbook(BytesIO(content), data_only=False)
+        if "Feuil1" not in wb.sheetnames:
+            return pd.DataFrame()
+        ws = wb["Feuil1"]
+
+        header_row = None
+        for r in range(1, min(ws.max_row, 15) + 1):
+            vals = [str(ws.cell(r, c).value or "").strip().upper() for c in range(1, min(ws.max_column, 90) + 1)]
+            if "DATE" in vals and "HEURE" in vals:
+                header_row = r
+                break
+        if header_row is None:
+            return pd.DataFrame()
+
+        headers = {}
+        for c in range(1, ws.max_column + 1):
+            name = str(ws.cell(header_row, c).value or "").strip()
+            if name:
+                headers[name.upper()] = c
+
+        c_date = headers.get("DATE")
+        c_heure = headers.get("HEURE")
+        c_ch = headers.get("CH")
+        c_sens = headers.get("UNNAMED: 8")
+        c_designation = headers.get("DESIGNATION")
+        c_nom = headers.get("NOM")
+        c_adresse = headers.get("ADRESSE")
+        c_cp = headers.get("CP")
+        c_loc = headers.get("LOCALITÉ") or headers.get("LOCALITE")
+        c_paiement = headers.get("PAIEMENT")
+        c_caisse = headers.get("CAISSE") or headers.get("CAISSE ")
+        c_bdc = headers.get("NUM BDC") or headers.get("NUM_BDC") or headers.get("BDC")
+
+        if not (c_date and c_ch and c_paiement and c_caisse):
+            return pd.DataFrame()
+
+        s1 = pd.to_datetime(start_date, errors="coerce") if start_date is not None else pd.NaT
+        s2 = pd.to_datetime(end_date, errors="coerce") if end_date is not None else pd.NaT
+        ch_filter_norm = _norm_ch(ch_filter) if ch_filter else ""
+
+        rows = []
+        for r in range(header_row + 1, ws.max_row + 1):
+            date_iso = _norm_date_iso(ws.cell(r, c_date).value)
+            if not date_iso:
+                continue
+            if not pd.isna(s1) and date_iso < s1.strftime("%Y-%m-%d"):
+                continue
+            if not pd.isna(s2) and date_iso > s2.strftime("%Y-%m-%d"):
+                continue
+
+            paiement = str(ws.cell(r, c_paiement).value or "").strip().lower()
+            if paiement != "caisse":
+                continue
+
+            caisse_val = _num(ws.cell(r, c_caisse).value)
+            if caisse_val <= 0:
+                continue
+
+            ch_norm = _norm_ch(ws.cell(r, c_ch).value)
+            if ch_filter_norm and not ch_norm.startswith(ch_filter_norm):
+                continue
+
+            is_green = _is_green_cell(ws.cell(r, c_caisse))
+
+            # RÈGLE DEMANDÉE :
+            # vert = payé, on ne le garde pas dans ce qui est à payer
+            if is_green:
+                continue
+
+            rows.append({
+                "EXCEL_ROW": r,
+                "DATE_ISO": date_iso,
+                "DATE": pd.to_datetime(date_iso).strftime("%d/%m/%Y"),
+                "HEURE": normalize_time_string(ws.cell(r, c_heure).value) if c_heure else "",
+                "CH": ch_norm,
+                "Unnamed: 8": str(ws.cell(r, c_sens).value or "").strip() if c_sens else "",
+                "DESIGNATION": str(ws.cell(r, c_designation).value or "").strip() if c_designation else "",
+                "Num BDC": str(ws.cell(r, c_bdc).value or "").strip() if c_bdc else "",
+                "NOM": str(ws.cell(r, c_nom).value or "").strip() if c_nom else "",
+                "ADRESSE": str(ws.cell(r, c_adresse).value or "").strip() if c_adresse else "",
+                "CP": str(ws.cell(r, c_cp).value or "").strip() if c_cp else "",
+                "Localité": str(ws.cell(r, c_loc).value or "").strip() if c_loc else "",
+                "PAIEMENT": "caisse",
+                "Caisse": caisse_val,
+            })
+
+        return pd.DataFrame(rows)
+
+    except Exception as e:
+        print(f"⚠️ read_caisse_unpaid_from_xlsm error: {e}", flush=True)
+        return pd.DataFrame()
+
+
+def force_sync_caisse_green_from_excel(start_date=None, end_date=None, ch_filter=None) -> int:
+    """
+    Synchronisation robuste caisse Excel -> DB.
+    Lit directement le XLSM avec openpyxl, détecte la vraie couleur verte sur la cellule Caisse,
+    puis marque CAISSE_PAYEE=1 en DB.
+    Matching volontairement large pour éviter que des lignes vertes restent à payer côté chauffeur :
+    date + chauffeur + montant, puis fallback date + montant + nom.
+    """
+    from io import BytesIO
+    from datetime import datetime, date
+    import pandas as pd
+    import re
+    try:
+        from openpyxl import load_workbook
+    except Exception as e:
+        print(f"⚠️ openpyxl indisponible force_sync_caisse_green_from_excel: {e}", flush=True)
+        return 0
+
+    def _norm_date_iso(v):
+        try:
+            if v is None:
+                return ""
+            if isinstance(v, (datetime, date)):
+                return v.strftime("%Y-%m-%d")
+            if isinstance(v, (int, float)) and not pd.isna(v):
+                if 20000 <= float(v) <= 60000:
+                    dt = pd.to_datetime(float(v), unit="D", origin="1899-12-30", errors="coerce")
+                    if not pd.isna(dt):
+                        return dt.strftime("%Y-%m-%d")
+            s = str(v).strip()
+            if not s or s.lower() in {"nan", "none", "nat"}:
+                return ""
+            dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
+            if not pd.isna(dt):
+                return dt.strftime("%Y-%m-%d")
+            s2 = re.sub(r"^(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)\s+", "", s.lower()).strip()
+            months = {
+                "janvier": "01", "février": "02", "fevrier": "02", "mars": "03", "avril": "04",
+                "mai": "05", "juin": "06", "juillet": "07", "août": "08", "aout": "08",
+                "septembre": "09", "octobre": "10", "novembre": "11", "décembre": "12", "decembre": "12",
+            }
+            m = re.match(r"^(\d{1,2})\s+([a-zéûôîàç]+)\s+(\d{4})$", s2)
+            if m:
+                dd = int(m.group(1)); mm = months.get(m.group(2)); yy = int(m.group(3))
+                if mm:
+                    return f"{yy:04d}-{mm}-{dd:02d}"
+        except Exception:
+            return ""
+        return ""
+
+    def _norm_ch(v):
+        try:
+            return normalize_ch_code(str(v or "").upper().replace("*", "").replace(" ", "").strip())
+        except Exception:
+            return str(v or "").upper().replace("*", "").replace(" ", "").strip()
+
+    def _num(v):
+        try:
+            if v is None:
+                return 0.0
+            s = str(v).strip().replace("€", "").replace(" ", "").replace(",", ".")
+            if not s or s.lower() in {"nan", "none", "nat"}:
+                return 0.0
+            return float(s)
+        except Exception:
+            return 0.0
+
+    def _is_green_cell(cell):
+        try:
+            fill = cell.fill
+            if fill is None or fill.patternType is None:
+                return False
+            fg = fill.fgColor
+            if fg is None:
+                return False
+            rgb = ""
+            if fg.type == "rgb" and fg.rgb:
+                rgb = str(fg.rgb).upper()
+                # verts Excel fréquents : C6EFCE / 92D050 / 00B050 / 00FF00
+                return (
+                    rgb.endswith("C6EFCE") or rgb.endswith("92D050") or
+                    rgb.endswith("00B050") or rgb.endswith("00FF00") or
+                    rgb in {"FFC6EFCE", "FF92D050", "FF00B050", "FF00FF00"}
+                )
+            if fg.type == "indexed":
+                return fg.indexed in {4, 43, 50}
+            # Les thèmes peuvent représenter du vert dans certains fichiers.
+            # On évite de tout accepter : seulement si la cellule a bien un fill solide.
+            if fg.type == "theme" and fill.patternType == "solid":
+                return True
+        except Exception:
+            return False
+        return False
+
+    try:
+        content = download_dropbox_excel_bytes()
+        if not content:
+            content = None
+            try:
+                from utils import get_dropbox_excel_cached
+                content = get_dropbox_excel_cached()
+            except Exception:
+                pass
+        if not content:
+            return 0
+
+        wb = load_workbook(BytesIO(content), data_only=False)
+        if "Feuil1" not in wb.sheetnames:
+            return 0
+        ws = wb["Feuil1"]
+
+        # header row detection
+        header_row = None
+        for r in range(1, min(ws.max_row, 15) + 1):
+            vals = [str(ws.cell(r, c).value or "").strip().upper() for c in range(1, min(ws.max_column, 80) + 1)]
+            if "DATE" in vals and "HEURE" in vals:
+                header_row = r
+                break
+        if header_row is None:
+            return 0
+
+        headers = {}
+        for c in range(1, ws.max_column + 1):
+            name = str(ws.cell(header_row, c).value or "").strip()
+            if name:
+                headers[name.upper()] = c
+
+        c_date = headers.get("DATE")
+        c_heure = headers.get("HEURE")
+        c_ch = headers.get("CH")
+        c_nom = headers.get("NOM")
+        c_paiement = headers.get("PAIEMENT")
+        c_caisse = headers.get("CAISSE") or headers.get("CAISSE ")
+        if not (c_date and c_ch and c_paiement and c_caisse):
+            return 0
+
+        s1 = pd.to_datetime(start_date, errors="coerce") if start_date is not None else pd.NaT
+        s2 = pd.to_datetime(end_date, errors="coerce") if end_date is not None else pd.NaT
+        ch_filter_norm = _norm_ch(ch_filter) if ch_filter else ""
+
+        excel_paid = []
+        for r in range(header_row + 1, ws.max_row + 1):
+            date_iso = _norm_date_iso(ws.cell(r, c_date).value)
+            if not date_iso:
+                continue
+            if not pd.isna(s1) and date_iso < s1.strftime("%Y-%m-%d"):
+                continue
+            if not pd.isna(s2) and date_iso > s2.strftime("%Y-%m-%d"):
+                continue
+
+            paiement = str(ws.cell(r, c_paiement).value or "").strip().lower()
+            if paiement != "caisse":
+                continue
+
+            caisse_val = _num(ws.cell(r, c_caisse).value)
+            if caisse_val <= 0:
+                continue
+
+            if not _is_green_cell(ws.cell(r, c_caisse)):
+                continue
+
+            ch_norm = _norm_ch(ws.cell(r, c_ch).value)
+            if ch_filter_norm and not ch_norm.startswith(ch_filter_norm):
+                continue
+
+            excel_paid.append({
+                "DATE_ISO": date_iso,
+                "HEURE": normalize_time_string(ws.cell(r, c_heure).value) if c_heure else "",
+                "CH": ch_norm,
+                "NOM": str(ws.cell(r, c_nom).value or "").strip().upper() if c_nom else "",
+                "CAISSE": caisse_val,
+            })
+
+        if not excel_paid:
+            return 0
+
+        now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        updated = 0
+
+        with get_connection() as conn:
+            cols = [x[1] for x in conn.execute("PRAGMA table_info(planning)").fetchall()]
+            if "CAISSE_PAYEE" not in cols:
+                conn.execute('ALTER TABLE planning ADD COLUMN "CAISSE_PAYEE" INTEGER DEFAULT 0')
+            if "CAISSE_PAYEE_AT" not in cols:
+                conn.execute('ALTER TABLE planning ADD COLUMN "CAISSE_PAYEE_AT" TEXT')
+            if "CAISSE_COMMENT" not in cols:
+                conn.execute('ALTER TABLE planning ADD COLUMN "CAISSE_COMMENT" TEXT')
+            conn.commit()
+
+            for p in excel_paid:
+                # 1) date + chauffeur + montant + nom (+ heure si possible)
+                params = [now_iso, p["DATE_ISO"], f'{p["CH"]}%', p["CAISSE"], p["NOM"]]
+                sql = """
+                    UPDATE planning
+                    SET CAISSE_PAYEE = 1,
+                        CAISSE_PAYEE_AT = COALESCE(CAISSE_PAYEE_AT, ?),
+                        CAISSE_COMMENT = CASE
+                            WHEN COALESCE(CAISSE_COMMENT,'') = '' THEN 'Payée détectée depuis Excel (vert)'
+                            ELSE CAISSE_COMMENT
+                        END
+                    WHERE COALESCE(IS_INDISPO,0)=0
+                      AND COALESCE(IS_SUPERSEDED,0)=0
+                      AND LOWER(TRIM(COALESCE(PAIEMENT,'')))='caisse'
+                      AND COALESCE(CAISSE_PAYEE,0)=0
+                      AND COALESCE(DATE_ISO,'')=?
+                      AND UPPER(REPLACE(REPLACE(COALESCE(CH,''),'*',''),' ','')) LIKE ?
+                      AND ABS(COALESCE(CAST(REPLACE(REPLACE(Caisse, ',', '.'), '€', '') AS REAL),0) - ?) < 0.01
+                      AND UPPER(TRIM(COALESCE(NOM,'')))=?
+                """
+                cur = conn.execute(sql, params)
+                cnt = int(cur.rowcount or 0)
+
+                # 2) fallback date + chauffeur + montant
+                if cnt == 0:
+                    cur = conn.execute(
+                        """
+                        UPDATE planning
+                        SET CAISSE_PAYEE = 1,
+                            CAISSE_PAYEE_AT = COALESCE(CAISSE_PAYEE_AT, ?),
+                            CAISSE_COMMENT = CASE
+                                WHEN COALESCE(CAISSE_COMMENT,'') = '' THEN 'Payée détectée depuis Excel (vert)'
+                                ELSE CAISSE_COMMENT
+                            END
+                        WHERE COALESCE(IS_INDISPO,0)=0
+                          AND COALESCE(IS_SUPERSEDED,0)=0
+                          AND LOWER(TRIM(COALESCE(PAIEMENT,'')))='caisse'
+                          AND COALESCE(CAISSE_PAYEE,0)=0
+                          AND COALESCE(DATE_ISO,'')=?
+                          AND UPPER(REPLACE(REPLACE(COALESCE(CH,''),'*',''),' ','')) LIKE ?
+                          AND ABS(COALESCE(CAST(REPLACE(REPLACE(Caisse, ',', '.'), '€', '') AS REAL),0) - ?) < 0.01
+                        """,
+                        (now_iso, p["DATE_ISO"], f'{p["CH"]}%', p["CAISSE"]),
+                    )
+                    cnt = int(cur.rowcount or 0)
+
+                # 3) fallback date + nom + montant
+                if cnt == 0 and p["NOM"]:
+                    cur = conn.execute(
+                        """
+                        UPDATE planning
+                        SET CAISSE_PAYEE = 1,
+                            CAISSE_PAYEE_AT = COALESCE(CAISSE_PAYEE_AT, ?),
+                            CAISSE_COMMENT = CASE
+                                WHEN COALESCE(CAISSE_COMMENT,'') = '' THEN 'Payée détectée depuis Excel (vert)'
+                                ELSE CAISSE_COMMENT
+                            END
+                        WHERE COALESCE(IS_INDISPO,0)=0
+                          AND COALESCE(IS_SUPERSEDED,0)=0
+                          AND LOWER(TRIM(COALESCE(PAIEMENT,'')))='caisse'
+                          AND COALESCE(CAISSE_PAYEE,0)=0
+                          AND COALESCE(DATE_ISO,'')=?
+                          AND UPPER(TRIM(COALESCE(NOM,'')))=?
+                          AND ABS(COALESCE(CAST(REPLACE(REPLACE(Caisse, ',', '.'), '€', '') AS REAL),0) - ?) < 0.01
+                        """,
+                        (now_iso, p["DATE_ISO"], p["NOM"], p["CAISSE"]),
+                    )
+                    cnt = int(cur.rowcount or 0)
+
+                updated += cnt
+
+            conn.commit()
+
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+
+        return int(updated)
+
+    except Exception as e:
+        print(f"⚠️ force_sync_caisse_green_from_excel error: {e}", flush=True)
+        return 0
 
 def render_tab_calcul_heures():
     import pandas as pd
@@ -10471,14 +11797,19 @@ def render_tab_calcul_heures():
 
                 render_excel_modified_indicator()
 
-                if st.button("🔄 Rafraîchir la caisse depuis Excel"):
-                        request_soft_refresh("caisse")
-
                 # ----------------- Période -----------------
                 today = date.today()
                 d1 = today - timedelta(days=60)
                 if d1 < date(2026, 1, 1):
                         d1 = date(2026, 1, 1)
+
+                if st.button("🔄 Rafraîchir la caisse depuis Excel"):
+                        n_sync_caisse = force_sync_caisse_green_from_excel(start_date=d1, end_date=today)
+                        if n_sync_caisse > 0:
+                                st.success(f"✅ {n_sync_caisse} ligne(s) caisse verte(s) synchronisée(s). Les montants admin et chauffeur lisent directement les caisses blanches/non vertes du XLSM.")
+                        else:
+                                st.info("Aucune nouvelle caisse verte à synchroniser. Les montants admin et chauffeur sont calculés directement sur les caisses blanches/non vertes du XLSM.")
+                        request_soft_refresh("caisse")
 
                 # ----------------- Chauffeur -----------------
                 chs = get_chauffeurs_for_ui()
@@ -10490,24 +11821,19 @@ def render_tab_calcul_heures():
                         ch_filter = None
 
                 # ==================================================
-                # 🔒 LECTURE DB DIRECTE (PAS get_planning)
+                # 🔒 SOURCE DE VÉRITÉ CAISSE = XLSM
                 # ==================================================
-                with get_connection() as conn:
-                        df_cash = pd.read_sql_query(
-                                """
-                                SELECT *
-                                FROM planning
-                                WHERE
-                                        COALESCE(IS_INDISPO,0) = 0
-                                        AND COALESCE(IS_SUPERSEDED,0) = 0
-                                        AND LOWER(COALESCE(PAIEMENT,'')) = 'caisse'
-                                        AND DATE_ISO >= ?
-                                        AND DATE_ISO <= ?
-                                ORDER BY DATE_ISO, HEURE
-                                """,
-                                conn,
-                                params=(d1.isoformat(), today.isoformat()),
+                # - cellule Caisse verte = payée => ignorée
+                # - cellule Caisse blanche/non verte = à remettre
+                try:
+                        df_cash = read_caisse_unpaid_from_xlsm(
+                                start_date=d1,
+                                end_date=today,
+                                ch_filter=None,
                         )
+                except Exception as e:
+                        st.error(f"Erreur lecture caisse XLSM : {e}")
+                        df_cash = pd.DataFrame()
 
 
                 # ==================================================
@@ -10516,8 +11842,6 @@ def render_tab_calcul_heures():
                 if not df_cash.empty:
                         df_cash2 = df_cash.copy()
                         df_cash2["Caisse"] = pd.to_numeric(df_cash2.get("Caisse", 0), errors="coerce").fillna(0.0)
-                        if "CAISSE_PAYEE" in df_cash2.columns:
-                                df_cash2 = df_cash2[df_cash2["CAISSE_PAYEE"].fillna(0).astype(int).eq(0)]
                         recap = (
                                 df_cash2.groupby(df_cash2["CH"].fillna("").astype(str).str.strip().str.upper())["Caisse"]
                                 .sum()
@@ -10533,7 +11857,7 @@ def render_tab_calcul_heures():
                 # DEBUG
                 if not df_cash.empty:
                         st.caption(
-                                f"DEBUG caisse — lignes chargées : {len(df_cash)} | "
+                                f"Source caisse XLSM — caisses blanches/non vertes : {len(df_cash)} | "
                                 f"date min = {df_cash['DATE_ISO'].min()} | "
                                 f"date max = {df_cash['DATE_ISO'].max()}"
                         )
@@ -10572,28 +11896,6 @@ def render_tab_calcul_heures():
                 if df_cash.empty:
                         st.success("✅ Aucune caisse à rentrer")
                         st.stop()
-
-                # ----------------- Dernière caisse payée -----------------
-                try:
-                        last_paid = get_last_caisse_paid_dates(ch_filter)
-                except Exception:
-                        last_paid = {}
-
-                if last_paid:
-                        df_cash["_date_iso"] = pd.to_datetime(df_cash["DATE_ISO"], errors="coerce")
-
-                        def _after_last_paid(row):
-                                ch_norm = normalize_ch_code(str(row.get("CH", "")))
-                                lp = last_paid.get(ch_norm)
-                                if not lp:
-                                        return True
-                                try:
-                                        return row["_date_iso"].date() > datetime.fromisoformat(lp).date()
-                                except Exception:
-                                        return True
-
-                        df_cash = df_cash[df_cash.apply(_after_last_paid, axis=1)]
-                        df_cash = df_cash.drop(columns=["_date_iso"], errors="ignore")
 
                 # ----------------- Non payées uniquement -----------------
                 if "CAISSE_PAYEE" in df_cash.columns:
@@ -10867,7 +12169,7 @@ def main():
         cid = str(get_client_id() or "").strip()
         sess = get_login_cookie()
 
-        if st.session_state.BOOTSTRAP_TRY < 1 and (not cid or not sess):
+        if st.session_state.BOOTSTRAP_TRY < 3 and (not cid or (not sess and not get_bound_login_cookie())):
             st.session_state.BOOTSTRAP_TRY += 1
             st.rerun()
     else:
@@ -11078,11 +12380,21 @@ def main():
             st.error("Aucun code chauffeur configuré.")
             return
 
-        tab1, tab2 = st.tabs(["🚖 Mon planning", "🚫 Mes indispos"])
-        with tab1:
-            render_tab_chauffeur_driver()
-        with tab2:
-            render_tab_indispo_driver(ch_code)
+        ch_norm = str(ch_code or "").strip().upper()
+        if ch_norm in {"FA", "AD"}:
+            tab1, tab2, tab3 = st.tabs(["🚖 Mon planning", "📚 Complément 15 jours", "🚫 Mes indispos"])
+            with tab1:
+                render_tab_chauffeur_driver()
+            with tab2:
+                render_tab_driver_complement_history(ch_norm)
+            with tab3:
+                render_tab_indispo_driver(ch_code)
+        else:
+            tab1, tab2 = st.tabs(["🚖 Mon planning", "🚫 Mes indispos"])
+            with tab1:
+                render_tab_chauffeur_driver()
+            with tab2:
+                render_tab_indispo_driver(ch_code)
 
     # ==================== ERREUR ============================
     else:
@@ -11090,7 +12402,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    pass  # déplacé en fin de fichier pour que les overrides soient déjà définis
 
 import base64
 
@@ -11131,3 +12443,780 @@ def build_printable_html(df):
     """
 
 
+
+
+# ============================================================
+#   PATCH DB RESET + REBUILD HISTORIQUE EXACT (OpenAI)
+# ============================================================
+def _clienthub_norm_iso(val):
+    import pandas as pd
+    from datetime import date, datetime
+
+    try:
+        if pd.isna(val):
+            return None
+    except Exception:
+        pass
+
+    if val is None:
+        return None
+
+    if isinstance(val, (datetime, date)):
+        try:
+            if pd.isna(val):
+                return None
+        except Exception:
+            pass
+        try:
+            return val.strftime("%Y-%m-%d")
+        except Exception:
+            return None
+
+    s = str(val).strip()
+    if not s or s.lower() in {"nat", "nan", "none"}:
+        return None
+
+    try:
+        dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
+        if pd.isna(dt):
+            return None
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+def _clienthub_load_dates_carburant_map():
+    import pandas as pd
+    from io import BytesIO
+    from utils import get_dropbox_excel_cached
+    content = get_dropbox_excel_cached()
+    if not content:
+        return {}
+    try:
+        df = pd.read_excel(BytesIO(content), sheet_name="dates carburant", header=None, engine="openpyxl")
+    except Exception:
+        return {}
+    out = {}
+    for _, row in df.iterrows():
+        d = _clienthub_norm_iso(row.iloc[0] if len(row) > 0 else None)
+        coef = row.iloc[2] if len(row) > 2 else None
+        if not d:
+            continue
+        try:
+            if pd.isna(coef):
+                continue
+        except Exception:
+            pass
+        try:
+            out[d] = float(coef)
+        except Exception:
+            continue
+    return out
+
+def _clienthub_to_float(v):
+    import pandas as pd
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    if v is None:
+        return None
+    s = str(v).replace(",", ".").strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def _clienthub_calc_surcharge(date_iso, km, h_tva, coef_map):
+    if not date_iso or date_iso < "2026-04-01":
+        return 0.0
+    coef = coef_map.get(date_iso)
+    if coef is None:
+        return 0.0
+    h = _clienthub_to_float(h_tva)
+    y = _clienthub_to_float(km)
+    if h in (47.5, 55.0):
+        return 2.0
+    if h in (115.0, 148.5):
+        return round(200.0 * float(coef), 2)
+    if y is None:
+        return 0.0
+    return round(float(y) * float(coef), 2)
+
+def _clienthub_read_excel_history_df():
+    import pandas as pd
+    from io import BytesIO
+    from datetime import date
+    import openpyxl
+
+    from utils import (
+        get_dropbox_excel_cached,
+        add_excel_color_flags_from_dropbox,
+        ensure_excel_row_key_column,
+        _cell_is_green,
+    )
+    from database import make_row_key_from_row
+
+    ensure_excel_row_key_column(
+        dropbox_path=DROPBOX_FILE_PATH,
+        sheet_name="Feuil1",
+        target_col_letter="ZX",
+    )
+
+    content = get_dropbox_excel_cached()
+    if not content:
+        return pd.DataFrame()
+
+    raw0 = pd.read_excel(
+        BytesIO(content),
+        sheet_name="Feuil1",
+        header=None,
+        engine="openpyxl",
+    )
+
+    if raw0 is None or raw0.empty:
+        return pd.DataFrame()
+
+    header_row = None
+    for i in range(min(10, len(raw0))):
+        vals = raw0.iloc[i].astype(str).str.strip().str.upper().tolist()
+        if "DATE" in vals and "HEURE" in vals:
+            header_row = i
+            break
+
+    if header_row is None:
+        return pd.DataFrame()
+
+    raw = pd.read_excel(
+        BytesIO(content),
+        sheet_name="Feuil1",
+        header=header_row,
+        engine="openpyxl",
+    )
+
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    raw = raw.fillna("").copy()
+
+    if "DATE" not in raw.columns:
+        return pd.DataFrame()
+
+    # ✅ garde la vraie position Excel avant filtres pour relire ZX / couleurs sans décalage
+    raw["_EXCEL_ROW"] = [(header_row + 2) + i for i in range(len(raw))]
+
+    raw = add_excel_color_flags_from_dropbox(raw, "Feuil1")
+
+    raw["DATE_ISO"] = raw["DATE"].apply(_clienthub_norm_iso)
+    raw = raw[raw["DATE_ISO"].notna()].copy()
+
+    today_iso = date.today().strftime("%Y-%m-%d")
+    raw = raw[raw["DATE_ISO"] <= today_iso].copy()
+
+    if "row_key" not in raw.columns:
+        raw["row_key"] = ""
+
+    try:
+        wb = openpyxl.load_workbook(BytesIO(content), data_only=False)
+        ws = wb["Feuil1"]
+        for idx in raw.index:
+            excel_row = int(raw.at[idx, "_EXCEL_ROW"])
+            rk = ws[f"ZX{excel_row}"].value
+            if rk:
+                raw.at[idx, "row_key"] = str(rk).strip()
+    except Exception:
+        pass
+
+    raw["row_key"] = raw.apply(
+        lambda r: str(r.get("row_key") or "").strip() or make_row_key_from_row(r.to_dict()),
+        axis=1,
+    )
+
+    try:
+        wb2 = openpyxl.load_workbook(BytesIO(content), data_only=False)
+        ws2 = wb2["Feuil1"]
+
+        col_p = 16
+        col_q = 17
+        fact_map = {}
+        yellow_map = {}
+
+        date_col_idx = None
+        heure_col_idx = None
+        try:
+            headers_upper = [str(c).strip().upper() for c in list(raw.columns)]
+            if "DATE" in headers_upper:
+                date_col_idx = headers_upper.index("DATE") + 1
+            if "HEURE" in headers_upper:
+                heure_col_idx = headers_upper.index("HEURE") + 1
+        except Exception:
+            date_col_idx = None
+            heure_col_idx = None
+
+        for idx in raw.index:
+            excel_row = int(raw.at[idx, "_EXCEL_ROW"])
+            cp = ws2.cell(excel_row, col_p)
+            cq = ws2.cell(excel_row, col_q)
+            fact_map[idx] = 1 if _cell_is_green(cp) and _cell_is_green(cq) else 0
+
+            dy = False
+            hy = False
+            try:
+                if date_col_idx:
+                    dy = _cell_is_yellow(ws2.cell(excel_row, date_col_idx))
+                if heure_col_idx:
+                    hy = _cell_is_yellow(ws2.cell(excel_row, heure_col_idx))
+            except Exception:
+                dy = False
+                hy = False
+            yellow_map[idx] = 1 if (dy or hy) else 0
+
+        raw["FACTURE_ENVOYEE"] = raw.index.to_series().map(fact_map).fillna(0).astype(int)
+        raw["DATE_HEURE_YELLOW"] = raw.index.to_series().map(yellow_map).fillna(0).astype(int)
+    except Exception:
+        raw["FACTURE_ENVOYEE"] = 0
+        raw["DATE_HEURE_YELLOW"] = 0
+
+    coef_map = _clienthub_load_dates_carburant_map()
+    raw["SURCHARGE_CARBURANT"] = raw.apply(
+        lambda r: _clienthub_calc_surcharge(
+            str(r.get("DATE_ISO") or ""),
+            r.get("KM"),
+            r.get("H TVA") if "H TVA" in raw.columns else r.get("HTVA"),
+            coef_map,
+        ),
+        axis=1,
+    )
+
+    # ✅ supprime les doublons métier : on garde en priorité la ligne colorée / la plus complète
+    dedup_cols = ["DATE_ISO", "HEURE", "Unnamed: 8", "DESIGNATION", "GO", "Num BDC", "NOM", "ADRESSE", "CP", "Localité"]
+    for c in dedup_cols:
+        if c not in raw.columns:
+            raw[c] = ""
+        raw[c] = raw[c].fillna("").astype(str).str.strip()
+
+    # score = priorité à la ligne facture envoyée, puis à celle qui contient le plus d'infos
+    info_cols = [c for c in ["GO", "Num BDC", "NOM", "ADRESSE", "CP", "Localité", "PAIEMENT", "Caisse", "KM", "H TVA", "HTVA", "REMARQUE", "DEMANDEUR", "IMPUTATION"] if c in raw.columns]
+    raw["_INFO_SCORE"] = raw[info_cols].apply(
+        lambda s: sum(1 for v in s if str(v or "").strip() not in {"", "0", "0.0", "nan", "None"}),
+        axis=1,
+    ) if info_cols else 0
+
+    raw = raw.sort_values(
+        by=["FACTURE_ENVOYEE", "_INFO_SCORE", "_EXCEL_ROW"],
+        ascending=[True, True, True],
+        kind="stable",
+    )
+    raw = raw.drop_duplicates(subset=dedup_cols, keep="last").copy()
+
+    raw = raw.drop(columns=["_INFO_SCORE"], errors="ignore")
+    return raw
+
+def clienthub_reset_and_rebuild_db(force=False):
+    import pandas as pd
+    from datetime import datetime
+    from database import (
+        ensure_planning_row_key_column,
+        ensure_planning_row_key_index,
+        ensure_surcharge_carburant_column,
+        make_row_key_from_row,
+    )
+
+    ensure_planning_row_key_column()
+    ensure_planning_row_key_index()
+    ensure_surcharge_carburant_column()
+
+    # 🔒 Garantit le schéma minimal AVANT lecture / rebuild
+    with get_connection() as conn:
+        cols_now = [r[1] for r in conn.execute("PRAGMA table_info(planning)").fetchall()]
+        wanted_cols = {
+            "DATE_HEURE_YELLOW": 'ALTER TABLE planning ADD COLUMN "DATE_HEURE_YELLOW" INTEGER DEFAULT 0',
+            "FACTURE_ENVOYEE": 'ALTER TABLE planning ADD COLUMN "FACTURE_ENVOYEE" INTEGER DEFAULT 0',
+            "SURCHARGE_CARBURANT": 'ALTER TABLE planning ADD COLUMN "SURCHARGE_CARBURANT" REAL DEFAULT 0',
+            "updated_at": 'ALTER TABLE planning ADD COLUMN "updated_at" TEXT',
+            "row_key": 'ALTER TABLE planning ADD COLUMN "row_key" TEXT',
+            "DATE_ISO": 'ALTER TABLE planning ADD COLUMN "DATE_ISO" TEXT',
+        }
+        for col_name, sql in wanted_cols.items():
+            if col_name not in cols_now:
+                conn.execute(sql)
+        conn.commit()
+
+    df = _clienthub_read_excel_history_df()
+    if df is None or df.empty:
+        return 0
+
+    with get_connection() as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(planning)").fetchall()]
+
+        # reset complet demandé pour repartir propre
+        conn.execute("DELETE FROM planning")
+        conn.commit()
+
+        now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        inserted = 0
+
+        for _, row in df.iterrows():
+            data = {}
+
+            # 1) recopie uniquement les colonnes vraiment présentes en DB
+            for c in cols:
+                if c == "id":
+                    continue
+                if c in row.index:
+                    data[c] = sqlite_safe(row.get(c))
+
+            # 2) champs calculés / sécurisés uniquement si la colonne existe
+            if "row_key" in cols:
+                data["row_key"] = str(row.get("row_key") or "").strip() or make_row_key_from_row(row.to_dict())
+
+            if "DATE_ISO" in cols:
+                data["DATE_ISO"] = str(row.get("DATE_ISO") or "")
+
+            if "DATE" in cols:
+                try:
+                    data["DATE"] = pd.to_datetime(str(row.get("DATE_ISO") or "")).strftime("%d/%m/%Y")
+                except Exception:
+                    if "DATE" in row.index:
+                        data["DATE"] = sqlite_safe(row.get("DATE"))
+
+            if "FACTURE_ENVOYEE" in cols:
+                try:
+                    data["FACTURE_ENVOYEE"] = int(row.get("FACTURE_ENVOYEE") or 0)
+                except Exception:
+                    data["FACTURE_ENVOYEE"] = 0
+
+            if "SURCHARGE_CARBURANT" in cols:
+                try:
+                    data["SURCHARGE_CARBURANT"] = float(row.get("SURCHARGE_CARBURANT") or 0.0)
+                except Exception:
+                    data["SURCHARGE_CARBURANT"] = 0.0
+
+            if "updated_at" in cols:
+                data["updated_at"] = now_iso
+
+            # 3) insert seulement sur les colonnes réellement présentes
+            cols_sql = ",".join(f'"{k}"' for k in data.keys())
+            q = ",".join("?" for _ in data)
+            conn.execute(
+                f"INSERT OR REPLACE INTO planning ({cols_sql}) VALUES ({q})",
+                [sqlite_safe(v) for v in data.values()]
+            )
+            inserted += 1
+
+        conn.commit()
+
+    try:
+        rebuild_planning_views()
+    except Exception:
+        pass
+
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
+    return inserted
+
+def _clienthub_style_facture(df):
+    try:
+        import pandas as pd
+        if df is None or df.empty:
+            return df
+        def _style_row(row):
+            styles = [''] * len(row)
+            idx_map = {col: i for i, col in enumerate(row.index)}
+            if int(row.get("FACTURE_ENVOYEE", 0) or 0) == 1:
+                for col in ["Num BDC", "NOM"]:
+                    if col in idx_map:
+                        styles[idx_map[col]] = "background-color: #d9ead3; font-weight: 700;"
+            if int(row.get("DATE_HEURE_YELLOW", 0) or 0) == 1:
+                for col in ["DATE", "HEURE"]:
+                    if col in idx_map:
+                        base = styles[idx_map[col]]
+                        styles[idx_map[col]] = (base + " " if base else "") + "background-color: #fff2cc; font-weight: 700;"
+            return styles
+        return df.style.apply(_style_row, axis=1)
+    except Exception:
+        return df
+
+def _clienthub_export_pdf_exact(df, title_txt):
+    from io import BytesIO
+    import pandas as pd
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.units import cm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+    def _to_float(v):
+        try:
+            if pd.isna(v):
+                return 0.0
+        except Exception:
+            pass
+        try:
+            return float(str(v).replace(',', '.').strip())
+        except Exception:
+            return 0.0
+
+    pdf_df = df.copy().fillna("") if df is not None else pd.DataFrame()
+    show_cols = [col for col in pdf_df.columns if col not in ["FACTURE_ENVOYEE", "DATE_HEURE_YELLOW"]]
+    compact_cols = [
+        "DATE", "HEURE", "Unnamed: 8", "DESIGNATION", "GO", "Num BDC", "NOM",
+        "CP", "Localité", "KM", "H TVA", "SURCHARGE_CARBURANT"
+    ]
+    display_cols = [c for c in compact_cols if c in show_cols] or show_cols[:12]
+
+    rename_map = {
+        "Unnamed: 8": "SENS",
+        "DESIGNATION": "DEST",
+        "Localité": "LOCALITÉ",
+        "H TVA": "PRIX OFFICIEL",
+    }
+    headers = [rename_map.get(c, c) for c in display_cols]
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=landscape(A4),
+        leftMargin=0.6 * cm,
+        rightMargin=0.6 * cm,
+        topMargin=0.7 * cm,
+        bottomMargin=0.7 * cm,
+    )
+    styles = getSampleStyleSheet()
+    story = [Paragraph(f"<b>{title_txt}</b>", styles["Title"]), Spacer(1, 0.25 * cm)]
+
+    main_data = [headers]
+    for _, row in pdf_df.iterrows():
+        main_data.append([str(row.get(col, "") or "")[:28] for col in display_cols])
+
+    available_w = doc.width
+    col_widths = []
+    for col in display_cols:
+        if col in {"DATE", "HEURE", "GO", "CP", "KM"}:
+            col_widths.append(1.45 * cm)
+        elif col in {"Unnamed: 8", "PAIEMENT"}:
+            col_widths.append(1.7 * cm)
+        elif col in {"H TVA", "SURCHARGE_CARBURANT", "Caisse", "PARKING", "ATTENTE", "PEAGE"}:
+            col_widths.append(2.0 * cm)
+        elif col in {"Num BDC"}:
+            col_widths.append(1.9 * cm)
+        elif col in {"NOM", "DESIGNATION", "Localité"}:
+            col_widths.append(2.6 * cm)
+        else:
+            col_widths.append(2.3 * cm)
+    total_w = sum(col_widths)
+    if total_w > available_w and total_w > 0:
+        ratio = available_w / total_w
+        col_widths = [w * ratio for w in col_widths]
+
+    table = Table(main_data, repeatRows=1, colWidths=col_widths)
+    style_cmds = [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#d9e2f3")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 6.2),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#9e9e9e")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7f7f7")]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]
+
+    date_idx = display_cols.index("DATE") if "DATE" in display_cols else None
+    heure_idx = display_cols.index("HEURE") if "HEURE" in display_cols else None
+    bdc_idx = display_cols.index("Num BDC") if "Num BDC" in display_cols else None
+    nom_idx = display_cols.index("NOM") if "NOM" in display_cols else None
+
+    for row_no, (_, row) in enumerate(pdf_df.iterrows(), start=1):
+        if int(row.get("FACTURE_ENVOYEE", 0) or 0) == 1:
+            for idx_col in [bdc_idx, nom_idx]:
+                if idx_col is not None:
+                    style_cmds.append(("BACKGROUND", (idx_col, row_no), (idx_col, row_no), colors.HexColor("#d9ead3")))
+                    style_cmds.append(("FONTNAME", (idx_col, row_no), (idx_col, row_no), "Helvetica-Bold"))
+        if int(row.get("DATE_HEURE_YELLOW", 0) or 0) == 1:
+            for idx_col in [date_idx, heure_idx]:
+                if idx_col is not None:
+                    style_cmds.append(("BACKGROUND", (idx_col, row_no), (idx_col, row_no), colors.HexColor("#fff2cc")))
+                    style_cmds.append(("FONTNAME", (idx_col, row_no), (idx_col, row_no), "Helvetica-Bold"))
+
+    table.setStyle(TableStyle(style_cmds))
+    story.append(table)
+    story.append(Spacer(1, 0.35 * cm))
+
+    total_km = round(sum(_to_float(v) for v in pdf_df.get("KM", pd.Series(dtype=float))), 2) if "KM" in pdf_df.columns else 0.0
+    total_official = round(sum(_to_float(v) for v in pdf_df.get("H TVA", pd.Series(dtype=float))), 2) if "H TVA" in pdf_df.columns else 0.0
+    total_surcharge = round(sum(_to_float(v) for v in pdf_df.get("SURCHARGE_CARBURANT", pd.Series(dtype=float))), 2) if "SURCHARGE_CARBURANT" in pdf_df.columns else 0.0
+    total_adjusted = round(total_official + total_surcharge, 2)
+    coef_moyen = round((total_surcharge / total_km), 4) if total_km > 0 else 0.0
+
+    story.append(Paragraph("<b>Calcul inflation / carburant</b>", styles["Heading4"]))
+    calc_data = [
+        ["Base diesel", "1.54 €/L"],
+        ["Prix officiel total", f"{total_official:.2f} €"],
+        ["Surcharge carburant totale", f"{total_surcharge:.2f} €"],
+        ["Total ajusté HTVA", f"{total_adjusted:.2f} €"],
+        ["KM total", f"{total_km:.2f} km"],
+        ["Coef moyen appliqué", f"{coef_moyen:.4f} €/km"],
+        ["Règle rappel", "Prix officiel + surcharge carburant"],
+    ]
+    calc_table = Table(calc_data, colWidths=[4.5 * cm, 4.2 * cm])
+    calc_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f4f4f4")),
+        ("BACKGROUND", (0, 2), (-1, 3), colors.HexColor("#fff2cc")),
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+        ("FONTNAME", (0, 2), (-1, 3), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#9e9e9e")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    story.append(calc_table)
+
+    doc.build(story)
+    return buf.getvalue()
+
+_old_render_tab_clients = render_tab_clients
+
+def render_tab_clients():
+    st.subheader("🔍 Clients / Historique")
+    role = str(st.session_state.get("role") or "").lower()
+    if role in {"admin", "restricted"}:
+        st.markdown("### 📑 Tableau client DB")
+        c1, c2, c3 = st.columns([1,1,1])
+        with c1:
+            if st.button("🗑️ Vider toute la DB planning", key="clienthub_reset_db"):
+                with get_connection() as conn:
+                    conn.execute("DELETE FROM planning")
+                    conn.commit()
+                try:
+                    rebuild_planning_views()
+                except Exception:
+                    pass
+                st.success("Base planning vidée.")
+        with c2:
+            if st.button("🚀 Recharger historique depuis Excel", key="clienthub_rebuild_db"):
+                n = clienthub_reset_and_rebuild_db()
+                st.success(f"Historique rechargé : {n} ligne(s).")
+        with c3:
+            st.caption("Repart sur une base propre : DB vidée puis rechargée depuis l'Excel jusqu'à aujourd'hui.")
+
+        df_full = get_planning(source="full", max_rows=50000)
+        if df_full is not None and not df_full.empty:
+            df_full = df_full.copy()
+            client_options = ["FNH","JC","BT","LEO","LBE","BUZON","KI","AC","AD","FA","LILLO"]
+            colf1, colf2, colf3 = st.columns([1,1,1])
+            with colf1:
+                client_label = st.selectbox("Client", client_options, key="clienthub_client")
+            with colf2:
+                d1 = st.date_input("Date début", value=date.today().replace(day=1), key="clienthub_d1")
+            with colf3:
+                d2 = st.date_input("Date fin", value=date.today(), key="clienthub_d2")
+
+            if "Num BDC" in df_full.columns:
+                if client_label in {"FA","AD","LILLO"}:
+                    pass
+                else:
+                    df_full = df_full[df_full["Num BDC"].fillna("").astype(str).str.upper().str.startswith(client_label)]
+            # exact date range
+            try:
+                df_full["DATE_FILT"] = pd.to_datetime(df_full["DATE"], dayfirst=True, errors="coerce").dt.date
+                df_full = df_full[(df_full["DATE_FILT"] >= d1) & (df_full["DATE_FILT"] <= d2)].copy()
+            except Exception:
+                pass
+
+            # chauffeur complementary views
+            if client_label == "FA" and "CH" in df_full.columns:
+                mask = df_full["CH"].fillna("").astype(str).str.upper().str.contains("FA|PO|RO", regex=True)
+                df_full = df_full[mask].copy()
+            elif client_label in {"AD","LILLO"} and "CH" in df_full.columns:
+                mask = df_full["CH"].fillna("").astype(str).str.upper().str.contains(client_label, regex=False)
+                df_full = df_full[mask].copy()
+
+            wanted = ["DATE","HEURE","Unnamed: 8","DESIGNATION","GO","Num BDC","NOM","ADRESSE","CP","Localité","PAIEMENT","Caisse","KM","H TVA","SURCHARGE_CARBURANT","PARKING","ATTENTE","PEAGE","ADM","REMARQUE","DEMANDEUR","IMPUTATION","FACTURE_ENVOYEE","DATE_HEURE_YELLOW"]
+            cols = [c for c in wanted if c in df_full.columns]
+            view = df_full[cols].copy().fillna("")
+            st.dataframe(_clienthub_style_facture(view), use_container_width=True, height=420)
+            pdf_bytes = _clienthub_export_pdf_exact(view, f"{client_label} du {d1.strftime('%d/%m/%Y')} au {d2.strftime('%d/%m/%Y')}")
+            st.download_button(
+                "📄 Télécharger PDF client",
+                data=pdf_bytes,
+                file_name=f"{client_label}_{d1.isoformat()}_{d2.isoformat()}.pdf",
+                mime="application/pdf",
+                key="clienthub_pdf_exact",
+                use_container_width=True,
+            )
+        else:
+            st.info("Aucune donnée en base. Recharge l'historique depuis Excel.")
+        st.markdown("---")
+    return _old_render_tab_clients()
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+def render_driver_caisse_details_from_xlsm(ch_code):
+    """
+    Tableau détail caisse chauffeur depuis XLSM :
+    n'affiche que les caisses blanches/non vertes.
+    """
+    from datetime import date
+    import pandas as pd
+
+    ch_code = str(ch_code or "").strip().upper()
+    start_date = date(date.today().year, 1, 1)
+    end_date = date.today()
+
+    df_cash = read_caisse_unpaid_from_xlsm(start_date=start_date, end_date=end_date, ch_filter=ch_code)
+
+    if df_cash is None or df_cash.empty:
+        st.success("✅ Aucune caisse à remettre selon l'Excel.")
+        return
+
+    total_due = pd.to_numeric(df_cash["Caisse"], errors="coerce").fillna(0.0).sum()
+    st.warning(f"💶 Caisse à remettre : {float(total_due):.2f} €")
+    st.dataframe(df_cash, use_container_width=True, height=360)
+
+
+def render_driver_caisse_badge(ch_code):
+    """
+    Montant caisse chauffeur = même logique admin + synchro silencieuse des cellules vertes Excel.
+    Cela évite que des caisses déjà vertes dans Excel restent affichées à payer.
+    """
+    import pandas as pd
+    from datetime import date
+
+    ch_code = str(ch_code or "").strip().upper()
+    if not ch_code:
+        return 0.0
+
+    start_date = date(date.today().year, 1, 1)
+    end_date = date.today()
+
+    # 🔄 Avant de calculer, on marque en DB les lignes vertes Excel comme payées.
+    try:
+        force_sync_caisse_green_from_excel(start_date=start_date, end_date=end_date, ch_filter=ch_code)
+    except Exception as e:
+        print(f"⚠️ driver caisse force sync skipped: {e}", flush=True)
+
+    try:
+        df = get_planning(
+            start_date=start_date,
+            end_date=end_date,
+            chauffeur=None,
+            type_filter=None,
+            search="",
+            max_rows=50000,
+            source="full",
+        )
+    except TypeError:
+        df = get_planning(start_date=start_date, end_date=end_date, max_rows=50000, source="full")
+    except Exception:
+        return 0.0
+
+    if df is None or df.empty:
+        return 0.0
+
+    if "IS_INDISPO" in df.columns:
+        df = df[df["IS_INDISPO"].fillna(0).astype(int) == 0].copy()
+    if "IS_SUPERSEDED" in df.columns:
+        df = df[df["IS_SUPERSEDED"].fillna(0).astype(int) == 0].copy()
+
+    if "CH" in df.columns:
+        ch_series = (
+            df["CH"].fillna("")
+            .astype(str)
+            .str.upper()
+            .str.replace("*", "", regex=False)
+            .str.replace(" ", "", regex=False)
+            .str.strip()
+        )
+        ch_norm = normalize_ch_code(ch_code)
+        df = df[ch_series.str.startswith(ch_norm)].copy()
+
+    if df.empty:
+        return 0.0
+
+    pay_norm = df.get("PAIEMENT", pd.Series("", index=df.index)).fillna("").astype(str).str.strip().str.lower()
+    df = df[pay_norm == "caisse"].copy()
+
+    if df.empty:
+        return 0.0
+
+    if "CAISSE_PAYEE" in df.columns:
+        df = df[df["CAISSE_PAYEE"].fillna(0).astype(int) == 0].copy()
+
+    if df.empty:
+        return 0.0
+
+    caisse_col = "Caisse" if "Caisse" in df.columns else ("CAISSE" if "CAISSE" in df.columns else None)
+    if not caisse_col:
+        return 0.0
+
+    total_due = pd.to_numeric(df[caisse_col], errors="coerce").fillna(0.0)
+    total_due = float(total_due[total_due > 0].sum())
+
+    return round(total_due, 2)
+
+
+
+def render_driver_caisse_details_from_xlsm(ch_code):
+    """
+    Tableau détail caisse chauffeur depuis XLSM :
+    n'affiche que les caisses blanches/non vertes.
+    """
+    from datetime import date
+    import pandas as pd
+
+    ch_code = str(ch_code or "").strip().upper()
+    start_date = date(date.today().year, 1, 1)
+    end_date = date.today()
+
+    df_cash = read_caisse_unpaid_from_xlsm(start_date=start_date, end_date=end_date, ch_filter=ch_code)
+
+    if df_cash is None or df_cash.empty:
+        st.success("✅ Aucune caisse à remettre selon l'Excel.")
+        return
+
+    total_due = pd.to_numeric(df_cash["Caisse"], errors="coerce").fillna(0.0).sum()
+    st.warning(f"💶 Caisse à remettre : {float(total_due):.2f} €")
+    st.dataframe(df_cash, use_container_width=True, height=360)
+
+
+def render_driver_caisse_badge(ch_code):
+    """
+    Montant caisse chauffeur basé sur la SOURCE EXACTE demandée :
+    le fichier XLSM.
+    - caisse verte dans XLSM => payée, ignorée
+    - caisse blanche/non verte dans XLSM => à payer
+    """
+    import pandas as pd
+    from datetime import date
+
+    ch_code = str(ch_code or "").strip().upper()
+    if not ch_code:
+        return 0.0
+
+    start_date = date(date.today().year, 1, 1)
+    end_date = date.today()
+
+    try:
+        df_cash = read_caisse_unpaid_from_xlsm(start_date=start_date, end_date=end_date, ch_filter=ch_code)
+        if df_cash is None or df_cash.empty:
+            return 0.0
+        total_due = pd.to_numeric(df_cash["Caisse"], errors="coerce").fillna(0.0)
+        return round(float(total_due[total_due > 0].sum()), 2)
+    except Exception as e:
+        print(f"⚠️ render_driver_caisse_badge XLSM source failed: {e}", flush=True)
+        return 0.0
