@@ -11461,7 +11461,7 @@ def render_tab_calcul_heures():
         # 💶 ONGLET CAISSE
         # ======================================================
         with tab_caisse:
-                render_tab_admin_caisse_lazy()
+                st.info("💶 La caisse admin est maintenant dans l’onglet principal « Caisse admin ». Elle ne se charge que quand tu cliques dessus.")
                 return
                 st.markdown("### 💶 Caisse non rentrée (60 jours)")
                 consume_soft_refresh("caisse")
