@@ -5021,16 +5021,125 @@ def sync_planning_j7_force_fast(excel_sync_ts: str | None = None, *, ui: bool = 
     else:
         df_excel["HEURE"] = ""
 
-    # 4) Flags minimum sans relire les couleurs Excel
+    # 4) Couleurs Excel IMPORTANTES — lecture locale du même XLSM déjà téléchargé
+    #    ✅ Pas de 2e téléchargement Dropbox, pas de sauvegarde XLSM.
+    #    On récupère seulement les couleurs utiles sur Feuil1 / J->J+7.
+    def _fast_excel_color_name(cell):
+        try:
+            fill = getattr(cell, "fill", None)
+            if fill is None or getattr(fill, "patternType", None) is None:
+                return ""
+            fg = getattr(fill, "fgColor", None)
+            if fg is None:
+                return ""
+            rgb = ""
+            if getattr(fg, "type", None) == "rgb" and getattr(fg, "rgb", None):
+                rgb = str(fg.rgb or "").upper()
+            elif getattr(fg, "type", None) == "indexed":
+                idx = int(getattr(fg, "indexed", 0) or 0)
+                if idx in {3, 4, 10, 17, 35, 43, 50}:
+                    return "green"
+                if idx in {5, 6, 13, 36, 44}:
+                    return "yellow"
+                return ""
+            elif getattr(fg, "type", None) == "theme":
+                return "theme"
+
+            if not rgb:
+                return ""
+            if rgb.endswith("00B050") or rgb.endswith("92D050") or rgb.endswith("C6EFCE") or rgb.endswith("00FF00"):
+                return "green"
+            if rgb.endswith("FFC000") or rgb.endswith("F4B183") or rgb.endswith("ED7D31") or rgb.endswith("FFA500"):
+                return "orange"
+            if rgb.endswith("FFFF00") or rgb.endswith("FFF2CC") or rgb.endswith("FFE699"):
+                return "yellow"
+            if rgb.endswith("BDD7EE") or rgb.endswith("9DC3E6") or rgb.endswith("00B0F0"):
+                return "blue"
+            if rgb.endswith("FFC7CE") or rgb.endswith("FF0000"):
+                return "red"
+            return rgb
+        except Exception:
+            return ""
+
     for c, default in {
         "IS_INDISPO": 0,
         "IS_BUREAU": 0,
         "IS_SUPERSEDED": 0,
+        "IS_GROUPAGE": 0,
+        "IS_PARTAGE": 0,
+        "IS_ATTENTE": 0,
         "CH_COLOR": "",
         "CAISSE_COLOR": "",
+        "CONFIRMED": 0,
+        "CONFIRMED_AT": None,
+        "CAISSE_PAYEE": 0,
     }.items():
         if c not in df_excel.columns:
             df_excel[c] = default
+
+    try:
+        from openpyxl import load_workbook as _load_wb_fast_colors
+        wb_colors = _load_wb_fast_colors(BytesIO(content), data_only=True, keep_vba=True, read_only=False)
+        ws_colors = wb_colors["Feuil1"]
+        header_excel_row = int(header_row) + 1
+        headers = {}
+        for col_idx in range(1, ws_colors.max_column + 1):
+            name = str(ws_colors.cell(row=header_excel_row, column=col_idx).value or "").strip()
+            if name:
+                headers[name.upper()] = col_idx
+
+        c_date = headers.get("DATE")
+        c_heure = headers.get("HEURE")
+        c_ch = headers.get("CH")
+        c_caisse = headers.get("CAISSE")
+        c_designation = headers.get("DESIGNATION")
+
+        color_map = {}
+        for pos in range(len(df_excel)):
+            excel_row = header_excel_row + 1 + pos
+            date_color = _fast_excel_color_name(ws_colors.cell(excel_row, c_date)) if c_date else ""
+            heure_color = _fast_excel_color_name(ws_colors.cell(excel_row, c_heure)) if c_heure else ""
+            ch_color = _fast_excel_color_name(ws_colors.cell(excel_row, c_ch)) if c_ch else ""
+            caisse_color = _fast_excel_color_name(ws_colors.cell(excel_row, c_caisse)) if c_caisse else ""
+            designation_color = _fast_excel_color_name(ws_colors.cell(excel_row, c_designation)) if c_designation else ""
+            color_map[pos] = (date_color, heure_color, ch_color, caisse_color, designation_color)
+
+        new_ch_colors, new_caisse_colors, groupages, partages, attentes = [], [], [], [], []
+        for idx in df_excel.index:
+            try:
+                pos = int(idx)
+            except Exception:
+                pos = None
+            date_color, heure_color, ch_color, caisse_color, designation_color = color_map.get(pos, ("", "", "", "", ""))
+            new_ch_colors.append(ch_color)
+            new_caisse_colors.append(caisse_color)
+            groupages.append(1 if (date_color == "yellow" or heure_color == "yellow") else 0)
+            partages.append(1 if (heure_color == "yellow" and date_color != "yellow") else 0)
+            attentes.append(1 if (designation_color == "yellow" or designation_color == "orange") else 0)
+
+        df_excel["CH_COLOR"] = new_ch_colors
+        df_excel["CAISSE_COLOR"] = new_caisse_colors
+        df_excel["IS_GROUPAGE"] = groupages
+        df_excel["IS_PARTAGE"] = partages
+        df_excel["IS_ATTENTE"] = attentes
+        df_excel["CONFIRMED"] = df_excel["CH_COLOR"].apply(lambda c: 1 if str(c).lower() == "green" else 0)
+        df_excel["CONFIRMED_AT"] = df_excel["CONFIRMED"].apply(lambda v: now_iso if int(v or 0) == 1 else None)
+
+        def _fast_caisse_payee(row):
+            paiement = str(row.get("PAIEMENT", "") or row.get("Paiement", "") or "").strip().lower()
+            if paiement != "caisse":
+                return 0
+            try:
+                montant = float(str(row.get("Caisse", 0) or 0).replace(",", "."))
+            except Exception:
+                montant = 0
+            if montant <= 0:
+                return 0
+            return 1 if str(row.get("CAISSE_COLOR", "")).lower() == "green" else 0
+
+        df_excel["CAISSE_PAYEE"] = df_excel.apply(_fast_caisse_payee, axis=1)
+    except Exception as e:
+        print(f"⚠️ Couleurs Excel non chargées en mode rapide: {e}", flush=True)
 
     # 5) EXCEL_UID + row_key
     def _norm_txt_uid(v):
@@ -5070,6 +5179,16 @@ def sync_planning_j7_force_fast(excel_sync_ts: str | None = None, *, ui: bool = 
             "IS_INDISPO": 'ALTER TABLE planning ADD COLUMN "IS_INDISPO" INTEGER DEFAULT 0',
             "IS_BUREAU": 'ALTER TABLE planning ADD COLUMN "IS_BUREAU" INTEGER DEFAULT 0',
             "LOCKED_BY_APP": 'ALTER TABLE planning ADD COLUMN "LOCKED_BY_APP" INTEGER DEFAULT 0',
+            "IS_GROUPAGE": 'ALTER TABLE planning ADD COLUMN "IS_GROUPAGE" INTEGER DEFAULT 0',
+            "IS_PARTAGE": 'ALTER TABLE planning ADD COLUMN "IS_PARTAGE" INTEGER DEFAULT 0',
+            "IS_ATTENTE": 'ALTER TABLE planning ADD COLUMN "IS_ATTENTE" INTEGER DEFAULT 0',
+            "CH_COLOR": 'ALTER TABLE planning ADD COLUMN "CH_COLOR" TEXT',
+            "CAISSE_COLOR": 'ALTER TABLE planning ADD COLUMN "CAISSE_COLOR" TEXT',
+            "CONFIRMED": 'ALTER TABLE planning ADD COLUMN "CONFIRMED" INTEGER DEFAULT 0',
+            "CONFIRMED_AT": 'ALTER TABLE planning ADD COLUMN "CONFIRMED_AT" TEXT',
+            "CAISSE_PAYEE": 'ALTER TABLE planning ADD COLUMN "CAISSE_PAYEE" INTEGER DEFAULT 0',
+            "CAISSE_PAYEE_AT": 'ALTER TABLE planning ADD COLUMN "CAISSE_PAYEE_AT" TEXT',
+            "CAISSE_COMMENT": 'ALTER TABLE planning ADD COLUMN "CAISSE_COMMENT" TEXT',
         }.items():
             if col not in existing_cols:
                 conn.execute(ddl)
@@ -11908,6 +12027,26 @@ def render_tab_calcul_heures():
                 # ==================================================
                 # 📋 TABLE ÉDITABLE
                 # ==================================================
+                # Sécurité : certaines sources caisse viennent du XLSM et n'ont pas toujours l'id DB.
+                # On tente de retrouver l'id via row_key, sinon on laisse vide sans planter.
+                if "id" not in df_cash.columns:
+                        df_cash["id"] = pd.NA
+                        try:
+                                if "row_key" in df_cash.columns:
+                                        keys = [str(x).strip() for x in df_cash["row_key"].dropna().tolist() if str(x).strip()]
+                                        if keys:
+                                                with get_connection() as conn:
+                                                        q = ",".join(["?"] * len(keys))
+                                                        rows = conn.execute(f"SELECT row_key, id FROM planning WHERE row_key IN ({q})", keys).fetchall()
+                                                id_map = {str(r[0]): int(r[1]) for r in rows}
+                                                df_cash["id"] = df_cash["row_key"].astype(str).map(id_map)
+                        except Exception:
+                                pass
+
+                for _c in ["DATE", "CH", "NOM", "Caisse"]:
+                        if _c not in df_cash.columns:
+                                df_cash[_c] = ""
+
                 df_out = df_cash[["id", "DATE", "CH", "NOM", "Caisse"]].copy()
 
                 df_out.rename(
@@ -11947,7 +12086,7 @@ def render_tab_calcul_heures():
 
                 with colv1:
                         if st.button("✅ Valider la sélection"):
-                                ids = edited[edited["Valider"] == True]["id"].tolist()
+                                ids = edited[edited["Valider"] == True]["id"].dropna().tolist()
 
                                 if not ids:
                                         st.warning("Aucune ligne sélectionnée.")
