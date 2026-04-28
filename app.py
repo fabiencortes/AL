@@ -4915,7 +4915,7 @@ def sync_planning_j7_force_fast(excel_sync_ts: str | None = None, *, ui: bool = 
     - synchronise uniquement aujourd'hui + les 7 jours suivants
     - ne touche pas Feuil2/Feuil3/chauffeurs
     - ne modifie pas le XLSM
-    - ne synchronise pas les couleurs/caisse
+    - respecte les couleurs Excel utiles (CH, Caisse, groupage/partage/attente)
     """
     import re
     import pandas as pd
@@ -5094,23 +5094,22 @@ def sync_planning_j7_force_fast(excel_sync_ts: str | None = None, *, ui: bool = 
         c_caisse = headers.get("CAISSE")
         c_designation = headers.get("DESIGNATION")
 
-        color_map = {}
-        for pos in range(len(df_excel)):
-            excel_row = header_excel_row + 1 + pos
+        # IMPORTANT : df_excel garde l'index original du XLSM après filtrage J->J+7.
+        # Donc la ligne Excel réelle = header_excel_row + 1 + index_original.
+        # Cela évite de lire les couleurs de mauvaises lignes quand il y a des dates avant aujourd'hui.
+        new_ch_colors, new_caisse_colors, groupages, partages, attentes = [], [], [], [], []
+        for idx in df_excel.index:
+            try:
+                excel_row = header_excel_row + 1 + int(idx)
+            except Exception:
+                excel_row = header_excel_row + 1
+
             date_color = _fast_excel_color_name(ws_colors.cell(excel_row, c_date)) if c_date else ""
             heure_color = _fast_excel_color_name(ws_colors.cell(excel_row, c_heure)) if c_heure else ""
             ch_color = _fast_excel_color_name(ws_colors.cell(excel_row, c_ch)) if c_ch else ""
             caisse_color = _fast_excel_color_name(ws_colors.cell(excel_row, c_caisse)) if c_caisse else ""
             designation_color = _fast_excel_color_name(ws_colors.cell(excel_row, c_designation)) if c_designation else ""
-            color_map[pos] = (date_color, heure_color, ch_color, caisse_color, designation_color)
 
-        new_ch_colors, new_caisse_colors, groupages, partages, attentes = [], [], [], [], []
-        for idx in df_excel.index:
-            try:
-                pos = int(idx)
-            except Exception:
-                pos = None
-            date_color, heure_color, ch_color, caisse_color, designation_color = color_map.get(pos, ("", "", "", "", ""))
             new_ch_colors.append(ch_color)
             new_caisse_colors.append(caisse_color)
             groupages.append(1 if (date_color == "yellow" or heure_color == "yellow") else 0)
@@ -5217,9 +5216,12 @@ def sync_planning_j7_force_fast(excel_sync_ts: str | None = None, *, ui: bool = 
     # 6) Préserve confirmations/caisse payée si même row_key, puis remplace J -> J+7
     with get_connection() as conn:
         cur = conn.cursor()
+        # On préserve uniquement les réponses chauffeur déjà encodées.
+        # Les confirmations/caisse doivent venir des couleurs du XLSM, sinon les anciennes valeurs DB
+        # peuvent écraser les nouvelles couleurs Excel.
         prev_rows = cur.execute(
             """
-            SELECT row_key, CONFIRMED, CONFIRMED_AT, ACK_AT, ACK_TEXT, CAISSE_PAYEE, CAISSE_PAYEE_AT, CAISSE_COMMENT
+            SELECT row_key, ACK_AT, ACK_TEXT
             FROM planning
             WHERE COALESCE(row_key,'') != ''
               AND date(COALESCE(DATE_ISO, DATE)) BETWEEN date(?) AND date(?)
@@ -5267,8 +5269,7 @@ def sync_planning_j7_force_fast(excel_sync_ts: str | None = None, *, ui: bool = 
 
             prev = prev_map.get(rk)
             if prev:
-                names = ["CONFIRMED", "CONFIRMED_AT", "ACK_AT", "ACK_TEXT", "CAISSE_PAYEE", "CAISSE_PAYEE_AT", "CAISSE_COMMENT"]
-                for name, val in zip(names, prev):
+                for name, val in zip(["ACK_AT", "ACK_TEXT"], prev):
                     if name in planning_cols:
                         data[name] = val
 
