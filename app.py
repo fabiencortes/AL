@@ -57,6 +57,11 @@ import pandas as pd
 import requests
 from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string
+try:
+    import utils as _al_utils
+    _al_utils.column_index_from_string = column_index_from_string
+except Exception:
+    pass
 from io import BytesIO
 import streamlit as st
 import database as _database
@@ -2479,7 +2484,7 @@ def format_chauffeur_colored(ch, confirmed, row=None):
 
     return f"🟠 {ch}"
 
-def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = True):
+def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = True, ensure_excel_keys: bool = False, refresh_aux_sheets: bool = False):
     """
     🔄 Synchronisation SAFE depuis aujourd’hui
     - ZÉRO doublon (row_key + INSERT OR IGNORE)
@@ -2509,14 +2514,11 @@ def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = Tru
             st.info(msg)
         else:
             print(f"ℹ️ {msg}", flush=True)
-    # 🆔 Assure ROW_KEY UUID dans Excel (colonne ZX, masquée)
-    try:
-        from utils import ensure_excel_row_key_column
-        ensure_excel_row_key_column(dropbox_path=DROPBOX_FILE_PATH, sheet_name="Feuil1", target_col_letter="ZX")
-    except Exception as e:
-        print(f"⚠️ ensure ROW_KEY Excel failed: {e}", flush=True)
-
-
+    # 🆔 IMPORTANT PERFORMANCE :
+    # Ne PAS toucher/modifier l'Excel avant d'avoir vérifié si Dropbox a changé.
+    # Avant, ensure_excel_row_key_column() pouvait télécharger + ouvrir + sauver le xlsm
+    # à chaque clic, ce qui rendait le bouton beaucoup plus lent.
+    # On ne l'exécute maintenant que si ensure_excel_keys=True.
     from datetime import date, datetime, timedelta
     import pandas as pd
     import re
@@ -2539,6 +2541,20 @@ def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = Tru
                     return 0
             except Exception:
                 pass
+
+    # ======================================================
+    # 🆔 ROW_KEY Excel — optionnel seulement
+    # ======================================================
+    if ensure_excel_keys:
+        try:
+            from utils import ensure_excel_row_key_column
+            ensure_excel_row_key_column(
+                dropbox_path=DROPBOX_FILE_PATH,
+                sheet_name="Feuil1",
+                target_col_letter="ZX",
+            )
+        except Exception as e:
+            print(f"⚠️ ensure ROW_KEY Excel failed: {e}", flush=True)
 
     # ======================================================
     # 0️⃣ SÉCURITÉ DB : colonnes nécessaires
@@ -3073,51 +3089,52 @@ def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = Tru
     # ======================================================
     rebuild_planning_views()
 
-    # ======================================================
-    # 12️⃣ Feuil2 → chauffeurs
-    # ======================================================
-    df_ch = load_planning_from_dropbox("Feuil2")
-    if df_ch is not None and not df_ch.empty:
-        with get_connection() as conn:
-            conn.execute("DROP TABLE IF EXISTS chauffeurs")
-            conn.commit()
+    if refresh_aux_sheets:
+        # ======================================================
+        # 12️⃣ Feuil2 → chauffeurs
+        # ======================================================
+        df_ch = load_planning_from_dropbox("Feuil2")
+        if df_ch is not None and not df_ch.empty:
+            with get_connection() as conn:
+                conn.execute("DROP TABLE IF EXISTS chauffeurs")
+                conn.commit()
 
-        cols = [c for c in df_ch.columns if c]
-        col_defs = ", ".join(f'"{c}" TEXT' for c in cols)
-        cols_sql = ",".join(f'"{c}"' for c in cols)
-        placeholders = ",".join("?" for _ in cols)
+            cols = [c for c in df_ch.columns if c]
+            col_defs = ", ".join(f'"{c}" TEXT' for c in cols)
+            cols_sql = ",".join(f'"{c}"' for c in cols)
+            placeholders = ",".join("?" for _ in cols)
 
-        with get_connection() as conn:
-            conn.execute(f'CREATE TABLE chauffeurs ({col_defs})')
-            for _, r in df_ch.iterrows():
-                conn.execute(
-                    f'INSERT INTO chauffeurs ({cols_sql}) VALUES ({placeholders})',
-                    [sqlite_safe(r.get(c)) for c in cols],
-                )
-            conn.commit()
+            with get_connection() as conn:
+                conn.execute(f'CREATE TABLE chauffeurs ({col_defs})')
+                for _, r in df_ch.iterrows():
+                    conn.execute(
+                        f'INSERT INTO chauffeurs ({cols_sql}) VALUES ({placeholders})',
+                        [sqlite_safe(r.get(c)) for c in cols],
+                    )
+                conn.commit()
 
-    # ======================================================
-    # 13️⃣ Feuil3
-    # ======================================================
-    df_f3 = load_planning_from_dropbox("Feuil3")
-    if df_f3 is not None and not df_f3.empty:
-        with get_connection() as conn:
-            conn.execute("DROP TABLE IF EXISTS feuil3")
-            conn.commit()
+        # ======================================================
+        # 13️⃣ Feuil3
+        # ======================================================
+        df_f3 = load_planning_from_dropbox("Feuil3")
+        if df_f3 is not None and not df_f3.empty:
+            with get_connection() as conn:
+                conn.execute("DROP TABLE IF EXISTS feuil3")
+                conn.commit()
 
-        cols3 = [c for c in df_f3.columns if c]
-        col_defs3 = ", ".join(f'"{c}" TEXT' for c in cols3)
-        cols_sql3 = ",".join(f'"{c}"' for c in cols3)
-        placeholders3 = ",".join("?" for _ in cols3)
+            cols3 = [c for c in df_f3.columns if c]
+            col_defs3 = ", ".join(f'"{c}" TEXT' for c in cols3)
+            cols_sql3 = ",".join(f'"{c}"' for c in cols3)
+            placeholders3 = ",".join("?" for _ in cols3)
 
-        with get_connection() as conn:
-            conn.execute(f'CREATE TABLE feuil3 ({col_defs3})')
-            for _, r in df_f3.iterrows():
-                conn.execute(
-                    f'INSERT INTO feuil3 ({cols_sql3}) VALUES ({placeholders3})',
-                    [sqlite_safe(r.get(c)) for c in cols3],
-                )
-            conn.commit()
+            with get_connection() as conn:
+                conn.execute(f'CREATE TABLE feuil3 ({col_defs3})')
+                for _, r in df_f3.iterrows():
+                    conn.execute(
+                        f'INSERT INTO feuil3 ({cols_sql3}) VALUES ({placeholders3})',
+                        [sqlite_safe(r.get(c)) for c in cols3],
+                    )
+                conn.commit()
 
     # ======================================================
     # 14️⃣ Cache / UI (silencieux + ciblé)
@@ -3141,6 +3158,36 @@ def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = Tru
 
 
 
+
+
+def sync_planning_from_today_fast(excel_sync_ts: str | None = None, *, ui: bool = True) -> int:
+    """
+    ⚡ Bouton MAJ rapide :
+    - vérifie d'abord si Dropbox a changé ;
+    - ne modifie pas le fichier Excel ;
+    - ne recharge pas Feuil2/Feuil3 ;
+    - garde le même moteur d'import Feuil1.
+    """
+    return sync_planning_from_today(
+        excel_sync_ts=excel_sync_ts,
+        ui=ui,
+        ensure_excel_keys=False,
+        refresh_aux_sheets=False,
+    )
+
+
+def sync_planning_from_today_old_button(excel_sync_ts: str | None = None, *, ui: bool = True) -> int:
+    """
+    ⚡ Compatibilité ancien nom, mais bouton MAJ allégé.
+    Ne modifie plus le fichier Excel au clic : l ancien ensure_excel_row_key_column()
+    ouvrait/sauvait le XLSM Dropbox et ralentissait fortement la synchro.
+    """
+    return sync_planning_from_today(
+        excel_sync_ts=excel_sync_ts,
+        ui=ui,
+        ensure_excel_keys=False,
+        refresh_aux_sheets=False,
+    )
 
 def sync_planning_from_uploaded_file(uploaded_file):
     """
@@ -4913,9 +4960,9 @@ def _topbar_sync_db_and_refresh(*, also_send_next4: bool = False):
         with st.spinner("🔄 Synchronisation Dropbox → DB…"):
             # force un refresh même si Dropbox n’a pas changé : on passe un ts unique
             try:
-                sync_planning_from_today(excel_sync_ts=datetime.now().isoformat(), ui=True)
+                sync_planning_from_today_old_button(excel_sync_ts=datetime.now().isoformat(), ui=True)
             except TypeError:
-                sync_planning_from_today(ui=True)
+                sync_planning_from_today_old_button(ui=True)
 
         if also_send_next4:
             with st.spinner("📧 Envoi planning (3 prochains jours)…"):
@@ -4924,12 +4971,16 @@ def _topbar_sync_db_and_refresh(*, also_send_next4: bool = False):
                     f"📧 Envoi terminé — envoyés: {recap['sent']} | vides: {recap['skipped_empty']} | emails manquants: {recap['missing_email']} | erreurs: {recap['errors']}"
                 )
 
-        # refresh UI
+        # Refresh léger : on invalide uniquement le planning si possible.
         try:
-            st.cache_data.clear()
+            get_planning.clear()
         except Exception:
             pass
-        st.rerun()
+        try:
+            st.session_state["last_sync_time"] = datetime.now().strftime("%H:%M")
+        except Exception:
+            pass
+        st.success("✅ Mise à jour terminée")
     except Exception as e:
         st.error(f"❌ Erreur MAJ DB Dropbox: {e}")
 
@@ -8739,10 +8790,12 @@ def render_tab_excel_sync():
     if st.session_state.pop("_do_dropbox_sync", False):
         with st.spinner("🔄 Synchronisation en cours depuis Dropbox…"):
             sync_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            inserted = sync_planning_from_today(excel_sync_ts=sync_ts)
-            cleanup_orphan_planning_rows(sync_ts)
+            inserted = sync_planning_from_today_old_button(excel_sync_ts=sync_ts)
+            # ⚡ Nettoyage lourd désactivé sur le bouton rapide.
+            # Logique ancienne restaurée pour ce bouton : ROW_KEY + Feuil2/Feuil3.
+            # cleanup_orphan_planning_rows(sync_ts)
             log_event(
-                f"Sync Dropbox + cleanup exécutés ({inserted} lignes)",
+                f"Sync Dropbox rapide exécuté ({inserted} lignes)",
                 "SYNC",
             )
 
@@ -11619,7 +11672,94 @@ def render_tab_calcul_heures():
                 # ==================================================
                 # 📋 TABLE ÉDITABLE
                 # ==================================================
-                df_out = df_cash[["id", "DATE", "CH", "NOM", "Caisse"]].copy()
+                # La source caisse vient du XLSM. Elle peut donc ne pas contenir
+                # l'id DB. On tente de retrouver l'id correspondant dans planning
+                # pour garder la validation manuelle, sans planter l'onglet.
+                if "id" not in df_cash.columns:
+                        try:
+                                with get_connection() as conn:
+                                        db_cash = pd.read_sql_query(
+                                                """
+                                                SELECT id, DATE_ISO, DATE, HEURE, CH, NOM, Caisse, PAIEMENT,
+                                                       COALESCE(CAISSE_PAYEE,0) AS CAISSE_PAYEE,
+                                                       COALESCE(IS_INDISPO,0) AS IS_INDISPO,
+                                                       COALESCE(IS_SUPERSEDED,0) AS IS_SUPERSEDED
+                                                FROM planning
+                                                WHERE LOWER(COALESCE(PAIEMENT,'')) = 'caisse'
+                                                  AND COALESCE(IS_INDISPO,0) = 0
+                                                  AND COALESCE(IS_SUPERSEDED,0) = 0
+                                                  AND COALESCE(CAISSE_PAYEE,0) = 0
+                                                """,
+                                                conn,
+                                        )
+
+                                if db_cash is not None and not db_cash.empty:
+                                        def _norm_txt_for_match(v):
+                                                try:
+                                                        return str(v or "").strip().upper()
+                                                except Exception:
+                                                        return ""
+
+                                        def _norm_time_for_match(v):
+                                                try:
+                                                        return normalize_time_string(v) or ""
+                                                except Exception:
+                                                        return str(v or "").strip()
+
+                                        def _norm_amount_for_match(v):
+                                                try:
+                                                        return round(float(str(v or 0).replace("€", "").replace(" ", "").replace(",", ".")), 2)
+                                                except Exception:
+                                                        return 0.0
+
+                                        db_cash = db_cash.copy()
+                                        db_cash["_DATE_ISO_M"] = db_cash.get("DATE_ISO", "").astype(str)
+                                        db_cash["_CH_M"] = db_cash.get("CH", "").map(lambda x: normalize_ch_code(str(x).upper().replace("*", "").replace(" ", "").strip()))
+                                        db_cash["_HEURE_M"] = db_cash.get("HEURE", "").map(_norm_time_for_match)
+                                        db_cash["_NOM_M"] = db_cash.get("NOM", "").map(_norm_txt_for_match)
+                                        db_cash["_CAISSE_M"] = db_cash.get("Caisse", 0).map(_norm_amount_for_match)
+
+                                        matched_ids = []
+                                        used_ids = set()
+                                        for _, xr in df_cash.iterrows():
+                                                date_m = str(xr.get("DATE_ISO", "") or "")
+                                                ch_m = normalize_ch_code(str(xr.get("CH", "") or "").upper().replace("*", "").replace(" ", "").strip())
+                                                heure_m = _norm_time_for_match(xr.get("HEURE", ""))
+                                                nom_m = _norm_txt_for_match(xr.get("NOM", ""))
+                                                caisse_m = _norm_amount_for_match(xr.get("Caisse", 0))
+
+                                                cand = db_cash[
+                                                        (db_cash["_DATE_ISO_M"] == date_m)
+                                                        & (db_cash["_CH_M"].str.startswith(ch_m) if ch_m else True)
+                                                        & ((db_cash["_CAISSE_M"] - caisse_m).abs() < 0.01)
+                                                ].copy()
+                                                if not cand.empty:
+                                                        cand = cand[~cand["id"].isin(used_ids)].copy()
+                                                if cand.empty:
+                                                        matched_ids.append(None)
+                                                        continue
+
+                                                cand["_score"] = 0
+                                                if nom_m:
+                                                        cand.loc[cand["_NOM_M"] == nom_m, "_score"] += 10
+                                                if heure_m:
+                                                        cand.loc[cand["_HEURE_M"] == heure_m, "_score"] += 5
+                                                cand = cand.sort_values(["_score", "id"], ascending=[False, True])
+                                                rid = int(cand.iloc[0]["id"])
+                                                used_ids.add(rid)
+                                                matched_ids.append(rid)
+
+                                        df_cash["id"] = matched_ids
+                        except Exception as e:
+                                st.warning(f"Impossible de relier certaines lignes caisse au planning DB : {e}")
+                                df_cash["id"] = None
+
+                needed_cols = ["id", "DATE", "CH", "NOM", "Caisse"]
+                for c in needed_cols:
+                        if c not in df_cash.columns:
+                                df_cash[c] = ""
+
+                df_out = df_cash[needed_cols].copy()
 
                 df_out.rename(
                         columns={
@@ -11628,6 +11768,9 @@ def render_tab_calcul_heures():
                         },
                         inplace=True,
                 )
+
+                if "id" in df_out.columns and df_out["id"].isna().any():
+                        st.warning("Certaines lignes viennent du XLSM mais n'ont pas encore été reliées à la DB. Elles sont affichées, mais ne pourront pas être validées manuellement ici.")
 
                 df_out["Valider"] = False
 
@@ -11658,10 +11801,18 @@ def render_tab_calcul_heures():
 
                 with colv1:
                         if st.button("✅ Valider la sélection"):
-                                ids = edited[edited["Valider"] == True]["id"].tolist()
+                                ids_raw = edited[edited["Valider"] == True]["id"].tolist()
+                                ids = []
+                                for rid in ids_raw:
+                                        try:
+                                                if pd.isna(rid):
+                                                        continue
+                                                ids.append(int(rid))
+                                        except Exception:
+                                                continue
 
                                 if not ids:
-                                        st.warning("Aucune ligne sélectionnée.")
+                                        st.warning("Aucune ligne sélectionnée avec un id DB valide.")
                                 else:
                                         now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                                         for rid in ids:
