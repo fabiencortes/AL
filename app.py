@@ -1451,9 +1451,20 @@ import os
 import requests
 
 def load_planning_from_dropbox(sheet_name: str | None = None) -> pd.DataFrame:
-    from utils import get_dropbox_excel_cached
+    # ✅ Lecture FORCÉE du XLSM Dropbox pour la MAJ planning.
+    # Évite get_dropbox_excel_cached() qui peut relire une ancienne version.
+    try:
+        content = download_dropbox_excel_bytes(DROPBOX_FILE_PATH)
+    except Exception:
+        content = None
 
-    content = get_dropbox_excel_cached()
+    if not content:
+        try:
+            from utils import get_dropbox_excel_cached
+            content = get_dropbox_excel_cached()
+        except Exception:
+            content = None
+
     if not content:
         return pd.DataFrame()
 
@@ -2509,13 +2520,8 @@ def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = Tru
             st.info(msg)
         else:
             print(f"ℹ️ {msg}", flush=True)
-    # 🆔 Assure ROW_KEY UUID dans Excel (colonne ZX, masquée)
-    try:
-        from utils import ensure_excel_row_key_column
-        ensure_excel_row_key_column(dropbox_path=DROPBOX_FILE_PATH, sheet_name="Feuil1", target_col_letter="ZX")
-    except Exception as e:
-        print(f"⚠️ ensure ROW_KEY Excel failed: {e}", flush=True)
-
+    # ✅ Mode rapide : ne pas modifier/sauver le XLSM pendant la MAJ.
+    # Les row_key sont recalculés côté DB.
 
     from datetime import date, datetime, timedelta
     import pandas as pd
@@ -2532,7 +2538,7 @@ def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = Tru
         pass
     else:
         last_excel_dt = get_meta("excel_last_modified")
-        if last_excel_dt:
+        if last_excel_dt and not excel_sync_ts:
             try:
                 last_excel_dt = datetime.fromisoformat(last_excel_dt)
                 if excel_dt <= last_excel_dt:
@@ -11828,17 +11834,21 @@ def main():
 
         ch_norm = str(ch_code or "").strip().upper()
         if ch_norm in {"FA", "AD"}:
-            tab1, tab2, tab3 = st.tabs(["🚖 Mon planning", "📚 Complément 15 jours", "🚫 Mes indispos"])
+            tab1, tab_caisse, tab2, tab3 = st.tabs(["🚖 Mon planning", "💶 Ma caisse", "📚 Complément 15 jours", "🚫 Mes indispos"])
             with tab1:
                 render_tab_chauffeur_driver()
+            with tab_caisse:
+                render_tab_chauffeur_caisse_lazy(ch_code)
             with tab2:
                 render_tab_driver_complement_history(ch_norm)
             with tab3:
                 render_tab_indispo_driver(ch_code)
         else:
-            tab1, tab2 = st.tabs(["🚖 Mon planning", "🚫 Mes indispos"])
+            tab1, tab_caisse, tab2 = st.tabs(["🚖 Mon planning", "💶 Ma caisse", "🚫 Mes indispos"])
             with tab1:
                 render_tab_chauffeur_driver()
+            with tab_caisse:
+                render_tab_chauffeur_caisse_lazy(ch_code)
             with tab2:
                 render_tab_indispo_driver(ch_code)
 
@@ -12505,11 +12515,6 @@ def render_tab_clients():
         st.markdown("---")
     return _old_render_tab_clients()
 
-if __name__ == "__main__":
-    main()
-
-
-
 
 
 def render_driver_caisse_details_from_xlsm(ch_code):
@@ -12666,3 +12671,76 @@ def render_driver_caisse_badge(ch_code):
     except Exception as e:
         print(f"⚠️ render_driver_caisse_badge XLSM source failed: {e}", flush=True)
         return 0.0
+
+# ============================================================
+# 💶 CAISSE — ONGLET LAZY (ne charge rien sans clic)
+# ============================================================
+def _safe_cash_dataframe_cols(df):
+    import pandas as pd
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    preferred = ["id", "DATE", "HEURE", "CH", "NOM", "ADRESSE", "CP", "Localité", "PAIEMENT", "Caisse", "CAISSE_PAYEE", "CAISSE_COLOR", "REMARQUE"]
+    cols = [c for c in preferred if c in df.columns]
+    if not cols:
+        cols = list(df.columns)
+    return df[cols].copy()
+
+def render_tab_chauffeur_caisse_lazy(ch_code=None):
+    from datetime import date
+    import pandas as pd
+    ch_code = str(ch_code or st.session_state.get("chauffeur_code") or "").strip().upper()
+    st.subheader(f"💶 Ma caisse {ch_code}" if ch_code else "💶 Ma caisse")
+    st.caption("La caisse n'est pas chargée au démarrage. Clique pour lire le XLSM uniquement à la demande.")
+    if not st.button("🔎 Charger ma caisse", key=f"load_driver_caisse_{ch_code}", type="primary"):
+        st.info("Clique sur ‘Charger ma caisse’ pour afficher les montants à remettre.")
+        return
+    try:
+        start_date = date(date.today().year, 1, 1)
+        end_date = date.today()
+        df_cash = read_caisse_unpaid_from_xlsm(start_date=start_date, end_date=end_date, ch_filter=ch_code)
+        if df_cash is None or df_cash.empty:
+            st.success("✅ Aucune caisse à remettre selon l'Excel.")
+            return
+        caisse_col = "Caisse" if "Caisse" in df_cash.columns else ("CAISSE" if "CAISSE" in df_cash.columns else None)
+        total = float(pd.to_numeric(df_cash[caisse_col], errors="coerce").fillna(0.0).sum()) if caisse_col else 0.0
+        st.warning(f"💶 Caisse à remettre : {total:.2f} €")
+        st.dataframe(_safe_cash_dataframe_cols(df_cash), use_container_width=True, height=420)
+    except Exception as e:
+        st.error(f"Erreur chargement caisse chauffeur : {e}")
+
+def render_tab_admin_caisse_lazy():
+    from datetime import date
+    import pandas as pd
+    st.subheader("💶 Caisse admin")
+    st.caption("Chargement uniquement sur demande pour éviter de ralentir le planning.")
+    try:
+        chs = get_real_chauffeurs_fast()
+    except Exception:
+        chs = CH_CODES
+    chs = sorted({str(c or "").strip().upper() for c in chs if str(c or "").strip()})
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col1:
+        ch_filter = st.selectbox("👨‍✈️ Chauffeur", ["(Tous)"] + chs, key="admin_caisse_ch_filter_lazy")
+    with col2:
+        start_date = st.date_input("Du", value=date(date.today().year, 1, 1), key="admin_caisse_start_lazy")
+    with col3:
+        end_date = st.date_input("Au", value=date.today(), key="admin_caisse_end_lazy")
+    if not st.button("🔎 Charger la caisse admin", key="load_admin_caisse_lazy", type="primary"):
+        st.info("Clique sur ‘Charger la caisse admin’ pour lire le XLSM et afficher les montants.")
+        return
+    try:
+        ch = None if ch_filter == "(Tous)" else ch_filter
+        df_cash = read_caisse_unpaid_from_xlsm(start_date=start_date, end_date=end_date, ch_filter=ch)
+        if df_cash is None or df_cash.empty:
+            st.success("✅ Aucune caisse à remettre selon l'Excel.")
+            return
+        caisse_col = "Caisse" if "Caisse" in df_cash.columns else ("CAISSE" if "CAISSE" in df_cash.columns else None)
+        total = float(pd.to_numeric(df_cash[caisse_col], errors="coerce").fillna(0.0).sum()) if caisse_col else 0.0
+        st.warning(f"💶 Total caisse à remettre : {total:.2f} €")
+        st.dataframe(_safe_cash_dataframe_cols(df_cash), use_container_width=True, height=520)
+    except Exception as e:
+        st.error(f"Erreur chargement caisse admin : {e}")
+
+if __name__ == "__main__":
+    main()
