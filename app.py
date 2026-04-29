@@ -1441,30 +1441,19 @@ import pandas as pd
 import requests
 import streamlit as st
 
-DROPBOX_FILE_PATH = "/Goldenlines/Planning 2026.xlsm"
+DROPBOX_FILE_PATH = "/Goldenlines/Planning 2026.xlsx"
 
 # 🔗 Lien public Dropbox (édition Excel Online)
-PLANNING_ONLINE_URL = "https://www.dropbox.com/scl/fi/e8f3zb2f022ovm8nbax9y/Planning-2026.xlsm?rlkey=aga4h1jy6dz7s7th3sng13l0c&st=3lqwgwhf&dl=0"
+PLANNING_ONLINE_URL = "https://www.dropbox.com/scl/fi/e8f3zb2f022ovm8nbax9y/Planning-2026.xlsx?rlkey=aga4h1jy6dz7s7th3sng13l0c&st=3lqwgwhf&dl=0"
 
 
 import os
 import requests
 
 def load_planning_from_dropbox(sheet_name: str | None = None) -> pd.DataFrame:
-    # ✅ Lecture FORCÉE du XLSM Dropbox pour la MAJ planning.
-    # Évite get_dropbox_excel_cached() qui peut relire une ancienne version.
-    try:
-        content = download_dropbox_excel_bytes(DROPBOX_FILE_PATH)
-    except Exception:
-        content = None
+    from utils import get_dropbox_excel_cached
 
-    if not content:
-        try:
-            from utils import get_dropbox_excel_cached
-            content = get_dropbox_excel_cached()
-        except Exception:
-            content = None
-
+    content = get_dropbox_excel_cached()
     if not content:
         return pd.DataFrame()
 
@@ -1523,7 +1512,7 @@ def get_dropbox_file_last_modified() -> datetime | None:
         }
 
         data = {
-            "path": "/Goldenlines/Planning 2026.xlsm"
+            "path": "/Goldenlines/Planning 2026.xlsx"
         }
 
         r = requests.post(
@@ -1545,7 +1534,7 @@ from utils import download_dropbox_excel_bytes as _download_dropbox_excel_bytes
 from utils import upload_dropbox_excel_bytes as _upload_dropbox_excel_bytes
 
 
-def download_dropbox_excel_bytes(path: str = "/Goldenlines/Planning 2026.xlsm") -> bytes | None:
+def download_dropbox_excel_bytes(path: str = "/Goldenlines/Planning 2026.xlsx") -> bytes | None:
     """Wrapper: télécharge le fichier Excel depuis Dropbox (bytes)."""
     try:
         return _download_dropbox_excel_bytes(path)
@@ -1554,7 +1543,7 @@ def download_dropbox_excel_bytes(path: str = "/Goldenlines/Planning 2026.xlsm") 
         return None
 
 
-def upload_dropbox_excel_bytes(content: bytes, path: str = "/Goldenlines/Planning 2026.xlsm") -> bool:
+def upload_dropbox_excel_bytes(content: bytes, path: str = "/Goldenlines/Planning 2026.xlsx") -> bool:
     """Wrapper: upload (overwrite) le fichier Excel sur Dropbox."""
     try:
         _upload_dropbox_excel_bytes(content, path)
@@ -1848,7 +1837,7 @@ def sync_caisse_paid_from_excel_history(start_date=None, end_date=None) -> int:
         content = download_dropbox_excel_bytes()
         if not content:
             return 0
-        wb = load_workbook(BytesIO(content), data_only=True, keep_vba=True)
+        wb = load_workbook(BytesIO(content), data_only=True, keep_vba=False)
         if "Feuil1" not in wb.sheetnames:
             return 0
         ws = wb["Feuil1"]
@@ -2190,7 +2179,7 @@ def render_excel_modified_indicator():
             h = mins // 60
             m = mins % 60
             txt = f"il y a {h}h{m:02d}"
-        st.caption(f"📄 Excel Dropbox modifié {txt} (source : Planning 2026.xlsm)")
+        st.caption(f"📄 Excel Dropbox modifié {txt} (source : Planning 2026.xlsx)")
     except Exception:
         pass
 
@@ -2490,7 +2479,7 @@ def format_chauffeur_colored(ch, confirmed, row=None):
 
     return f"🟠 {ch}"
 
-def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = True):
+def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = True, ensure_excel_keys: bool = False, refresh_aux_sheets: bool = False):
     """
     🔄 Synchronisation SAFE depuis aujourd’hui
     - ZÉRO doublon (row_key + INSERT OR IGNORE)
@@ -2520,8 +2509,30 @@ def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = Tru
             st.info(msg)
         else:
             print(f"ℹ️ {msg}", flush=True)
-    # ✅ Mode rapide : ne pas modifier/sauver le XLSM pendant la MAJ.
-    # Les row_key sont recalculés côté DB.
+
+    # ⚡ ULTRA FAST: on vérifie Dropbox AVANT toute opération lourde
+    # Si le fichier n a pas changé, on sort immédiatement.
+    excel_dt = get_dropbox_file_last_modified()
+    if excel_dt:
+        last_excel_dt = get_meta("excel_last_modified")
+        if last_excel_dt:
+            try:
+                _last_dt = __import__("datetime").datetime.fromisoformat(str(last_excel_dt))
+                if excel_dt <= _last_dt:
+                    if ui:
+                        st.info("✅ Dropbox inchangé : aucune synchronisation nécessaire.")
+                    return 0
+            except Exception:
+                pass
+    # 🆔 ROW_KEY Excel : très lent sur .xlsx Dropbox.
+    # On ne le lance plus au clic normal. À activer seulement en maintenance.
+    if ensure_excel_keys:
+        try:
+            from utils import ensure_excel_row_key_column
+            ensure_excel_row_key_column(dropbox_path=DROPBOX_FILE_PATH, sheet_name="Feuil1", target_col_letter="ZX")
+        except Exception as e:
+            print(f"⚠️ ensure ROW_KEY Excel failed: {e}", flush=True)
+
 
     from datetime import date, datetime, timedelta
     import pandas as pd
@@ -2533,18 +2544,7 @@ def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = Tru
     # ======================================================
     # 🔍 CHECK : Excel Dropbox a-t-il changé ?
     # ======================================================
-    excel_dt = get_dropbox_file_last_modified()
-    if not excel_dt:
-        pass
-    else:
-        last_excel_dt = get_meta("excel_last_modified")
-        if last_excel_dt and not excel_sync_ts:
-            try:
-                last_excel_dt = datetime.fromisoformat(last_excel_dt)
-                if excel_dt <= last_excel_dt:
-                    return 0
-            except Exception:
-                pass
+    # check Dropbox déjà fait en tout début de fonction
 
     # ======================================================
     # 0️⃣ SÉCURITÉ DB : colonnes nécessaires
@@ -3082,7 +3082,7 @@ def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = Tru
     # ======================================================
     # 12️⃣ Feuil2 → chauffeurs
     # ======================================================
-    df_ch = load_planning_from_dropbox("Feuil2")
+    df_ch = load_planning_from_dropbox("Feuil2") if refresh_aux_sheets else pd.DataFrame()
     if df_ch is not None and not df_ch.empty:
         with get_connection() as conn:
             conn.execute("DROP TABLE IF EXISTS chauffeurs")
@@ -3105,7 +3105,7 @@ def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = Tru
     # ======================================================
     # 13️⃣ Feuil3
     # ======================================================
-    df_f3 = load_planning_from_dropbox("Feuil3")
+    df_f3 = load_planning_from_dropbox("Feuil3") if refresh_aux_sheets else pd.DataFrame()
     if df_f3 is not None and not df_f3.empty:
         with get_connection() as conn:
             conn.execute("DROP TABLE IF EXISTS feuil3")
@@ -4919,9 +4919,9 @@ def _topbar_sync_db_and_refresh(*, also_send_next4: bool = False):
         with st.spinner("🔄 Synchronisation Dropbox → DB…"):
             # force un refresh même si Dropbox n’a pas changé : on passe un ts unique
             try:
-                sync_planning_from_today(excel_sync_ts=datetime.now().isoformat(), ui=True)
+                sync_planning_from_today(excel_sync_ts=datetime.now().isoformat(), ui=True, ensure_excel_keys=False, refresh_aux_sheets=False)
             except TypeError:
-                sync_planning_from_today(ui=True)
+                sync_planning_from_today(ui=True, ensure_excel_keys=False, refresh_aux_sheets=False)
 
         if also_send_next4:
             with st.spinner("📧 Envoi planning (3 prochains jours)…"):
@@ -4930,12 +4930,8 @@ def _topbar_sync_db_and_refresh(*, also_send_next4: bool = False):
                     f"📧 Envoi terminé — envoyés: {recap['sent']} | vides: {recap['skipped_empty']} | emails manquants: {recap['missing_email']} | erreurs: {recap['errors']}"
                 )
 
-        # refresh UI
-        try:
-            st.cache_data.clear()
-        except Exception:
-            pass
-        st.rerun()
+        # Refresh léger : pas de rerun brutal, sync_planning_from_today invalide déjà le planning.
+        st.success("✅ Mise à jour terminée.")
     except Exception as e:
         st.error(f"❌ Erreur MAJ DB Dropbox: {e}")
 
@@ -6072,7 +6068,7 @@ def render_tab_table():
 
     EXCEL_ONLINE_URL = (
         "https://www.dropbox.com/scl/fi/lymuumy8en46l7p0uwjj3/"
-        "Planning-2026.xlsm"
+        "Planning-2026.xlsx"
         "?rlkey=sgvr0a58ekpr471p5aguqk3k8&dl=0"
     )
 
@@ -7782,11 +7778,54 @@ def render_tab_chauffeur_driver():
             _topbar_sync_db_and_refresh(also_send_next4=False)
 
     # ===================================================
-    # 💶 CAISSE À REMETTRE
+    # 💶 BADGE — CAISSE À REMETTRE
     # ===================================================
-    # Optimisation : aucune lecture caisse ici.
-    # La caisse chauffeur se charge uniquement dans l’onglet séparé "💶 Ma caisse",
-    # et seulement quand le chauffeur clique sur "Charger ma caisse".
+    # SOURCE DE VÉRITÉ = XLSM :
+    # - cellule Caisse verte = payé, on ignore
+    # - cellule Caisse blanche/non verte = à remettre
+    has_caisse_due = False
+    total_caisse_due = 0.0
+    d1_caisse = today - timedelta(days=60)
+    if d1_caisse < date(2026, 1, 1):
+        d1_caisse = date(2026, 1, 1)
+
+    try:
+        df_badge = read_caisse_unpaid_from_xlsm(
+            start_date=d1_caisse,
+            end_date=today,
+            ch_filter=ch_selected,
+        )
+    except Exception as e:
+        print(f"⚠️ caisse XLSM chauffeur error: {e}", flush=True)
+        df_badge = pd.DataFrame()
+
+    if df_badge is not None and not df_badge.empty:
+        df_badge["Caisse"] = pd.to_numeric(df_badge["Caisse"], errors="coerce").fillna(0.0)
+        df_badge = df_badge[df_badge["Caisse"] > 0].copy()
+        total_caisse_due = float(df_badge["Caisse"].sum()) if not df_badge.empty else 0.0
+        has_caisse_due = total_caisse_due > 0
+
+    if has_caisse_due:
+        st.markdown(
+            f"""
+            <div style="background:#fff3e0;border:1px solid #ff9800;
+                        padding:12px;border-radius:10px;margin-bottom:10px;">
+                💶 <b>Caisse à remettre :</b>
+                <span style="color:#d32f2f;font-weight:900;font-size:18px;">
+                    {total_caisse_due:.2f} €
+                </span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if st.toggle("🧾 Voir le détail de la caisse", False):
+            detail_cols = ["EXCEL_ROW", "DATE", "HEURE", "CH", "NOM", "DESIGNATION", "ADRESSE", "PAX", "PAIEMENT", "Caisse"]
+            detail_cols = [c for c in detail_cols if c in df_badge.columns]
+            st.caption(f"Source : XLSM Feuil1 — caisses blanches/non vertes du {d1_caisse.strftime('%d/%m/%Y')} au {today.strftime('%d/%m/%Y')}.")
+            st.dataframe(df_badge[detail_cols] if detail_cols else df_badge, use_container_width=True, height=300)
+    else:
+        st.success("✅ Aucune caisse à remettre pour le moment.")
 
     # ===================================================
     # 📅 PÉRIODE
@@ -8619,7 +8658,7 @@ def render_tab_excel_sync():
         ---
         🔧 **Workflow normal :**
 
-        1. Ouvre le fichier **Planning 2026.xlsm** dans **Dropbox**
+        1. Ouvre le fichier **Planning 2026.xlsx** dans **Dropbox**
         2. Modifie *Feuil1*, *Feuil2*, *Feuil3*
         3. Enregistre le fichier
         4. Clique sur **FORCER MAJ DROPBOX → DB**
@@ -8634,8 +8673,8 @@ def render_tab_excel_sync():
     st.subheader("🆘 Mode secours — Charger un fichier Excel manuellement")
 
     uploaded_file = st.file_uploader(
-        "📤 Charger un fichier Planning Excel (.xlsm)",
-        type=["xlsm"],
+        "📤 Charger un fichier Planning Excel (.xlsx)",
+        type=["xlsx"],
         accept_multiple_files=False,
     )
 
@@ -10934,9 +10973,10 @@ def render_tab_calcul_heures():
 
     st.subheader("⏱️ Calcul d’heures")
 
-    tab_calc, tab_rules = st.tabs([
+    tab_calc, tab_rules, tab_caisse = st.tabs([
         "📊 Heures (60 jours)",
         "⚙️ Règles (éditables)",
+        "💶 Caisse non rentrée (60j)",
     ])
 
     # ======================================================
@@ -11462,11 +11502,236 @@ def render_tab_calcul_heures():
                         st.info("Aucun demandeur mémorisé ou erreur lecture.")
 
         # ======================================================
-        # 💶 CAISSE DÉSACTIVÉE ICI
+        # 💶 ONGLET CAISSE
         # ======================================================
-        # La caisse n’est plus calculée dans “Calcul d’heures”.
-        # Elle se charge uniquement dans l’onglet admin séparé “💶 Caisse admin”,
-        # sur demande, pour éviter toute lecture XLSM inutile.
+        with tab_caisse:
+                st.markdown("### 💶 Caisse non rentrée (60 jours)")
+                consume_soft_refresh("caisse")
+
+                render_excel_modified_indicator()
+
+                # ----------------- Période -----------------
+                today = date.today()
+                d1 = today - timedelta(days=60)
+                if d1 < date(2026, 1, 1):
+                        d1 = date(2026, 1, 1)
+
+                if st.button("🔄 Rafraîchir la caisse depuis Excel"):
+                        n_sync_caisse = force_sync_caisse_green_from_excel(start_date=d1, end_date=today)
+                        if n_sync_caisse > 0:
+                                st.success(f"✅ {n_sync_caisse} ligne(s) caisse verte(s) synchronisée(s). Les montants admin et chauffeur lisent directement les caisses blanches/non vertes du XLSM.")
+                        else:
+                                st.info("Aucune nouvelle caisse verte à synchroniser. Les montants admin et chauffeur sont calculés directement sur les caisses blanches/non vertes du XLSM.")
+                        request_soft_refresh("caisse")
+
+                # ----------------- Chauffeur -----------------
+                chs = get_chauffeurs_for_ui()
+                ch_filter = st.selectbox(
+                        "👨‍✈️ Chauffeur",
+                        ["(Tous)"] + chs,
+                )
+                if ch_filter == "(Tous)":
+                        ch_filter = None
+
+                # ==================================================
+                # 🔒 SOURCE DE VÉRITÉ CAISSE = XLSM
+                # ==================================================
+                # - cellule Caisse verte = payée => ignorée
+                # - cellule Caisse blanche/non verte = à remettre
+                try:
+                        df_cash = read_caisse_unpaid_from_xlsm(
+                                start_date=d1,
+                                end_date=today,
+                                ch_filter=None,
+                        )
+                except Exception as e:
+                        st.error(f"Erreur lecture caisse XLSM : {e}")
+                        df_cash = pd.DataFrame()
+
+
+                # ==================================================
+                # 📊 RÉCAP PAR CHAUFFEUR (comme la vue chauffeur)
+                # ==================================================
+                if not df_cash.empty:
+                        df_cash2 = df_cash.copy()
+                        df_cash2["Caisse"] = pd.to_numeric(df_cash2.get("Caisse", 0), errors="coerce").fillna(0.0)
+                        recap = (
+                                df_cash2.groupby(df_cash2["CH"].fillna("").astype(str).str.strip().str.upper())["Caisse"]
+                                .sum()
+                                .reset_index()
+                                .rename(columns={"CH": "Chauffeur", "Caisse": "Caisse due (€)"})
+                                .sort_values("Caisse due (€)", ascending=False)
+                        )
+                        recap = recap[recap["Chauffeur"] != ""]
+                        if not recap.empty:
+                                st.markdown("#### 💶 Caisse due par chauffeur (60 jours)")
+                                st.dataframe(recap, use_container_width=True, height=220)
+
+                # DEBUG
+                if not df_cash.empty:
+                        st.caption(
+                                f"Source caisse XLSM — caisses blanches/non vertes : {len(df_cash)} | "
+                                f"date min = {df_cash['DATE_ISO'].min()} | "
+                                f"date max = {df_cash['DATE_ISO'].max()}"
+                        )
+
+                if df_cash is None or df_cash.empty:
+                        st.success("✅ Aucune caisse à rentrer")
+                        st.stop()
+
+                df_cash = df_cash.copy()
+
+                # ----------------- Filtre chauffeur -----------------
+                if ch_filter and "CH" in df_cash.columns:
+                        ch_norm = normalize_ch_code(ch_filter)
+                        df_cash = df_cash[
+                                df_cash["CH"]
+                                .fillna("")
+                                .astype(str)
+                                .str.upper()
+                                .str.replace("*", "", regex=False)
+                                .str.replace(" ", "", regex=False)
+                                .str.startswith(ch_norm)
+                        ]
+
+                if df_cash.empty:
+                        st.success("✅ Aucune caisse à rentrer")
+                        st.stop()
+
+                # ----------------- Montant > 0 -----------------
+                df_cash["Caisse"] = (
+                        df_cash.get("Caisse", pd.Series(0, index=df_cash.index))
+                        .pipe(pd.to_numeric, errors="coerce")
+                        .fillna(0)
+                )
+                df_cash = df_cash[df_cash["Caisse"] > 0]
+
+                if df_cash.empty:
+                        st.success("✅ Aucune caisse à rentrer")
+                        st.stop()
+
+                # ----------------- Non payées uniquement -----------------
+                if "CAISSE_PAYEE" in df_cash.columns:
+                        df_cash = df_cash[df_cash["CAISSE_PAYEE"].fillna(0).astype(int) == 0]
+
+                if df_cash.empty:
+                        st.success("✅ Aucune caisse à rentrer")
+                        st.stop()
+
+                # ==================================================
+                # 📋 TABLE ÉDITABLE
+                # ==================================================
+                df_out = df_cash[["id", "DATE", "CH", "NOM", "Caisse"]].copy()
+
+                df_out.rename(
+                        columns={
+                                "NOM": "Client",
+                                "Caisse": "Montant €",
+                        },
+                        inplace=True,
+                )
+
+                df_out["Valider"] = False
+
+                edited = st.data_editor(
+                        df_out,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                                "Valider": st.column_config.CheckboxColumn("Payé"),
+                        },
+                )
+
+                total_due = float(edited["Montant €"].sum())
+                st.metric("💶 Total à rentrer", f"{total_due:.2f} €")
+
+                # ==================================================
+                # 📝 COMMENTAIRE
+                # ==================================================
+                comment = st.text_input(
+                        "📝 Commentaire (ex : finalement paiement bancontact)",
+                        "",
+                )
+
+                # ==================================================
+                # ✅ VALIDATION
+                # ==================================================
+                colv1, colv2 = st.columns(2)
+
+                with colv1:
+                        if st.button("✅ Valider la sélection"):
+                                ids = edited[edited["Valider"] == True]["id"].tolist()
+
+                                if not ids:
+                                        st.warning("Aucune ligne sélectionnée.")
+                                else:
+                                        now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                        for rid in ids:
+                                                apply_row_update(
+                                                        int(rid),
+                                                        {
+                                                                "CAISSE_PAYEE": 1,
+                                                                "CAISSE_PAYEE_AT": now_iso,
+                                                                "CAISSE_COMMENT": comment or "Validé manuellement",
+                                                        },
+                                                        lock_row=True,
+                                                        touch_is_new=True,
+                                                )
+
+                                        # 📤 Export DB -> Excel (sans conflit) : uniquement la sélection
+                                        try:
+                                                export_db_changes_to_excel_dropbox(row_ids=[int(x) for x in ids])
+                                        except Exception:
+                                                pass
+
+                                        st.success("Caisse validée ✅")
+                                        request_soft_refresh("caisse")
+
+
+                with colv2:
+                        if ch_filter and st.button("✅ Tout valider pour ce chauffeur"):
+                                ch_norm = normalize_ch_code(ch_filter)
+                                now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                                # IDs concernés (caisse non payée)
+                                with get_connection() as conn:
+                                        rows = conn.execute(
+                                                """
+                                                SELECT id
+                                                FROM planning
+                                                WHERE UPPER(REPLACE(REPLACE(CH,'*',''),' ','')) LIKE ?
+                                                  AND LOWER(COALESCE(PAIEMENT,'')) = 'caisse'
+                                                  AND COALESCE(CAISSE_PAYEE,0) = 0
+                                                  AND DATE_ISO >= ?
+                                                """,
+                                                (f"{ch_norm}%", d1.isoformat()),
+                                        ).fetchall()
+
+                                ids2 = [int(r[0]) for r in rows] if rows else []
+
+                                if not ids2:
+                                        st.info("Aucune ligne à valider pour ce chauffeur.")
+                                else:
+                                        for rid in ids2:
+                                                apply_row_update(
+                                                        rid,
+                                                        {
+                                                                "CAISSE_PAYEE": 1,
+                                                                "CAISSE_PAYEE_AT": now_iso,
+                                                                "CAISSE_COMMENT": comment or "Validé globalement",
+                                                        },
+                                                        lock_row=True,
+                                                        touch_is_new=True,
+                                                )
+
+                                        try:
+                                                export_db_changes_to_excel_dropbox(row_ids=ids2)
+                                        except Exception:
+                                                pass
+
+                                        st.success(f"Toute la caisse de {ch_filter} est validée ✅")
+                                        request_soft_refresh("caisse")
+
 
 
 
@@ -11739,7 +12004,6 @@ def main():
 
         (
             tab1,
-            tab_caisse_admin,
             tab_confirm,
             tab2,
             tab3,
@@ -11754,7 +12018,6 @@ def main():
         ) = st.tabs(
             [
                 "📅 Planning",
-                "💶 Caisse admin",
                 confirm_label,
                 "⚡ Vue jour (mobile)",
                 "📊 Tableau / Édition",
@@ -11771,8 +12034,6 @@ def main():
 
         with tab1:
             render_tab_planning()
-        with tab_caisse_admin:
-            render_tab_admin_caisse_lazy()
         with tab_confirm:
             render_tab_confirmation_chauffeur()
         with tab2:
@@ -11834,21 +12095,17 @@ def main():
 
         ch_norm = str(ch_code or "").strip().upper()
         if ch_norm in {"FA", "AD"}:
-            tab1, tab_caisse, tab2, tab3 = st.tabs(["🚖 Mon planning", "💶 Ma caisse", "📚 Complément 15 jours", "🚫 Mes indispos"])
+            tab1, tab2, tab3 = st.tabs(["🚖 Mon planning", "📚 Complément 15 jours", "🚫 Mes indispos"])
             with tab1:
                 render_tab_chauffeur_driver()
-            with tab_caisse:
-                render_tab_chauffeur_caisse_lazy(ch_code)
             with tab2:
                 render_tab_driver_complement_history(ch_norm)
             with tab3:
                 render_tab_indispo_driver(ch_code)
         else:
-            tab1, tab_caisse, tab2 = st.tabs(["🚖 Mon planning", "💶 Ma caisse", "🚫 Mes indispos"])
+            tab1, tab2 = st.tabs(["🚖 Mon planning", "🚫 Mes indispos"])
             with tab1:
                 render_tab_chauffeur_driver()
-            with tab_caisse:
-                render_tab_chauffeur_caisse_lazy(ch_code)
             with tab2:
                 render_tab_indispo_driver(ch_code)
 
@@ -12515,6 +12772,11 @@ def render_tab_clients():
         st.markdown("---")
     return _old_render_tab_clients()
 
+if __name__ == "__main__":
+    main()
+
+
+
 
 
 def render_driver_caisse_details_from_xlsm(ch_code):
@@ -12671,76 +12933,3 @@ def render_driver_caisse_badge(ch_code):
     except Exception as e:
         print(f"⚠️ render_driver_caisse_badge XLSM source failed: {e}", flush=True)
         return 0.0
-
-# ============================================================
-# 💶 CAISSE — ONGLET LAZY (ne charge rien sans clic)
-# ============================================================
-def _safe_cash_dataframe_cols(df):
-    import pandas as pd
-    if df is None or df.empty:
-        return pd.DataFrame()
-    df = df.copy()
-    preferred = ["id", "DATE", "HEURE", "CH", "NOM", "ADRESSE", "CP", "Localité", "PAIEMENT", "Caisse", "CAISSE_PAYEE", "CAISSE_COLOR", "REMARQUE"]
-    cols = [c for c in preferred if c in df.columns]
-    if not cols:
-        cols = list(df.columns)
-    return df[cols].copy()
-
-def render_tab_chauffeur_caisse_lazy(ch_code=None):
-    from datetime import date
-    import pandas as pd
-    ch_code = str(ch_code or st.session_state.get("chauffeur_code") or "").strip().upper()
-    st.subheader(f"💶 Ma caisse {ch_code}" if ch_code else "💶 Ma caisse")
-    st.caption("La caisse n'est pas chargée au démarrage. Clique pour lire le XLSM uniquement à la demande.")
-    if not st.button("🔎 Charger ma caisse", key=f"load_driver_caisse_{ch_code}", type="primary"):
-        st.info("Clique sur ‘Charger ma caisse’ pour afficher les montants à remettre.")
-        return
-    try:
-        start_date = date(date.today().year, 1, 1)
-        end_date = date.today()
-        df_cash = read_caisse_unpaid_from_xlsm(start_date=start_date, end_date=end_date, ch_filter=ch_code)
-        if df_cash is None or df_cash.empty:
-            st.success("✅ Aucune caisse à remettre selon l'Excel.")
-            return
-        caisse_col = "Caisse" if "Caisse" in df_cash.columns else ("CAISSE" if "CAISSE" in df_cash.columns else None)
-        total = float(pd.to_numeric(df_cash[caisse_col], errors="coerce").fillna(0.0).sum()) if caisse_col else 0.0
-        st.warning(f"💶 Caisse à remettre : {total:.2f} €")
-        st.dataframe(_safe_cash_dataframe_cols(df_cash), use_container_width=True, height=420)
-    except Exception as e:
-        st.error(f"Erreur chargement caisse chauffeur : {e}")
-
-def render_tab_admin_caisse_lazy():
-    from datetime import date
-    import pandas as pd
-    st.subheader("💶 Caisse admin")
-    st.caption("Chargement uniquement sur demande pour éviter de ralentir le planning.")
-    try:
-        chs = get_real_chauffeurs_fast()
-    except Exception:
-        chs = CH_CODES
-    chs = sorted({str(c or "").strip().upper() for c in chs if str(c or "").strip()})
-    col1, col2, col3 = st.columns([1, 1, 1])
-    with col1:
-        ch_filter = st.selectbox("👨‍✈️ Chauffeur", ["(Tous)"] + chs, key="admin_caisse_ch_filter_lazy")
-    with col2:
-        start_date = st.date_input("Du", value=date(date.today().year, 1, 1), key="admin_caisse_start_lazy")
-    with col3:
-        end_date = st.date_input("Au", value=date.today(), key="admin_caisse_end_lazy")
-    if not st.button("🔎 Charger la caisse admin", key="load_admin_caisse_lazy", type="primary"):
-        st.info("Clique sur ‘Charger la caisse admin’ pour lire le XLSM et afficher les montants.")
-        return
-    try:
-        ch = None if ch_filter == "(Tous)" else ch_filter
-        df_cash = read_caisse_unpaid_from_xlsm(start_date=start_date, end_date=end_date, ch_filter=ch)
-        if df_cash is None or df_cash.empty:
-            st.success("✅ Aucune caisse à remettre selon l'Excel.")
-            return
-        caisse_col = "Caisse" if "Caisse" in df_cash.columns else ("CAISSE" if "CAISSE" in df_cash.columns else None)
-        total = float(pd.to_numeric(df_cash[caisse_col], errors="coerce").fillna(0.0).sum()) if caisse_col else 0.0
-        st.warning(f"💶 Total caisse à remettre : {total:.2f} €")
-        st.dataframe(_safe_cash_dataframe_cols(df_cash), use_container_width=True, height=520)
-    except Exception as e:
-        st.error(f"Erreur chargement caisse admin : {e}")
-
-if __name__ == "__main__":
-    main()
