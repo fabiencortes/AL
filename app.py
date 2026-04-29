@@ -1450,10 +1450,16 @@ PLANNING_ONLINE_URL = "https://www.dropbox.com/scl/fi/e8f3zb2f022ovm8nbax9y/Plan
 import os
 import requests
 
-def load_planning_from_dropbox(sheet_name: str | None = None) -> pd.DataFrame:
+def load_planning_from_dropbox(sheet_name: str | None = None, *, force_refresh: bool = False) -> pd.DataFrame:
     from utils import get_dropbox_excel_cached
 
-    content = get_dropbox_excel_cached()
+    # En mode MAJ bouton: lecture directe Dropbox sans cache.
+    # En affichage normal: cache autorisé pour garder l'app rapide.
+    if force_refresh:
+        content = download_dropbox_excel_bytes(DROPBOX_FILE_PATH)
+    else:
+        content = get_dropbox_excel_cached()
+
     if not content:
         return pd.DataFrame()
 
@@ -1534,13 +1540,46 @@ from utils import download_dropbox_excel_bytes as _download_dropbox_excel_bytes
 from utils import upload_dropbox_excel_bytes as _upload_dropbox_excel_bytes
 
 
-def download_dropbox_excel_bytes(path: str = "/Goldenlines/Planning 2026.xlsx") -> bytes | None:
-    """Wrapper: télécharge le fichier Excel depuis Dropbox (bytes)."""
-    try:
-        return _download_dropbox_excel_bytes(path)
-    except Exception as e:
-        print(f"⚠️ Dropbox download error: {e}", flush=True)
-        return None
+def download_dropbox_excel_bytes(path: str = None) -> bytes | None:
+    """Télécharge le fichier Excel depuis Dropbox sans cache.
+
+    Priorité: Planning 2026.xlsx.
+    Fallbacks utiles pour éviter l'erreur Dropbox 409 si le fichier
+    n'a pas encore été renommé exactement pareil dans Dropbox.
+    """
+    base_path = str(path or DROPBOX_FILE_PATH or "/Goldenlines/Planning 2026.xlsx")
+    candidates = []
+
+    def _add(x):
+        x = str(x or "").strip()
+        if x and x not in candidates:
+            candidates.append(x)
+
+    _add(base_path)
+    _add(base_path.replace(" ", "-"))
+    _add("/Goldenlines/Planning 2026.xlsx")
+    _add("/Goldenlines/Planning-2026.xlsx")
+    _add("/Goldenlines/Planning 2026.xlsm")
+    _add("/Goldenlines/Planning-2026.xlsm")
+
+    last_error = None
+    for cand in candidates:
+        try:
+            content = _download_dropbox_excel_bytes(cand)
+            if content:
+                try:
+                    globals()["DROPBOX_FILE_PATH_ACTIVE"] = cand
+                except Exception:
+                    pass
+                return content
+        except Exception as e:
+            last_error = e
+            print(f"⚠️ Dropbox download failed for {cand}: {e}", flush=True)
+            continue
+
+    if last_error:
+        print(f"⚠️ Dropbox download error final: {last_error}", flush=True)
+    return None
 
 
 def upload_dropbox_excel_bytes(content: bytes, path: str = "/Goldenlines/Planning 2026.xlsx") -> bool:
@@ -2479,7 +2518,7 @@ def format_chauffeur_colored(ch, confirmed, row=None):
 
     return f"🟠 {ch}"
 
-def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = True, ensure_excel_keys: bool = False, refresh_aux_sheets: bool = False):
+def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = True, ensure_excel_keys: bool = False, refresh_aux_sheets: bool = False, force_refresh: bool = False):
     """
     🔄 Synchronisation SAFE depuis aujourd’hui
     - ZÉRO doublon (row_key + INSERT OR IGNORE)
@@ -2512,7 +2551,7 @@ def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = Tru
 
     # ⚡ ULTRA FAST: on vérifie Dropbox AVANT toute opération lourde
     # Si le fichier n a pas changé, on sort immédiatement.
-    excel_dt = get_dropbox_file_last_modified()
+    excel_dt = None if force_refresh else get_dropbox_file_last_modified()
     if excel_dt:
         last_excel_dt = get_meta("excel_last_modified")
         if last_excel_dt:
@@ -2575,7 +2614,7 @@ def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = Tru
     # ======================================================
     # 1️⃣ Charger Excel Dropbox (Feuil1)
     # ======================================================
-    df_excel = load_planning_from_dropbox("Feuil1")
+    df_excel = load_planning_from_dropbox("Feuil1", force_refresh=force_refresh)
     if df_excel is None or df_excel.empty:
         _ui_warn("Planning Dropbox vide.")
         return 0
@@ -3191,7 +3230,7 @@ def rebuild_planning_db_from_dropbox_full() -> int:
     # ======================================================
     # 1️⃣ Charger Excel Dropbox (Feuil1)
     # ======================================================
-    df_excel = load_planning_from_dropbox("Feuil1")
+    df_excel = load_planning_from_dropbox("Feuil1", force_refresh=force_refresh)
     if df_excel.empty:
         return 0
 
@@ -4919,9 +4958,13 @@ def _topbar_sync_db_and_refresh(*, also_send_next4: bool = False):
         with st.spinner("🔄 Synchronisation Dropbox → DB…"):
             # force un refresh même si Dropbox n’a pas changé : on passe un ts unique
             try:
-                sync_planning_from_today(excel_sync_ts=datetime.now().isoformat(), ui=True, ensure_excel_keys=False, refresh_aux_sheets=False)
+                try:
+                    st.cache_data.clear()
+                except Exception:
+                    pass
+                sync_planning_from_today(excel_sync_ts=datetime.now().isoformat(), ui=True, ensure_excel_keys=False, refresh_aux_sheets=False, force_refresh=True)
             except TypeError:
-                sync_planning_from_today(ui=True, ensure_excel_keys=False, refresh_aux_sheets=False)
+                sync_planning_from_today(ui=True, ensure_excel_keys=False, refresh_aux_sheets=False, force_refresh=True)
 
         if also_send_next4:
             with st.spinner("📧 Envoi planning (3 prochains jours)…"):
