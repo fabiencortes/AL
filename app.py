@@ -5011,12 +5011,6 @@ def style_groupage_partage(styler):
                 return False
 
         # ======================================================
-        # 🔴 Indisponibilité : priorité absolue
-        # ======================================================
-        if is_indispo_row(row, df.columns.tolist()) or _flag(row.get("IS_INDISPO")):
-            return ["background-color: #ffcdd2; color:#7f0000; font-weight:700"] * len(row)
-
-        # ======================================================
         # 🟦 Congé chauffeur (HEURE 00:00 + IMMAT numérique)
         # ======================================================
         try:
@@ -5029,6 +5023,12 @@ def style_groupage_partage(styler):
 
         if is_conge:
             return ["background-color: #e3f2fd"] * len(row)
+
+        # ======================================================
+        # 🔴 Indisponibilité (logique existante)
+        # ======================================================
+        if is_indispo_row(row, df.columns.tolist()):
+            return ["background-color: #f8d7da"] * len(row)
 
         # ======================================================
         # 🟡 Groupage / Partage
@@ -5058,12 +5058,8 @@ def style_groupage_partage(styler):
     return styler.apply(style_row, axis=1)
 def style_indispo(styler):
     def _red(row):
-        try:
-            is_ind = int(row.get("IS_INDISPO", 0) or 0) == 1
-        except Exception:
-            is_ind = str(row.get("IS_INDISPO", "")).strip() == "1"
-        if is_ind:
-            return ["background-color: #ffcdd2; color:#7f0000; font-weight:700"] * len(row)
+        if row.get("IS_INDISPO", 0) == 1:
+            return ["background-color: #ffb3b3"] * len(row)
         return [""] * len(row)
 
     return styler.apply(_red, axis=1)
@@ -7685,7 +7681,7 @@ def export_chauffeur_planning_table_pdf(df, ch_code):
 
         # 🎨 Couleurs métier (PDF)
         if int(row.get("IS_INDISPO", 0) or 0) == 1:
-            row_styles.append(("BACKGROUND", (0, r), (-1, r), colors.salmon))
+            row_styles.append(("BACKGROUND", (0, r), (-1, r), colors.lightgrey))
 
         if int(row.get("IS_URGENT", 0) or 0) == 1:
             row_styles.append(("BACKGROUND", (0, r), (-1, r), colors.salmon))
@@ -7736,9 +7732,8 @@ def style_planning_chauffeur(row):
     styles = [""] * len(row)
 
     try:
-        is_indispo = int(row.get("IS_INDISPO", 0) or 0) == 1
-        if is_indispo:
-            styles = ["background-color:#ffcdd2;color:#7f0000;font-weight:700;"] * len(row)
+        if int(row.get("IS_INDISPO", 0) or 0) == 1:
+            styles = ["background-color:#eeeeee"] * len(row)
 
         elif int(row.get("IS_URGENT", 0) or 0) == 1:
             styles = ["background-color:#ffcccb"] * len(row)
@@ -7756,7 +7751,7 @@ def style_planning_chauffeur(row):
             idx = list(row.index).index("Caisse")
             styles[idx] = "background-color:#ffebee;font-weight:900;color:#c62828;"
 
-        if (not locals().get("is_indispo", False)) and is_navette_confirmed(row):
+        if is_navette_confirmed(row):
             styles = ["background-color:#e8f5e9"] * len(row)
 
     except Exception:
@@ -7783,8 +7778,9 @@ def render_tab_chauffeur_driver():
     # ===================================================
     # 💶 CAISSE À REMETTRE
     # ===================================================
-    # Optimisation : ne pas lire le XLSM dans le planning chauffeur.
-    # La caisse se charge uniquement dans l'onglet "💶 Ma caisse" sur demande.
+    # Optimisation : aucune lecture caisse ici.
+    # La caisse chauffeur se charge uniquement dans l’onglet séparé "💶 Ma caisse",
+    # et seulement quand le chauffeur clique sur "Charger ma caisse".
 
     # ===================================================
     # 📅 PÉRIODE
@@ -7860,14 +7856,11 @@ def render_tab_chauffeur_driver():
         planning_cols_driver = add_surcharge_column_if_allowed(planning_cols_driver)
 
         df_table = df_ch.copy()
-        flag_cols_driver = ["IS_INDISPO", "IS_URGENT", "IS_GROUPAGE", "IS_PARTAGE", "CONFIRMED", "ACK_AT"]
-        internal_cols_driver = planning_cols_driver + [c for c in flag_cols_driver if c in df_table.columns and c not in planning_cols_driver]
-        for c in internal_cols_driver:
+        for c in planning_cols_driver:
             if c not in df_table.columns:
                 df_table[c] = ""
 
-        df_table = df_table[internal_cols_driver]
-        visible_driver_cols = list(planning_cols_driver)
+        df_table = df_table[planning_cols_driver]
 
         if can_see_surcharge_column() and "SURCHARGE_CARBURANT" in df_table.columns:
             try:
@@ -7891,7 +7884,6 @@ def render_tab_chauffeur_driver():
             df_table.style.apply(style_planning_chauffeur, axis=1),
             use_container_width=True,
             height=520,
-            column_order=[c for c in visible_driver_cols if c in df_table.columns],
         )
 
         col_pdf, col_print = st.columns(2)
@@ -8287,7 +8279,6 @@ def render_tab_chauffeur_driver():
                 df_table[c] = ""
 
         df_table = df_table[planning_cols_driver]
-        visible_driver_cols = list(planning_cols_driver)
 
         # Renommage propre affichage
         if can_see_surcharge_column() and "SURCHARGE_CARBURANT" in df_table.columns:
@@ -8303,10 +8294,6 @@ def render_tab_chauffeur_driver():
             "Localité": "LOCALITÉ",
             "Tél": "TÉL",
         })
-        visible_driver_cols = [
-            {"Unnamed: 8": "SENS", "DESIGNATION": "DEST", "Localité": "LOCALITÉ", "Tél": "TÉL"}.get(c, c)
-            for c in visible_driver_cols
-        ]
 
         # 🔴 Mise en évidence CAISSE
         def _style_caisse(v):
@@ -11471,9 +11458,11 @@ def render_tab_calcul_heures():
         # ======================================================
         # 💶 CAISSE DÉSACTIVÉE ICI
         # ======================================================
-        # La caisse est uniquement chargée dans l'onglet séparé "💶 Caisse admin"
-        # et dans "💶 Ma caisse" côté chauffeur.
-        # Ne pas lire le XLSM ici : Streamlit exécute tous les onglets.
+        # La caisse n’est plus calculée dans “Calcul d’heures”.
+        # Elle se charge uniquement dans l’onglet admin séparé “💶 Caisse admin”,
+        # sur demande, pour éviter toute lecture XLSM inutile.
+
+
 
 
 # ==========================================================================
@@ -11744,6 +11733,7 @@ def main():
 
         (
             tab1,
+            tab_caisse_admin,
             tab_confirm,
             tab2,
             tab3,
@@ -11758,6 +11748,7 @@ def main():
         ) = st.tabs(
             [
                 "📅 Planning",
+                "💶 Caisse admin",
                 confirm_label,
                 "⚡ Vue jour (mobile)",
                 "📊 Tableau / Édition",
@@ -11774,6 +11765,8 @@ def main():
 
         with tab1:
             render_tab_planning()
+        with tab_caisse_admin:
+            render_tab_admin_caisse_lazy()
         with tab_confirm:
             render_tab_confirmation_chauffeur()
         with tab2:
