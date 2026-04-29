@@ -1463,6 +1463,10 @@ def load_planning_from_dropbox(sheet_name: str | None = None, *, force_refresh: 
     if not content:
         return pd.DataFrame()
 
+    try:
+        globals()["_LAST_DROPBOX_EXCEL_CONTENT"] = content
+    except Exception:
+        pass
 
     bio = BytesIO(content)
 
@@ -1500,8 +1504,12 @@ def load_planning_from_dropbox(sheet_name: str | None = None, *, force_refresh: 
         header=header_row,
         engine="openpyxl",
     )
-
-    return df.fillna("")
+    df = df.fillna("")
+    try:
+        df["_EXCEL_ROW"] = [(header_row + 2) + i for i in range(len(df))]
+    except Exception:
+        pass
+    return df
 
 
 
@@ -1773,6 +1781,137 @@ def ensure_planning_color_columns():
             if col not in existing:
                 conn.execute(f'ALTER TABLE planning ADD COLUMN "{col}" TEXT')
         conn.commit()
+
+# ============================================================
+#   COULEURS EXCEL — VERSION LOCALE SANS 2e DOWNLOAD DROPBOX
+# ============================================================
+def _excel_fill_color_name(cell) -> str:
+    """Retourne green/orange/yellow/blue/red si la cellule Excel a une couleur utile."""
+    try:
+        fill = getattr(cell, "fill", None)
+        if fill is None or fill.patternType is None:
+            return ""
+        fg = getattr(fill, "fgColor", None)
+        if fg is None:
+            return ""
+        rgb = ""
+        if getattr(fg, "type", None) == "rgb" and getattr(fg, "rgb", None):
+            rgb = str(fg.rgb or "").upper()
+        elif getattr(fg, "type", None) == "indexed":
+            idx = getattr(fg, "indexed", None)
+            if idx in {3, 4, 10, 17, 35, 43, 50}:
+                return "green"
+            if idx in {5, 6, 13, 36, 44}:
+                return "yellow"
+            if idx in {45, 46, 53}:
+                return "orange"
+            return ""
+        elif getattr(fg, "type", None) == "theme":
+            # Thèmes Excel : on garde une indication utile sans planter.
+            try:
+                tint = float(getattr(fg, "tint", 0) or 0)
+            except Exception:
+                tint = 0
+            return "green" if tint <= 0.4 else "yellow"
+
+        if not rgb:
+            return ""
+        # verts fréquents Excel
+        if rgb.endswith(("00B050", "92D050", "C6EFCE", "00FF00")) or rgb in {"FF00B050", "FF92D050", "FFC6EFCE", "FF00FF00"}:
+            return "green"
+        # orange / attente / changement
+        if rgb.endswith(("F4B183", "F8CBAD", "FFC000", "FFA500", "ED7D31")) or rgb in {"FFFFC000", "FFFFA500", "FFF4B183", "FFF8CBAD", "FFED7D31"}:
+            return "orange"
+        # jaune groupage
+        if rgb.endswith(("FFFF00", "FFF2CC", "FFE699")) or rgb in {"FFFFFF00", "FFFFFFCC", "FFFFF2CC", "FFFFE699"}:
+            return "yellow"
+        # bleu partage éventuel
+        if rgb.endswith(("00B0F0", "9DC3E6", "BDD7EE", "DDEBF7")) or rgb in {"FF00B0F0", "FF9DC3E6", "FFBDD7EE", "FFDDEBF7"}:
+            return "blue"
+        # rouge indispo éventuel
+        if rgb.endswith(("FF0000", "FFC7CE", "F4CCCC")) or rgb in {"FFFF0000", "FFFFC7CE", "FFF4CCCC"}:
+            return "red"
+    except Exception:
+        return ""
+    return ""
+
+
+def add_excel_color_flags_from_content(df: pd.DataFrame, sheet_name: str = "Feuil1", content: bytes | None = None) -> pd.DataFrame:
+    """
+    Lit les couleurs depuis le contenu Excel déjà téléchargé.
+    Évite add_excel_color_flags_from_dropbox() qui retélécharge parfois l'ancien .xlsm
+    et provoque une erreur Dropbox 409.
+    """
+    if df is None or df.empty:
+        return df
+    try:
+        from openpyxl import load_workbook
+        content = content or globals().get("_LAST_DROPBOX_EXCEL_CONTENT")
+        if not content:
+            return df
+        wb = load_workbook(BytesIO(content), data_only=False, read_only=False)
+        if sheet_name not in wb.sheetnames:
+            return df
+        ws = wb[sheet_name]
+
+        header_row = None
+        headers = {}
+        for r in range(1, min(15, ws.max_row) + 1):
+            vals = []
+            row_headers = {}
+            for c in range(1, min(120, ws.max_column) + 1):
+                v = ws.cell(r, c).value
+                txt = str(v or "").strip()
+                vals.append(txt.upper())
+                if txt:
+                    row_headers[txt.upper()] = c
+            if "DATE" in vals and "HEURE" in vals:
+                header_row = r
+                headers = row_headers
+                break
+        if not header_row:
+            return df
+
+        c_date = headers.get("DATE")
+        c_heure = headers.get("HEURE")
+        c_ch = headers.get("CH")
+        c_caisse = headers.get("CAISSE")
+
+        out = df.copy()
+        for col, default in {
+            "CH_COLOR": "",
+            "CAISSE_COLOR": "",
+            "IS_GROUPAGE": 0,
+            "IS_PARTAGE": 0,
+            "IS_ATTENTE": 0,
+        }.items():
+            if col not in out.columns:
+                out[col] = default
+
+        for pos, idx in enumerate(out.index):
+            try:
+                excel_row = int(out.at[idx, "_EXCEL_ROW"]) if "_EXCEL_ROW" in out.columns and str(out.at[idx, "_EXCEL_ROW"]).strip() else header_row + 1 + int(pos)
+            except Exception:
+                excel_row = header_row + 1 + int(pos)
+
+            if c_ch:
+                out.at[idx, "CH_COLOR"] = _excel_fill_color_name(ws.cell(excel_row, c_ch))
+            if c_caisse:
+                out.at[idx, "CAISSE_COLOR"] = _excel_fill_color_name(ws.cell(excel_row, c_caisse))
+
+            date_color = _excel_fill_color_name(ws.cell(excel_row, c_date)) if c_date else ""
+            heure_color = _excel_fill_color_name(ws.cell(excel_row, c_heure)) if c_heure else ""
+            if "yellow" in {date_color, heure_color}:
+                out.at[idx, "IS_GROUPAGE"] = 1
+            if "blue" in {date_color, heure_color}:
+                out.at[idx, "IS_PARTAGE"] = 1
+            if "orange" in {date_color, heure_color}:
+                out.at[idx, "IS_ATTENTE"] = 1
+        return out
+    except Exception as e:
+        print(f"⚠️ Couleurs Excel ignorées (lecture locale): {e}", flush=True)
+        return df
+
 # ============================================================
 # NORMALISATION DES CODES CHAUFFEURS (FA, FA*, FADO, NPFA...)
 # ============================================================
@@ -2622,7 +2761,7 @@ def sync_planning_from_today(excel_sync_ts: str | None = None, *, ui: bool = Tru
     # ======================================================
     # 2️⃣ Couleurs Excel
     # ======================================================
-    df_excel = add_excel_color_flags_from_dropbox(df_excel, "Feuil1")
+    df_excel = add_excel_color_flags_from_content(df_excel, "Feuil1")
     ensure_planning_color_columns()
 
     # ======================================================
@@ -3237,7 +3376,7 @@ def rebuild_planning_db_from_dropbox_full() -> int:
     # ======================================================
     # 2️⃣ Couleurs Excel
     # ======================================================
-    df_excel = add_excel_color_flags_from_dropbox(df_excel, "Feuil1")
+    df_excel = add_excel_color_flags_from_content(df_excel, "Feuil1")
     ensure_planning_color_columns()
 
     # ======================================================
@@ -12363,7 +12502,7 @@ def _clienthub_read_excel_history_df():
     # ✅ garde la vraie position Excel avant filtres pour relire ZX / couleurs sans décalage
     raw["_EXCEL_ROW"] = [(header_row + 2) + i for i in range(len(raw))]
 
-    raw = add_excel_color_flags_from_dropbox(raw, "Feuil1")
+    raw = add_excel_color_flags_from_content(raw, "Feuil1", content)
 
     raw["DATE_ISO"] = raw["DATE"].apply(_clienthub_norm_iso)
     raw = raw[raw["DATE_ISO"].notna()].copy()
