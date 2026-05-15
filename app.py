@@ -11865,7 +11865,95 @@ def render_tab_calcul_heures():
                 # ==================================================
                 # 📋 TABLE ÉDITABLE
                 # ==================================================
-                df_out = df_cash[["id", "DATE", "CH", "NOM", "Caisse"]].copy()
+                # 🔒 Sécurité : la caisse lue depuis Excel/XLSM ne contient pas toujours l'id DB.
+                # On le retrouve ici avant d'afficher/valider, pour éviter le KeyError "['id'] not in index".
+                if "id" not in df_cash.columns:
+                        df_cash["id"] = pd.NA
+
+                try:
+                        if df_cash["id"].isna().all():
+                                df_match = df_cash.copy()
+
+                                if "DATE_ISO" not in df_match.columns:
+                                        df_match["DATE_ISO"] = pd.to_datetime(
+                                                df_match.get("DATE", ""),
+                                                dayfirst=True,
+                                                errors="coerce",
+                                        ).dt.strftime("%Y-%m-%d")
+
+                                df_match["_CH_NORM"] = df_match.get("CH", "").map(_planning_ch_norm)
+                                df_match["_NOM_NORM"] = df_match.get("NOM", "").map(_normalize_name_for_match)
+                                df_match["_HEURE_NORM"] = df_match.get("HEURE", "").map(normalize_time_string) if "HEURE" in df_match.columns else ""
+                                df_match["_CAISSE_NUM"] = pd.to_numeric(df_match.get("Caisse", 0), errors="coerce").fillna(0.0).round(2)
+                                df_match["DATE_ISO"] = df_match.get("DATE_ISO", "").fillna("").astype(str)
+
+                                with get_connection() as conn:
+                                        db_cash = pd.read_sql_query(
+                                                """
+                                                SELECT id, DATE_ISO, DATE, HEURE, CH, NOM, Caisse, PAIEMENT,
+                                                       COALESCE(CAISSE_PAYEE,0) AS CAISSE_PAYEE,
+                                                       COALESCE(IS_INDISPO,0) AS IS_INDISPO,
+                                                       COALESCE(IS_SUPERSEDED,0) AS IS_SUPERSEDED
+                                                FROM planning
+                                                WHERE COALESCE(IS_INDISPO,0)=0
+                                                  AND COALESCE(IS_SUPERSEDED,0)=0
+                                                  AND LOWER(COALESCE(PAIEMENT,''))='caisse'
+                                                  AND COALESCE(CAISSE_PAYEE,0)=0
+                                                  AND COALESCE(DATE_ISO,'') >= ?
+                                                  AND COALESCE(DATE_ISO,'') <= ?
+                                                """,
+                                                conn,
+                                                params=(d1.isoformat(), today.isoformat()),
+                                        )
+
+                                if not db_cash.empty:
+                                        db_cash["_CH_NORM"] = db_cash.get("CH", "").map(_planning_ch_norm)
+                                        db_cash["_NOM_NORM"] = db_cash.get("NOM", "").map(_normalize_name_for_match)
+                                        db_cash["_HEURE_NORM"] = db_cash.get("HEURE", "").map(normalize_time_string)
+                                        db_cash["_CAISSE_NUM"] = pd.to_numeric(db_cash.get("Caisse", 0), errors="coerce").fillna(0.0).round(2)
+                                        db_cash["DATE_ISO"] = db_cash.get("DATE_ISO", "").fillna("").astype(str)
+
+                                        used_db_ids = set()
+                                        found_ids = []
+
+                                        for _, ex in df_match.iterrows():
+                                                cand = db_cash[
+                                                        (db_cash["DATE_ISO"] == str(ex.get("DATE_ISO", ""))) &
+                                                        (db_cash["_CH_NORM"] == str(ex.get("_CH_NORM", ""))) &
+                                                        ((db_cash["_CAISSE_NUM"] - float(ex.get("_CAISSE_NUM") or 0)).abs() < 0.01)
+                                                ].copy()
+
+                                                cand = cand[~cand["id"].isin(used_db_ids)].copy()
+
+                                                if not cand.empty:
+                                                        cand["_score"] = 0
+                                                        if str(ex.get("_NOM_NORM", "")):
+                                                                cand.loc[cand["_NOM_NORM"] == str(ex.get("_NOM_NORM", "")), "_score"] += 10
+                                                        if str(ex.get("_HEURE_NORM", "")):
+                                                                cand.loc[cand["_HEURE_NORM"] == str(ex.get("_HEURE_NORM", "")), "_score"] += 5
+                                                        cand = cand.sort_values(["_score", "id"], ascending=[False, True])
+                                                        best_id = int(cand.iloc[0]["id"])
+                                                        used_db_ids.add(best_id)
+                                                        found_ids.append(best_id)
+                                                else:
+                                                        found_ids.append(pd.NA)
+
+                                        df_cash["id"] = found_ids
+
+                except Exception as e:
+                        st.warning(f"⚠️ Impossible de relier certaines caisses Excel à la DB : {e}")
+
+                # On garde uniquement les lignes reliées à la DB pour la validation.
+                # Les autres ne font plus planter l'app, mais ne peuvent pas être validées depuis ce tableau.
+                df_cash = df_cash[df_cash["id"].notna()].copy()
+                if df_cash.empty:
+                        st.warning("Aucune ligne caisse ne peut être reliée à la DB pour validation. Lance d'abord la mise à jour DB depuis Dropbox, puis reviens ici.")
+                        st.stop()
+
+                df_cash["id"] = pd.to_numeric(df_cash["id"], errors="coerce").astype("Int64")
+
+                safe_cols = [c for c in ["id", "DATE", "CH", "NOM", "Caisse"] if c in df_cash.columns]
+                df_out = df_cash[safe_cols].copy()
 
                 df_out.rename(
                         columns={
