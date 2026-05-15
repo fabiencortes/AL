@@ -371,14 +371,13 @@ USERS = {
     "ge": {"password": "ge", "role": "driver", "chauffeur_code": "GE"},
     "lillo": {"password": "lillo", "role": "driver", "chauffeur_code": "LILLO"},
     "jf": {"password": "jf", "role": "driver", "chauffeur_code": "JF"},
-    "jef": {"password": "jef", "role": "driver", "chauffeur_code": "JEF"},
 }
 
 # Fallback si Feuil2 ne contient rien
 CH_CODES = [
     "AU", "FA", "GD", "GG", "LL", "MA", "O", "RK", "RO", "SW", "NP", "DO",
     "OM", "AD", "CB", "CF", "CM", "EM", "GE", "HM", "JF", "KM", "LILLO",
-    "MF", "WS", "PO","JEF"
+    "MF", "WS", "PO"
 ]
 
 # ============================================================
@@ -1195,6 +1194,10 @@ def init_all_db_once():
     ensure_flight_alerts_time_columns()
     ensure_ack_columns()
     ensure_caisse_columns()
+    try:
+        ensure_superseded_column()
+    except Exception as e:
+        print(f"⚠️ ensure_superseded_column skipped: {e}", flush=True)
     ensure_urgence_columns()
     ensure_surcharge_carburant_column()
 
@@ -5622,16 +5625,33 @@ def render_tab_planning():
     # 📖 LECTURE DB (période stricte)
     # ===================================================
     with get_connection() as conn:
-        df = pd.read_sql_query(
-            """
+        # 🔒 Lecture compatible ancienne DB : certaines bases Streamlit Cloud
+        # peuvent ne pas encore avoir DATE_ISO ou IS_SUPERSEDED.
+        try:
+            db_cols = {r[1] for r in conn.execute("PRAGMA table_info(planning)").fetchall()}
+        except Exception:
+            db_cols = set()
+
+        if "DATE_ISO" in db_cols:
+            date_expr = "DATE_ISO"
+            order_expr = "DATE_ISO, HEURE"
+        else:
+            date_expr = "CASE WHEN LENGTH(DATE)=10 AND substr(DATE,3,1)='/' THEN substr(DATE,7,4)||'-'||substr(DATE,4,2)||'-'||substr(DATE,1,2) ELSE DATE END"
+            order_expr = date_expr + ", HEURE"
+
+        where_parts = [f"date({date_expr}) >= date(?)", f"date({date_expr}) <= date(?)"]
+        if "IS_SUPERSEDED" in db_cols:
+            where_parts.append("COALESCE(IS_SUPERSEDED,0) = 0")
+
+        sql = f"""
             SELECT *
             FROM planning
-            WHERE
-                DATE_ISO >= ?
-                AND DATE_ISO <= ?
-                AND COALESCE(IS_SUPERSEDED,0) = 0
-            ORDER BY DATE_ISO, HEURE
-            """,
+            WHERE {' AND '.join(where_parts)}
+            ORDER BY {order_expr}
+        """
+
+        df = pd.read_sql_query(
+            sql,
             conn,
             params=(start_date.isoformat(), end_date.isoformat()),
         )
