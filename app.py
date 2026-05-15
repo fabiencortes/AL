@@ -7960,54 +7960,64 @@ def render_tab_chauffeur_driver():
             _topbar_sync_db_and_refresh(also_send_next4=False)
 
     # ===================================================
-    # 💶 BADGE — CAISSE À REMETTRE
+    # 🧭 ONGLET CHAUFFEUR — LA CAISSE NE CHARGE PAS AUTOMATIQUEMENT
     # ===================================================
-    # SOURCE DE VÉRITÉ = XLSM :
-    # - cellule Caisse verte = payé, on ignore
-    # - cellule Caisse blanche/non verte = à remettre
-    has_caisse_due = False
-    total_caisse_due = 0.0
-    d1_caisse = today - timedelta(days=60)
-    if d1_caisse < date(2026, 1, 1):
-        d1_caisse = date(2026, 1, 1)
+    driver_tab = st.radio(
+        "Onglet chauffeur",
+        ["📅 Planning", "💶 Caisse"],
+        horizontal=True,
+        key=f"driver_main_tab_{ch_selected}",
+    )
 
-    try:
-        df_badge = read_caisse_unpaid_from_xlsm(
-            start_date=d1_caisse,
-            end_date=today,
-            ch_filter=ch_selected,
-        )
-    except Exception as e:
-        print(f"⚠️ caisse XLSM chauffeur error: {e}", flush=True)
-        df_badge = pd.DataFrame()
+    if driver_tab == "💶 Caisse":
+        st.markdown("### 💶 Caisse à remettre")
+        st.caption("Chargement uniquement quand tu ouvres cet onglet. Source : Excel/Dropbox Feuil1, cellule Caisse non verte.")
 
-    if df_badge is not None and not df_badge.empty:
-        df_badge["Caisse"] = pd.to_numeric(df_badge["Caisse"], errors="coerce").fillna(0.0)
-        df_badge = df_badge[df_badge["Caisse"] > 0].copy()
-        total_caisse_due = float(df_badge["Caisse"].sum()) if not df_badge.empty else 0.0
-        has_caisse_due = total_caisse_due > 0
+        has_caisse_due = False
+        total_caisse_due = 0.0
+        d1_caisse = today - timedelta(days=60)
+        if d1_caisse < date(2026, 1, 1):
+            d1_caisse = date(2026, 1, 1)
 
-    if has_caisse_due:
-        st.markdown(
-            f"""
-            <div style="background:#fff3e0;border:1px solid #ff9800;
-                        padding:12px;border-radius:10px;margin-bottom:10px;">
-                💶 <b>Caisse à remettre :</b>
-                <span style="color:#d32f2f;font-weight:900;font-size:18px;">
-                    {total_caisse_due:.2f} €
-                </span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        try:
+            df_badge = read_caisse_unpaid_from_xlsm(
+                start_date=d1_caisse,
+                end_date=today,
+                ch_filter=ch_selected,
+            )
+        except Exception as e:
+            print(f"⚠️ caisse XLSM chauffeur error: {e}", flush=True)
+            df_badge = pd.DataFrame()
 
-        if st.toggle("🧾 Voir le détail de la caisse", False):
+        if df_badge is not None and not df_badge.empty:
+            if "Caisse" in df_badge.columns:
+                df_badge["Caisse"] = pd.to_numeric(df_badge["Caisse"], errors="coerce").fillna(0.0)
+                df_badge = df_badge[df_badge["Caisse"] > 0].copy()
+            total_caisse_due = float(df_badge["Caisse"].sum()) if (not df_badge.empty and "Caisse" in df_badge.columns) else 0.0
+            has_caisse_due = total_caisse_due > 0
+
+        if has_caisse_due:
+            st.markdown(
+                f"""
+                <div style="background:#fff3e0;border:1px solid #ff9800;
+                            padding:12px;border-radius:10px;margin-bottom:10px;">
+                    💶 <b>Caisse à remettre :</b>
+                    <span style="color:#d32f2f;font-weight:900;font-size:18px;">
+                        {total_caisse_due:.2f} €
+                    </span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
             detail_cols = ["EXCEL_ROW", "DATE", "HEURE", "CH", "NOM", "DESIGNATION", "ADRESSE", "PAX", "PAIEMENT", "Caisse"]
             detail_cols = [c for c in detail_cols if c in df_badge.columns]
-            st.caption(f"Source : XLSM Feuil1 — caisses blanches/non vertes du {d1_caisse.strftime('%d/%m/%Y')} au {today.strftime('%d/%m/%Y')}.")
-            st.dataframe(df_badge[detail_cols] if detail_cols else df_badge, use_container_width=True, height=300)
-    else:
-        st.success("✅ Aucune caisse à remettre pour le moment.")
+            st.caption(f"Période : du {d1_caisse.strftime('%d/%m/%Y')} au {today.strftime('%d/%m/%Y')}.")
+            st.dataframe(df_badge[detail_cols] if detail_cols else df_badge, use_container_width=True, height=420)
+        else:
+            st.success("✅ Aucune caisse à remettre pour le moment.")
+
+        return
 
     # ===================================================
     # 📅 PÉRIODE
