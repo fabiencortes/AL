@@ -371,13 +371,14 @@ USERS = {
     "ge": {"password": "ge", "role": "driver", "chauffeur_code": "GE"},
     "lillo": {"password": "lillo", "role": "driver", "chauffeur_code": "LILLO"},
     "jf": {"password": "jf", "role": "driver", "chauffeur_code": "JF"},
+    "jef": {"password": "jef", "role": "driver", "chauffeur_code": "JEF"},
 }
 
 # Fallback si Feuil2 ne contient rien
 CH_CODES = [
     "AU", "FA", "GD", "GG", "LL", "MA", "O", "RK", "RO", "SW", "NP", "DO",
     "OM", "AD", "CB", "CF", "CM", "EM", "GE", "HM", "JF", "KM", "LILLO",
-    "MF", "WS", "PO"
+    "MF", "WS", "PO","JEF"
 ]
 
 # ============================================================
