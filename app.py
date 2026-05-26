@@ -377,7 +377,7 @@ USERS = {
 # Fallback si Feuil2 ne contient rien
 CH_CODES = [
     "AU", "FA", "GD", "GG", "LL", "MA", "O", "RK", "RO", "SW", "NP", "DO",
-    "OM", "AD", "CB", "CF", "CM", "EM", "GE", "HM", "JF", "KM", "LILLO",
+    "OM", "AD", "CB", "CF", "CM", "EM", "GE", "HM", "JF", "JEF", "KM", "LILLO",
     "MF", "WS", "PO"
 ]
 
