@@ -6576,7 +6576,13 @@ def get_chauffeur_contact(ch: str):
     try:
         with get_connection() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT * FROM chauffeurs WHERE TRIM(INITIALE) = ? LIMIT 1", (ch,))
+            cur.execute("""
+                SELECT *
+                FROM chauffeurs
+                WHERE UPPER(TRIM(INITIALE)) = UPPER(TRIM(?))
+                ORDER BY CASE WHEN COALESCE(MAIL, '') <> '' THEN 0 ELSE 1 END
+                LIMIT 1
+                """, (ch,))
             row = cur.fetchone()
             if row:
                 cols = [d[0] for d in cur.description]
@@ -6960,6 +6966,73 @@ def build_chauffeur_day_message(df_ch: pd.DataFrame, ch_selected: str, day_label
 
     return "\n".join(lines).strip()
 
+
+
+def get_known_chauffeur_codes_for_send() -> set[str]:
+    """Codes chauffeurs connus : Feuil2/DB + CH_CODES + comptes utilisateurs."""
+    codes = set()
+
+    for c in CH_CODES:
+        c = str(c or "").strip().upper()
+        if c:
+            codes.add(c)
+
+    for u in USERS.values():
+        c = str(u.get("chauffeur_code") or "").strip().upper()
+        if c:
+            codes.add(c)
+
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT INITIALE FROM chauffeurs WHERE COALESCE(INITIALE,'') <> ''"
+            ).fetchall()
+        for (c,) in rows:
+            c = str(c or "").strip().upper()
+            if c and not c.startswith("TLA") and not c.startswith("TLM"):
+                codes.add(c)
+    except Exception:
+        pass
+
+    return codes
+
+
+def split_chauffeurs_for_send(raw) -> list[str]:
+    """Découpe robuste pour l'envoi planning.
+    Corrige notamment les codes à 3+ lettres comme JEF/LILLO, qui peuvent être perdus
+    si le découpage externe ne travaille que par blocs de 2 lettres.
+    """
+    import re as _re
+
+    txt = str(raw or "").strip().upper()
+    if not txt:
+        return []
+
+    compact = _re.sub(r"[^A-Z0-9]", "", txt)
+    known = get_known_chauffeur_codes_for_send()
+
+    out = []
+
+    # Cas exact : JEF, LILLO, etc.
+    if compact in known:
+        out.append(compact)
+
+    # Découpage déjà existant, conservé pour FA/NP/DOFA/NPFA...
+    try:
+        for c in split_chauffeurs(txt):
+            c = str(c or "").strip().upper()
+            if c and c not in out:
+                out.append(c)
+    except Exception:
+        pass
+
+    # Dernière sécurité : retrouver les codes longs connus (JEF/LILLO...) dans la cellule.
+    for c in sorted(known, key=len, reverse=True):
+        if len(c) >= 3 and c in compact and c not in out:
+            out.append(c)
+
+    return out
+
 # ============================================================
 #   ONGLET 🚖 VUE CHAUFFEUR (PC + GSM)
 #   -> DEVENU : ENVOI PLANNING BUREAU (OPTIMISÉ)
@@ -7038,9 +7111,29 @@ def render_tab_vue_chauffeur(forced_ch=None):
 
     if not df_chcol.empty:
         for raw in df_chcol["CH"].dropna().astype(str):
-            for c in split_chauffeurs(raw):
+            for c in split_chauffeurs_for_send(raw):
                 if c:
                     active_chauffeurs.add(c)
+
+    # Liste affichée = chauffeurs actifs sur la période + chauffeurs connus avec email.
+    # Ainsi JEF reste sélectionnable même si le découpage du planning ou la période ne le remonte pas.
+    try:
+        with get_connection() as conn:
+            df_contacts = pd.read_sql_query(
+                """
+                SELECT DISTINCT UPPER(TRIM(INITIALE)) AS INITIALE
+                FROM chauffeurs
+                WHERE COALESCE(INITIALE,'') <> ''
+                  AND COALESCE(MAIL,'') <> ''
+                """,
+                conn,
+            )
+        for c in df_contacts["INITIALE"].dropna().astype(str):
+            c = c.strip().upper()
+            if c and not c.startswith("TLA") and not c.startswith("TLM"):
+                active_chauffeurs.add(c)
+    except Exception:
+        pass
 
     chauffeurs_planning = sorted(active_chauffeurs)
 
