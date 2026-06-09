@@ -6124,13 +6124,7 @@ def render_tab_quick_day_mobile():
         ch_current = str(row.get("CH", "") or "").strip()
 
         # 🛠️ Badge manuel + 🟡 pending excel
-        try:
-            ch_manual_val = row.get("CH_MANUAL", 0)
-            if pd.isna(ch_manual_val):
-                ch_manual_val = 0
-            manual_badge = " 🛠️" if int(float(str(ch_manual_val).strip() or 0)) == 1 else ""
-        except Exception:
-            manual_badge = ""
+        manual_badge = " 🛠️" if int(row.get("CH_MANUAL", 0) or 0) == 1 else ""
         pending_badge = " 🟡" if (rk and rk in pending_map) else ""
 
         # Destination (route + designation)
@@ -8982,12 +8976,12 @@ def render_tab_chauffeurs():
                 st.error(f"Erreur synchronisation Feuil2 : {e}")
 
     with col_info:
-        st.caption("Ce bouton recharge uniquement la feuille Feuil2 dans la table chauffeurs. Il ne modifie pas Feuil1 ni le planning.")
+        st.caption("Attention : le bouton de synchronisation recharge Feuil2 depuis Dropbox et écrase la table chauffeurs locale. Les modifications faites ci-dessous sont enregistrées dans la DB locale uniquement.")
 
     try:
         with get_connection() as conn:
             df = pd.read_sql_query(
-                'SELECT * FROM "chauffeurs" ORDER BY INITIALE',
+                'SELECT rowid AS _rowid_, * FROM "chauffeurs" ORDER BY INITIALE',
                 conn,
             )
     except Exception as e:
@@ -8997,39 +8991,66 @@ def render_tab_chauffeurs():
     # 🔒 Sécurité Streamlit : aucune colonne dupliquée
     df = df.loc[:, ~df.columns.duplicated()]
 
-    st.markdown("#### Table chauffeurs (éditable)")
-    edited = st.data_editor(
-        df,
-        use_container_width=True,
-        num_rows="dynamic",
-        key="chauffeurs_editor",
-    )
+    # Les colonnes techniques ne doivent pas être modifiées à l'écran.
+    editor_df = df.copy()
+    hidden_cols = [c for c in ["_rowid_", "id"] if c in editor_df.columns]
 
-    if st.button("💾 Enregistrer les modifications (chauffeurs)"):
+    st.markdown("#### Table chauffeurs (éditable)")
+
+    # ✅ IMPORTANT : data_editor + bouton dans le même form.
+    # Sinon Streamlit peut relancer le script et perdre la dernière cellule modifiée
+    # au moment où on clique sur Enregistrer.
+    with st.form("chauffeurs_edit_form", clear_on_submit=False):
+        edited = st.data_editor(
+            editor_df,
+            use_container_width=True,
+            num_rows="dynamic",
+            key="chauffeurs_editor",
+            hide_index=True,
+            disabled=hidden_cols,
+        )
+        submitted = st.form_submit_button("💾 Enregistrer les modifications (chauffeurs)")
+
+    if submitted:
         try:
+            edited = edited.copy()
+            edited = edited.loc[:, ~edited.columns.duplicated()]
+
+            # Supprimer les colonnes techniques avant réinsertion.
+            cols = [str(c).strip() for c in edited.columns if str(c).strip() and c not in {"_rowid_", "id"}]
+
+            # Nettoyage valeurs + lignes vides.
+            for c in cols:
+                edited[c] = edited[c].apply(lambda x: "" if pd.isna(x) else str(x).strip())
+
+            if "INITIALE" in edited.columns:
+                edited["INITIALE"] = edited["INITIALE"].astype(str).str.strip().str.upper()
+                edited = edited[edited["INITIALE"].astype(str).str.strip() != ""].copy()
+
             with get_connection() as conn:
                 cur = conn.cursor()
 
-                # On repart de zéro pour éviter doublons / lignes fantômes
+                # On repart de zéro pour éviter doublons / lignes fantômes.
                 cur.execute('DELETE FROM "chauffeurs"')
 
-                cols = [c for c in edited.columns if c != "id"]
-                col_list_sql = ",".join(f'"{c}"' for c in cols)
-                placeholders = ",".join("?" for _ in cols)
+                if cols and not edited.empty:
+                    col_list_sql = ",".join(f'"{c}"' for c in cols)
+                    placeholders = ",".join("?" for _ in cols)
 
-                for _, row in edited.iterrows():
-                    values = [
-                        row[c] if pd.notna(row[c]) else None
-                        for c in cols
-                    ]
-                    cur.execute(
-                        f'INSERT INTO "chauffeurs" ({col_list_sql}) VALUES ({placeholders})',
-                        values,
-                    )
+                    for _, row in edited.iterrows():
+                        values = [sqlite_safe(row.get(c, "")) for c in cols]
+                        cur.execute(
+                            f'INSERT INTO "chauffeurs" ({col_list_sql}) VALUES ({placeholders})',
+                            values,
+                        )
 
                 conn.commit()
 
-            st.success("Table chauffeurs mise à jour ✅")
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+            st.success(f"Table chauffeurs mise à jour ✅ ({len(edited)} ligne(s) enregistrée(s))")
             st.rerun()
 
         except Exception as e:
