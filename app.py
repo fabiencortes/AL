@@ -5000,6 +5000,36 @@ def _send_planning_next_4_days_to_all(*, want_pdf: bool = True) -> dict:
             )
 
             if df_ch is None or df_ch.empty:
+                # ✅ Sécurité supplémentaire pour les codes longs (ex: JEF).
+                # Si get_chauffeur_planning() ne retrouve rien à cause du découpage
+                # interne, on refiltre directement la période sur la colonne CH.
+                try:
+                    with get_connection() as conn:
+                        df_all_period = pd.read_sql_query(
+                            """
+                            SELECT *
+                            FROM planning
+                            WHERE COALESCE(IS_INDISPO,0)=0
+                              AND COALESCE(IS_SUPERSEDED,0)=0
+                              AND DATE_ISO BETWEEN ? AND ?
+                            """,
+                            conn,
+                            params=(d_start.isoformat(), d_end.isoformat()),
+                        )
+                    if df_all_period is not None and not df_all_period.empty and "CH" in df_all_period.columns:
+                        ch_compact = str(ch or "").strip().upper()
+                        ch_series = (
+                            df_all_period["CH"]
+                            .fillna("")
+                            .astype(str)
+                            .str.upper()
+                            .str.replace(r"[^A-Z0-9]", "", regex=True)
+                        )
+                        df_ch = df_all_period[ch_series.str.contains(ch_compact, regex=False, na=False)].copy()
+                except Exception:
+                    pass
+
+            if df_ch is None or df_ch.empty:
                 recap["skipped_empty"] += 1
                 try:
                     log_send(ch, "MAIL", periode_label, "OK", "Aucune navette (pas d'envoi)")
