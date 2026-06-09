@@ -6124,7 +6124,13 @@ def render_tab_quick_day_mobile():
         ch_current = str(row.get("CH", "") or "").strip()
 
         # 🛠️ Badge manuel + 🟡 pending excel
-        manual_badge = " 🛠️" if int(row.get("CH_MANUAL", 0) or 0) == 1 else ""
+        try:
+            ch_manual_val = row.get("CH_MANUAL", 0)
+            if pd.isna(ch_manual_val):
+                ch_manual_val = 0
+            manual_badge = " 🛠️" if int(float(str(ch_manual_val).strip() or 0)) == 1 else ""
+        except Exception:
+            manual_badge = ""
         pending_badge = " 🟡" if (rk and rk in pending_map) else ""
 
         # Destination (route + designation)
