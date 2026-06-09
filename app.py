@@ -4935,7 +4935,7 @@ def _send_planning_next_4_days_to_all(*, want_pdf: bool = True) -> dict:
     """
     from datetime import date, timedelta
 
-    recap = {"sent": 0, "skipped_empty": 0, "missing_email": 0, "errors": 0}
+    recap = {"sent": 0, "skipped_empty": 0, "missing_email": 0, "errors": 0, "jef_debug": ""}
 
     # 🔐 sécurité: réservé admin
     if st.session_state.get("role") != "admin":
@@ -4970,13 +4970,20 @@ def _send_planning_next_4_days_to_all(*, want_pdf: bool = True) -> dict:
             )
         if not df_chcol.empty:
             for raw in df_chcol["CH"].dropna().astype(str):
-                for c in split_chauffeurs(raw):
+                # ✅ IMPORTANT JEF/LILLO : utiliser le découpage robuste d'envoi
+                # split_chauffeurs() découpe surtout par blocs de 2 lettres et peut perdre JEF.
+                for c in split_chauffeurs_for_send(raw):
                     if c:
                         active_chauffeurs.add(c)
     except Exception:
         active_chauffeurs = set()
 
     chauffeurs = sorted(active_chauffeurs)
+    if "JEF" not in chauffeurs:
+        recap["jef_debug"] = "JEF non détecté dans les lignes CH de la période. Vérifier Feuil1: CH doit contenir JEF entre demain et J+4."
+    else:
+        _jef_tel, _jef_mail = get_chauffeur_contact("JEF")
+        recap["jef_debug"] = f"JEF détecté dans le planning. Mail trouvé: {'oui' if _jef_mail else 'non'}."
     if not chauffeurs:
         st.info("Aucun chauffeur trouvé sur les 4 prochains jours.")
         return recap
@@ -4986,6 +4993,8 @@ def _send_planning_next_4_days_to_all(*, want_pdf: bool = True) -> dict:
         try:
             _tel, mail = get_chauffeur_contact(ch)
             if not mail:
+                if str(ch).strip().upper() == "JEF":
+                    recap["jef_debug"] = "JEF détecté mais e-mail introuvable dans la table chauffeurs après synchro Feuil2."
                 recap["missing_email"] += 1
                 try:
                     log_send(ch, "MAIL", periode_label, "KO", "Email manquant")
@@ -5000,36 +5009,8 @@ def _send_planning_next_4_days_to_all(*, want_pdf: bool = True) -> dict:
             )
 
             if df_ch is None or df_ch.empty:
-                # ✅ Sécurité supplémentaire pour les codes longs (ex: JEF).
-                # Si get_chauffeur_planning() ne retrouve rien à cause du découpage
-                # interne, on refiltre directement la période sur la colonne CH.
-                try:
-                    with get_connection() as conn:
-                        df_all_period = pd.read_sql_query(
-                            """
-                            SELECT *
-                            FROM planning
-                            WHERE COALESCE(IS_INDISPO,0)=0
-                              AND COALESCE(IS_SUPERSEDED,0)=0
-                              AND DATE_ISO BETWEEN ? AND ?
-                            """,
-                            conn,
-                            params=(d_start.isoformat(), d_end.isoformat()),
-                        )
-                    if df_all_period is not None and not df_all_period.empty and "CH" in df_all_period.columns:
-                        ch_compact = str(ch or "").strip().upper()
-                        ch_series = (
-                            df_all_period["CH"]
-                            .fillna("")
-                            .astype(str)
-                            .str.upper()
-                            .str.replace(r"[^A-Z0-9]", "", regex=True)
-                        )
-                        df_ch = df_all_period[ch_series.str.contains(ch_compact, regex=False, na=False)].copy()
-                except Exception:
-                    pass
-
-            if df_ch is None or df_ch.empty:
+                if str(ch).strip().upper() == "JEF":
+                    recap["jef_debug"] = "JEF a un e-mail, mais get_chauffeur_planning ne retourne aucune ligne pour JEF sur la période."
                 recap["skipped_empty"] += 1
                 try:
                     log_send(ch, "MAIL", periode_label, "OK", "Aucune navette (pas d'envoi)")
@@ -5107,6 +5088,8 @@ def _send_planning_next_4_days_to_all(*, want_pdf: bool = True) -> dict:
                 raise RuntimeError("SMTP : envoi échoué")
 
             recap["sent"] += 1
+            if str(ch).strip().upper() == "JEF":
+                recap["jef_debug"] = f"JEF envoyé à {mail}"
             try:
                 log_send(ch, "MAIL", periode_label, "OK", "Envoyé")
             except Exception:
@@ -5141,11 +5124,25 @@ def _topbar_sync_db_and_refresh(*, also_send_next4: bool = False):
                 sync_planning_from_today(ui=True, ensure_excel_keys=False, refresh_aux_sheets=False, force_refresh=True)
 
         if also_send_next4:
+            # ✅ IMPORTANT : l'envoi dépend de la table chauffeurs (Feuil2) pour les e-mails.
+            # On recharge Feuil2 juste avant l'envoi pour éviter que JEF soit absent de la DB.
+            try:
+                n_ch = sync_chauffeurs_from_feuil2_dropbox()
+                try:
+                    st.cache_data.clear()
+                except Exception:
+                    pass
+                st.info(f"👨‍✈️ Feuil2 synchronisée avant envoi : {n_ch} chauffeur(s).")
+            except Exception as e:
+                st.warning(f"⚠️ Feuil2 non synchronisée avant envoi : {e}")
+
             with st.spinner("📧 Envoi planning (3 prochains jours)…"):
                 recap = _send_planning_next_4_days_to_all(want_pdf=True)
                 st.success(
                     f"📧 Envoi terminé — envoyés: {recap['sent']} | vides: {recap['skipped_empty']} | emails manquants: {recap['missing_email']} | erreurs: {recap['errors']}"
                 )
+                if recap.get("jef_debug"):
+                    st.info("Diagnostic JEF : " + str(recap.get("jef_debug")))
 
         # Refresh léger : pas de rerun brutal, sync_planning_from_today invalide déjà le planning.
         st.success("✅ Mise à jour terminée.")
@@ -6600,34 +6597,66 @@ def render_tab_clients():
 # ============================================================
 
 def get_chauffeur_contact(ch: str):
-    """Récupère téléphone + mail du chauffeur via table `chauffeurs` (Feuil2)."""
+    """Récupère téléphone + mail du chauffeur via table `chauffeurs` (Feuil2).
+
+    Version robuste : accepte une table Feuil2 avec colonnes standard (INITIALE/TEL_CH/MAIL)
+    ou des noms Excel différents. Évite aussi de planter si la colonne MAIL n'existe pas encore.
+    """
+    import re as _re
+
+    def _norm_col(x):
+        return _re.sub(r"[^A-Z0-9]", "", str(x or "").strip().upper())
+
+    def _first_value(data, names, fallback_idx=None):
+        norm_to_key = {_norm_col(k): k for k in data.keys()}
+        for n in names:
+            k = norm_to_key.get(_norm_col(n))
+            if k is not None and str(data.get(k) or "").strip():
+                return str(data.get(k) or "").strip()
+        if fallback_idx is not None:
+            try:
+                vals = list(data.values())
+                if fallback_idx < len(vals) and str(vals[fallback_idx] or "").strip():
+                    return str(vals[fallback_idx] or "").strip()
+            except Exception:
+                pass
+        return ""
+
+    wanted = str(ch or "").strip().upper()
+    if not wanted:
+        return "", ""
+
     tel = ""
     mail = ""
     try:
         with get_connection() as conn:
             cur = conn.cursor()
-            cur.execute("""
-                SELECT *
-                FROM chauffeurs
-                WHERE UPPER(TRIM(INITIALE)) = UPPER(TRIM(?))
-                ORDER BY CASE WHEN COALESCE(MAIL, '') <> '' THEN 0 ELSE 1 END
-                LIMIT 1
-                """, (ch,))
-            row = cur.fetchone()
-            if row:
-                cols = [d[0] for d in cur.description]
-                data = {cols[i]: row[i] for i in range(len(cols))}
-                tel = (
-                    data.get("TEL_CH")
-                    or data.get("TEL")
-                    or data.get("Tél")
-                    or data.get("PHONE")
-                    or ""
-                )
-                mail = data.get("MAIL") or data.get("Email") or ""
-    except Exception:
-        pass
-    return str(tel or ""), str(mail or "")
+            cur.execute('SELECT * FROM "chauffeurs"')
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+
+        best = None
+        for row in rows:
+            data = {cols[i]: row[i] for i in range(len(cols))}
+            init = _first_value(data, ["INITIALE", "INITIALES", "CODE", "CH", "CHAUFFEUR"], fallback_idx=0).upper()
+            if init == wanted:
+                m = _first_value(data, ["MAIL", "EMAIL", "E-MAIL", "E MAIL", "ADRESSE MAIL", "COURRIEL"], fallback_idx=7)
+                # Priorité à la ligne qui contient un mail.
+                if best is None or (m and "@" in m):
+                    best = data
+                    if m and "@" in m:
+                        break
+
+        if best:
+            tel = _first_value(best, ["TEL_CH", "TEL", "TÉL", "TELEPHONE", "TÉLÉPHONE", "PHONE", "GSM"], fallback_idx=2)
+            mail = _first_value(best, ["MAIL", "EMAIL", "E-MAIL", "E MAIL", "ADRESSE MAIL", "COURRIEL"], fallback_idx=7)
+    except Exception as e:
+        try:
+            print(f"⚠️ get_chauffeur_contact({wanted}) error: {e}", flush=True)
+        except Exception:
+            pass
+
+    return str(tel or "").strip(), str(mail or "").strip()
 
 
 def render_chauffeur_stats(df_ch: pd.DataFrame):
@@ -8855,8 +8884,25 @@ def render_tab_indispo_driver(ch_code: str):
 def sync_chauffeurs_from_feuil2_dropbox() -> int:
     """Synchronise uniquement Feuil2 (chauffeurs) depuis le fichier Dropbox vers SQLite.
 
-    Ne touche pas au planning Feuil1, ni à Feuil3.
+    Corrige JEF : la table créée contient toujours les colonnes standard
+    INITIALE / TEL_CH / MAIL, même si Feuil2 a des titres différents.
+    L'e-mail est aussi récupéré en colonne 8 si le titre n'est pas reconnu.
     """
+    import re as _re
+
+    def _norm_col(x):
+        return _re.sub(r"[^A-Z0-9]", "", str(x or "").strip().upper())
+
+    def _find_col(df, candidates, fallback_idx=None):
+        norm_to_col = {_norm_col(c): c for c in df.columns}
+        for cand in candidates:
+            c = norm_to_col.get(_norm_col(cand))
+            if c is not None:
+                return c
+        if fallback_idx is not None and fallback_idx < len(df.columns):
+            return df.columns[fallback_idx]
+        return None
+
     df_ch = load_planning_from_dropbox("Feuil2", force_refresh=True)
 
     if df_ch is None or df_ch.empty:
@@ -8864,15 +8910,30 @@ def sync_chauffeurs_from_feuil2_dropbox() -> int:
 
     df_ch = df_ch.fillna("")
     df_ch = df_ch.loc[:, ~df_ch.columns.duplicated()]
-
-    # Normalise les noms de colonnes sans toucher aux valeurs.
     df_ch.columns = [str(c).strip() for c in df_ch.columns]
     df_ch = df_ch[[c for c in df_ch.columns if c]].copy()
     df_ch = df_ch.loc[:, ~df_ch.columns.duplicated()]
 
-    cols = [str(c).strip() for c in df_ch.columns if str(c).strip()]
-    if not cols:
+    if df_ch.empty:
         return 0
+
+    init_col = _find_col(df_ch, ["INITIALE", "INITIALES", "CODE", "CH"], fallback_idx=0)
+    tel_col = _find_col(df_ch, ["TEL_CH", "TEL", "TÉL", "TELEPHONE", "TÉLÉPHONE", "PHONE", "GSM"], fallback_idx=2)
+    mail_col = _find_col(df_ch, ["MAIL", "EMAIL", "E-MAIL", "E MAIL", "ADRESSE MAIL", "COURRIEL"], fallback_idx=7)
+
+    # Colonnes standard en plus des colonnes originales.
+    df_ch["INITIALE"] = df_ch[init_col].astype(str).str.strip().str.upper() if init_col else ""
+    df_ch["TEL_CH"] = df_ch[tel_col].astype(str).str.strip() if tel_col else ""
+    df_ch["MAIL"] = df_ch[mail_col].astype(str).str.strip() if mail_col else ""
+
+    # Nettoyage : garder uniquement les lignes avec un code chauffeur réel.
+    df_ch = df_ch[df_ch["INITIALE"].astype(str).str.strip() != ""].copy()
+    if df_ch.empty:
+        return 0
+
+    # Supprimer les doublons de colonnes après ajout standard.
+    df_ch = df_ch.loc[:, ~df_ch.columns.duplicated()]
+    cols = [str(c).strip() for c in df_ch.columns if str(c).strip()]
 
     col_defs = ", ".join(f'"{c}" TEXT' for c in cols)
     cols_sql = ",".join(f'"{c}"' for c in cols)
