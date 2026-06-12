@@ -5102,6 +5102,187 @@ def _send_planning_next_4_days_to_all(*, want_pdf: bool = True) -> dict:
             except Exception:
                 pass
 
+
+    return recap
+
+
+def _send_orange_ch_planning(*, from_tomorrow: bool = False, want_pdf: bool = True) -> dict:
+    """
+    Boutons bureau :
+    - force la lecture Dropbox -> DB avant toute lecture du planning
+    - prend uniquement les lignes dont la cellule CH est orange dans Excel (CH_COLOR='orange')
+    - envoie uniquement aux chauffeurs écrits dans CH sur ces lignes
+    - ajoute aussi le chauffeur écrit dans la colonne ²²²² si cette cellule contient un code chauffeur
+    """
+    from datetime import date, timedelta, datetime
+    import pandas as pd
+
+    recap = {"sent": 0, "skipped_empty": 0, "missing_email": 0, "errors": 0, "rows": 0, "chauffeurs": []}
+
+    if st.session_state.get("role") != "admin":
+        st.warning("⛔ Envoi réservé au bureau (admin).")
+        return recap
+
+    today = date.today()
+    if from_tomorrow:
+        d_start = today + timedelta(days=1)
+        d_end = today + timedelta(days=4)
+        periode_label = "orange de demain à J+4"
+    else:
+        d_start = today
+        d_end = today
+        periode_label = "orange du jour"
+
+    # 1) FORCER la lecture du planning avant l'envoi, même si le fichier est ouvert.
+    try:
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        sync_planning_from_today(
+            excel_sync_ts=datetime.now().isoformat(),
+            ui=True,
+            ensure_excel_keys=False,
+            refresh_aux_sheets=False,
+            force_refresh=True,
+        )
+    except TypeError:
+        sync_planning_from_today(ui=True, ensure_excel_keys=False, refresh_aux_sheets=False, force_refresh=True)
+
+    # 2) Recharger Feuil2 avant envoi pour avoir les mails chauffeurs à jour.
+    try:
+        sync_chauffeurs_from_feuil2_dropbox()
+    except Exception as e:
+        st.warning(f"⚠️ Feuil2 non synchronisée avant envoi : {e}")
+
+    try:
+        ensure_send_log_table()
+    except Exception:
+        pass
+
+    # 3) Lire uniquement les lignes CH orange de la période.
+    with get_connection() as conn:
+        df = pd.read_sql_query(
+            """
+            SELECT *
+            FROM planning
+            WHERE COALESCE(IS_INDISPO,0)=0
+              AND COALESCE(IS_SUPERSEDED,0)=0
+              AND DATE_ISO BETWEEN ? AND ?
+              AND LOWER(COALESCE(CH_COLOR,'')) = 'orange'
+            ORDER BY DATE_ISO, HEURE
+            """,
+            conn,
+            params=(d_start.isoformat(), d_end.isoformat()),
+        )
+
+    if df is None or df.empty:
+        st.info(f"Aucune ligne avec CH orange pour la période {periode_label}.")
+        return recap
+
+    recap["rows"] = int(len(df))
+
+    known_codes = get_known_chauffeur_codes_for_send()
+
+    def _codes_from_2222(val) -> list[str]:
+        """Ne garde que les vrais codes chauffeurs dans ²²²²; ignore les heures 08:30, 1830, etc."""
+        txt = str(val or "").strip().upper()
+        if not txt:
+            return []
+        # Si c'est une heure, ce n'est pas un chauffeur.
+        try:
+            if normalize_time_string(txt):
+                return []
+        except Exception:
+            pass
+        out = []
+        for c in split_chauffeurs_for_send(txt):
+            c = str(c or "").strip().upper()
+            if c in known_codes and c not in out:
+                out.append(c)
+        return out
+
+    # 4) Construire les lignes exactes à envoyer par chauffeur.
+    rows_by_ch = {}
+    for idx, row in df.iterrows():
+        recipients = []
+        for c in split_chauffeurs_for_send(row.get("CH", "")):
+            c = str(c or "").strip().upper()
+            if c and c in known_codes and c not in recipients:
+                recipients.append(c)
+        for c in _codes_from_2222(row.get("²²²²", "")):
+            if c and c not in recipients:
+                recipients.append(c)
+        for ch in recipients:
+            rows_by_ch.setdefault(ch, []).append(idx)
+
+    if not rows_by_ch:
+        st.info("Lignes orange trouvées, mais aucun code chauffeur reconnu dans CH ou ²²²².")
+        return recap
+
+    recap["chauffeurs"] = sorted(rows_by_ch.keys())
+
+    planning_cols_driver = [
+        "DATE","HEURE","CH","²²²²","IMMAT","PAX","Reh","Siège",
+        "Unnamed: 8","DESIGNATION","H South","Décollage","N° Vol","Origine",
+        "GO","Num BDC","NOM","ADRESSE","CP","Localité","Tél",
+        "Type Nav","PAIEMENT","Caisse"
+    ]
+    planning_cols_driver = add_surcharge_column_if_allowed(planning_cols_driver)
+
+    for ch, idxs in rows_by_ch.items():
+        try:
+            _tel, mail = get_chauffeur_contact(ch)
+            if not mail:
+                recap["missing_email"] += 1
+                try:
+                    log_send(ch, "MAIL", periode_label, "KO", "Email manquant")
+                except Exception:
+                    pass
+                continue
+
+            df_ch = df.loc[idxs].copy().sort_values(["DATE_ISO", "HEURE"], kind="stable")
+            if df_ch.empty:
+                recap["skipped_empty"] += 1
+                continue
+
+            body = build_planning_mail_body(df_ch=df_ch, ch=ch, from_date=d_start, to_date=d_end)
+            subject = f"[PLANNING] {ch} — {periode_label}"
+
+            if want_pdf:
+                df_table = df_ch.copy()
+                for c in planning_cols_driver:
+                    if c not in df_table.columns:
+                        df_table[c] = ""
+                df_table = df_table[planning_cols_driver]
+                pdf_buf = export_chauffeur_planning_table_pdf(df_table, ch)
+                pdf_bytes = pdf_buf.getvalue() if hasattr(pdf_buf, "getvalue") else bytes(pdf_buf)
+                fname = f"Planning_{ch}_{periode_label.replace(' ', '_')}.pdf"
+                ok = send_email_smtp_with_attachments(
+                    to_email=mail,
+                    subject=subject,
+                    body=body,
+                    attachments=[(fname, pdf_bytes, "pdf")],
+                )
+            else:
+                ok = send_email_smtp(to_email=mail, subject=subject, body=body)
+
+            if not ok:
+                raise RuntimeError("SMTP : envoi échoué")
+
+            recap["sent"] += 1
+            try:
+                log_send(ch, "MAIL", periode_label, "OK", f"Envoyé ({len(df_ch)} ligne(s) orange)")
+            except Exception:
+                pass
+
+        except Exception as e:
+            recap["errors"] += 1
+            try:
+                log_send(ch, "MAIL", periode_label, "KO", str(e))
+            except Exception:
+                pass
+
     return recap
 
 
@@ -5154,8 +5335,8 @@ def _topbar_sync_db_and_refresh(*, also_send_next4: bool = False):
 
 
 def render_top_bar():
-    # 4 colonnes : user | maj db | maj+envoi | déconnexion
-    col1, col2, col3, col4 = st.columns([5, 2, 2, 1])
+    # 6 colonnes : user | maj db | maj+envoi | orange jour | orange demain | déconnexion
+    col1, col2, col3, col4, col5, col6 = st.columns([4, 2, 2, 2, 2, 1])
 
     role = st.session_state.get("role")
 
@@ -5202,9 +5383,37 @@ def render_top_bar():
             st.empty()
 
     # -------------------------------
-    # 🔓 Déconnexion
+    # 🟠 Envoi uniquement lignes CH orange du jour (ADMIN ONLY)
     # -------------------------------
     with col4:
+        if role == "admin":
+            if st.button("🟠 Envoyer orange jour", use_container_width=True, key="topbar_send_orange_today"):
+                with st.spinner("🔄 Lecture forcée Dropbox puis envoi CH orange du jour…"):
+                    recap = _send_orange_ch_planning(from_tomorrow=False, want_pdf=True)
+                st.success(
+                    f"🟠 Terminé — lignes: {recap['rows']} | envoyés: {recap['sent']} | emails manquants: {recap['missing_email']} | erreurs: {recap['errors']}"
+                )
+        else:
+            st.empty()
+
+    # -------------------------------
+    # 🟠 Envoi uniquement lignes CH orange demain -> J+4 (ADMIN ONLY)
+    # -------------------------------
+    with col5:
+        if role == "admin":
+            if st.button("🟠 Envoyer orange demain", use_container_width=True, key="topbar_send_orange_tomorrow"):
+                with st.spinner("🔄 Lecture forcée Dropbox puis envoi CH orange de demain à J+4…"):
+                    recap = _send_orange_ch_planning(from_tomorrow=True, want_pdf=True)
+                st.success(
+                    f"🟠 Terminé — lignes: {recap['rows']} | envoyés: {recap['sent']} | emails manquants: {recap['missing_email']} | erreurs: {recap['errors']}"
+                )
+        else:
+            st.empty()
+
+    # -------------------------------
+    # 🔓 Déconnexion
+    # -------------------------------
+    with col6:
         if st.button("🔓 Déconnexion", use_container_width=True, key="topbar_logout"):
             logout()
 
