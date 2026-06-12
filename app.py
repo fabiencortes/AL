@@ -5112,7 +5112,8 @@ def _send_orange_ch_planning(*, from_tomorrow: bool = False, want_pdf: bool = Tr
     - force la lecture Dropbox -> DB avant toute lecture du planning
     - prend uniquement les lignes dont la cellule CH est orange dans Excel (CH_COLOR='orange')
     - envoie uniquement aux chauffeurs écrits dans CH sur ces lignes
-    - ajoute aussi le chauffeur écrit dans la colonne ²²²² si cette cellule contient un code chauffeur
+    - considère le chauffeur écrit dans ²²²² comme ancien chauffeur retiré
+    - lui envoie un message de retrait + son planning complet mis à jour
     """
     from datetime import date, timedelta, datetime
     import pandas as pd
@@ -5202,37 +5203,50 @@ def _send_orange_ch_planning(*, from_tomorrow: bool = False, want_pdf: bool = Tr
                 out.append(c)
         return out
 
-    # 4) Construire les lignes exactes à envoyer par chauffeur.
+    # 4) Construire les listes de chauffeurs
+    # CH orange = chauffeur qui reçoit la mission
+    # ²²²² = chauffeur retiré de la mission
+
     rows_by_ch = {}
+    removed_by_ch = {}
+
     for idx, row in df.iterrows():
-        recipients = []
+
+        # Chauffeur actuel (colonne CH orange)
         for c in split_chauffeurs_for_send(row.get("CH", "")):
             c = str(c or "").strip().upper()
-            if c and c in known_codes and c not in recipients:
-                recipients.append(c)
-        for c in _codes_from_2222(row.get("²²²²", "")):
-            if c and c not in recipients:
-                recipients.append(c)
-        for ch in recipients:
-            rows_by_ch.setdefault(ch, []).append(idx)
 
-    if not rows_by_ch:
+            if c and c in known_codes:
+                rows_by_ch.setdefault(c, []).append(idx)
+
+        # Chauffeur retiré (colonne ²²²²)
+        for c in _codes_from_2222(row.get("²²²²", "")):
+            c = str(c or "").strip().upper()
+
+            if c and c in known_codes:
+                removed_by_ch.setdefault(c, []).append(idx)
+
+    # Chauffeurs à prévenir = nouveaux chauffeurs + anciens chauffeurs retirés
+    all_chauffeurs_to_send = sorted(set(rows_by_ch.keys()) | set(removed_by_ch.keys()))
+
+    if not all_chauffeurs_to_send:
         st.info("Lignes orange trouvées, mais aucun code chauffeur reconnu dans CH ou ²²²².")
         return recap
 
-    recap["chauffeurs"] = sorted(rows_by_ch.keys())
+    recap["chauffeurs"] = all_chauffeurs_to_send
 
     planning_cols_driver = [
-        "DATE","HEURE","CH","²²²²","IMMAT","PAX","Reh","Siège",
-        "Unnamed: 8","DESIGNATION","H South","Décollage","N° Vol","Origine",
-        "GO","Num BDC","NOM","ADRESSE","CP","Localité","Tél",
-        "Type Nav","PAIEMENT","Caisse"
+        "DATE", "HEURE", "CH", "²²²²", "IMMAT", "PAX", "Reh", "Siège",
+        "Unnamed: 8", "DESIGNATION", "H South", "Décollage", "N° Vol", "Origine",
+        "GO", "Num BDC", "NOM", "ADRESSE", "CP", "Localité", "Tél",
+        "Type Nav", "PAIEMENT", "Caisse"
     ]
     planning_cols_driver = add_surcharge_column_if_allowed(planning_cols_driver)
 
-    for ch, idxs in rows_by_ch.items():
+    for ch in all_chauffeurs_to_send:
         try:
             _tel, mail = get_chauffeur_contact(ch)
+
             if not mail:
                 recap["missing_email"] += 1
                 try:
@@ -5241,23 +5255,59 @@ def _send_orange_ch_planning(*, from_tomorrow: bool = False, want_pdf: bool = Tr
                     pass
                 continue
 
-            df_ch = df.loc[idxs].copy().sort_values(["DATE_ISO", "HEURE"], kind="stable")
+            # Planning COMPLET du chauffeur pour la période
+            df_ch = get_chauffeur_planning(
+                ch,
+                start_date=d_start,
+                end_date=d_end,
+            )
+
+            if isinstance(df_ch, list):
+                df_ch = pd.DataFrame(df_ch)
+
+            if df_ch is None:
+                df_ch = pd.DataFrame()
+
+            if not df_ch.empty:
+                df_ch = df_ch.sort_values(
+                    ["DATE_ISO", "HEURE"],
+                    kind="stable"
+                )
+
             if df_ch.empty:
                 recap["skipped_empty"] += 1
                 continue
 
-            body = build_planning_mail_body(df_ch=df_ch, ch=ch, from_date=d_start, to_date=d_end)
+            intro = ""
+
+            if ch in removed_by_ch:
+                intro = (
+                    "⚠️ Une ou plusieurs missions vous ont été retirées du planning.\n\n"
+                    "Veuillez consulter votre planning mis à jour ci-dessous.\n\n"
+                )
+
+            body = intro + build_planning_mail_body(
+                df_ch=df_ch,
+                ch=ch,
+                from_date=d_start,
+                to_date=d_end,
+            )
+
             subject = f"[PLANNING] {ch} — {periode_label}"
 
             if want_pdf:
                 df_table = df_ch.copy()
+
                 for c in planning_cols_driver:
                     if c not in df_table.columns:
                         df_table[c] = ""
+
                 df_table = df_table[planning_cols_driver]
+
                 pdf_buf = export_chauffeur_planning_table_pdf(df_table, ch)
                 pdf_bytes = pdf_buf.getvalue() if hasattr(pdf_buf, "getvalue") else bytes(pdf_buf)
                 fname = f"Planning_{ch}_{periode_label.replace(' ', '_')}.pdf"
+
                 ok = send_email_smtp_with_attachments(
                     to_email=mail,
                     subject=subject,
@@ -5265,19 +5315,30 @@ def _send_orange_ch_planning(*, from_tomorrow: bool = False, want_pdf: bool = Tr
                     attachments=[(fname, pdf_bytes, "pdf")],
                 )
             else:
-                ok = send_email_smtp(to_email=mail, subject=subject, body=body)
+                ok = send_email_smtp(
+                    to_email=mail,
+                    subject=subject,
+                    body=body,
+                )
 
             if not ok:
                 raise RuntimeError("SMTP : envoi échoué")
 
             recap["sent"] += 1
+
             try:
-                log_send(ch, "MAIL", periode_label, "OK", f"Envoyé ({len(df_ch)} ligne(s) orange)")
+                if ch in removed_by_ch:
+                    details = f"Envoyé planning complet + mission retirée ({len(df_ch)} ligne(s))"
+                else:
+                    details = f"Envoyé planning complet ({len(df_ch)} ligne(s))"
+
+                log_send(ch, "MAIL", periode_label, "OK", details)
             except Exception:
                 pass
 
         except Exception as e:
             recap["errors"] += 1
+
             try:
                 log_send(ch, "MAIL", periode_label, "KO", str(e))
             except Exception:
