@@ -4018,6 +4018,7 @@ SMTP_PORT = 587
 SMTP_USER = "airportslinesbureau@gmail.com"
 FROM_EMAIL = SMTP_USER
 ADMIN_NOTIFICATION_EMAIL = "airportslinesbureau@gmail.com"
+SEND_ARCHIVE_BCC_EMAIL = ADMIN_NOTIFICATION_EMAIL  # CCI automatique sur les mails chauffeurs
 
 
 def get_smtp_password():
@@ -4212,6 +4213,7 @@ def bool_from_flag(x) -> bool:
 # ============================================================
 
 def ensure_send_log_table():
+    """Historique léger : on garde les 5 derniers envois par chauffeur/canal."""
     with get_connection() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS send_log (
@@ -4221,22 +4223,105 @@ def ensure_send_log_table():
                 canal TEXT,
                 periode TEXT,
                 statut TEXT,
-                message TEXT
+                message TEXT,
+                subject TEXT,
+                body TEXT,
+                to_email TEXT,
+                attachment_name TEXT
             )
         """)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(send_log)").fetchall()}
+        for col in ["subject", "body", "to_email", "attachment_name"]:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE send_log ADD COLUMN {col} TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_send_log_ch_ts ON send_log(chauffeur, canal, ts DESC)")
         conn.commit()
 
 
-def log_send(chauffeur, canal, periode, statut, message):
+def prune_send_log_for_chauffeur(chauffeur: str, canal: str = "MAIL", keep: int = 5):
+    """Supprime tout sauf les X derniers envois pour éviter de ralentir l'app."""
+    ch = str(chauffeur or "").strip().upper()
+    canal = str(canal or "MAIL").strip().upper()
+    if not ch:
+        return
     with get_connection() as conn:
         conn.execute(
             """
-            INSERT INTO send_log (chauffeur, canal, periode, statut, message)
-            VALUES (?, ?, ?, ?, ?)
+            DELETE FROM send_log
+            WHERE chauffeur = ?
+              AND UPPER(COALESCE(canal,'')) = ?
+              AND id NOT IN (
+                  SELECT id FROM send_log
+                  WHERE chauffeur = ? AND UPPER(COALESCE(canal,'')) = ?
+                  ORDER BY datetime(ts) DESC, id DESC
+                  LIMIT ?
+              )
             """,
-            (chauffeur, canal, periode, statut, message),
+            (ch, canal, ch, canal, int(keep or 5)),
         )
         conn.commit()
+
+
+def log_send(chauffeur, canal, periode, statut, message, subject="", body="", to_email="", attachment_name=""):
+    ensure_send_log_table()
+    ch = str(chauffeur or "").strip().upper()
+    canal_norm = str(canal or "MAIL").strip().upper()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO send_log (chauffeur, canal, periode, statut, message, subject, body, to_email, attachment_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (ch, canal_norm, periode, statut, message, subject, body, to_email, attachment_name),
+        )
+        conn.commit()
+    prune_send_log_for_chauffeur(ch, canal_norm, keep=5)
+
+
+def render_tab_send_history():
+    st.subheader("📤 Messages envoyés aux chauffeurs")
+    ensure_send_log_table()
+    try:
+        with get_connection() as conn:
+            df = pd.read_sql_query(
+                """
+                SELECT id, ts, chauffeur, canal, periode, statut, subject, to_email, attachment_name, message, body
+                FROM send_log
+                ORDER BY datetime(ts) DESC, id DESC
+                LIMIT 300
+                """,
+                conn,
+            )
+    except Exception as e:
+        st.error(f"Impossible de lire l'historique des envois : {e}")
+        return
+
+    if df.empty:
+        st.info("Aucun envoi enregistré pour le moment.")
+        return
+
+    chauffeurs = ["Tous"] + sorted(df["chauffeur"].dropna().astype(str).str.upper().unique().tolist())
+    ch_filter = st.selectbox("Chauffeur", chauffeurs, key="send_history_ch_filter")
+    if ch_filter != "Tous":
+        df = df[df["chauffeur"].astype(str).str.upper() == ch_filter].copy()
+
+    st.caption("Historique volontairement limité : maximum 5 derniers envois par chauffeur et par canal.")
+    display_cols = ["ts", "chauffeur", "canal", "periode", "statut", "subject", "to_email", "attachment_name"]
+    st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
+
+    if not df.empty:
+        labels = [
+            f"{r.ts} — {r.chauffeur} — {r.canal} — {r.subject or r.message or ''}"
+            for r in df.itertuples(index=False)
+        ]
+        choice = st.selectbox("Voir le contenu exact", labels, key="send_history_detail")
+        idx = labels.index(choice)
+        row = df.iloc[idx]
+        st.markdown(f"**Sujet :** {row.get('subject') or ''}")
+        st.markdown(f"**Destinataire :** {row.get('to_email') or ''}")
+        if row.get("attachment_name"):
+            st.markdown(f"**Pièce jointe :** {row.get('attachment_name')}")
+        st.text_area("Message envoyé", row.get("body") or row.get("message") or "", height=350)
 
 
 
@@ -4821,6 +4906,9 @@ def send_email_smtp(to_email: str, subject: str, body: str) -> bool:
         msg["Subject"] = subject
         msg["From"] = FROM_EMAIL
         msg["To"] = to_email
+        archive_bcc = str(globals().get("SEND_ARCHIVE_BCC_EMAIL", "") or "").strip()
+        if archive_bcc and archive_bcc.lower() != str(to_email).strip().lower():
+            msg["Bcc"] = archive_bcc
 
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
             server.starttls()
@@ -4851,6 +4939,9 @@ def send_email_smtp_with_attachments(
         msg["Subject"] = subject
         msg["From"] = FROM_EMAIL
         msg["To"] = to_email
+        archive_bcc = str(globals().get("SEND_ARCHIVE_BCC_EMAIL", "") or "").strip()
+        if archive_bcc and archive_bcc.lower() != str(to_email).strip().lower():
+            msg["Bcc"] = archive_bcc
 
         msg.attach(MIMEText(body or "", "plain", "utf-8"))
 
@@ -5091,14 +5182,14 @@ def _send_planning_next_4_days_to_all(*, want_pdf: bool = True) -> dict:
             if str(ch).strip().upper() == "JEF":
                 recap["jef_debug"] = f"JEF envoyé à {mail}"
             try:
-                log_send(ch, "MAIL", periode_label, "OK", "Envoyé")
+                log_send(ch, "MAIL", periode_label, "OK", "Envoyé", subject=subject, body=body, to_email=mail, attachment_name=(fname if want_pdf else ""))
             except Exception:
                 pass
 
         except Exception as e:
             recap["errors"] += 1
             try:
-                log_send(ch, "MAIL", periode_label, "KO", str(e))
+                log_send(ch, "MAIL", periode_label, "KO", str(e), subject=(locals().get("subject", "")), body=(locals().get("body", "")), to_email=(locals().get("mail", "")))
             except Exception:
                 pass
 
@@ -5455,7 +5546,7 @@ def _send_orange_ch_planning(*, from_tomorrow: bool = False, want_pdf: bool = Tr
                 else:
                     details = f"Envoyé planning complet ({len(df_ch)} ligne(s))"
 
-                log_send(ch, "MAIL", periode_label, "OK", details)
+                log_send(ch, "MAIL", periode_label, "OK", details, subject=subject, body=body, to_email=mail, attachment_name=(attachments[0][0] if attachments else ""))
             except Exception:
                 pass
 
@@ -5466,7 +5557,7 @@ def _send_orange_ch_planning(*, from_tomorrow: bool = False, want_pdf: bool = Tr
             except Exception:
                 pass
             try:
-                log_send(ch, "MAIL", periode_label, "KO", str(e))
+                log_send(ch, "MAIL", periode_label, "KO", str(e), subject=(locals().get("subject", "")), body=(locals().get("body", "")), to_email=(locals().get("mail", "")))
             except Exception:
                 pass
 
@@ -7212,6 +7303,10 @@ def send_planning_to_chauffeurs(
         if mail:
             if send_email_smtp(mail, subject, msg_txt):
                 sent += 1
+                try:
+                    log_send(ch, "MAIL", f"{from_date.strftime('%d/%m/%Y')}" + (f" → {to_date.strftime('%d/%m/%Y')}" if to_date else ""), "OK", "Envoyé", subject=subject, body=msg_txt, to_email=mail)
+                except Exception:
+                    pass
         else:
             no_email.append(ch)
 
@@ -7750,10 +7845,10 @@ def render_tab_vue_chauffeur(forced_ch=None):
                         raise RuntimeError("SMTP : envoi échoué")
 
                     sent += 1
-                    log_send(ch, "MAIL", periode_label, "OK", "Envoyé")
+                    log_send(ch, "MAIL", periode_label, "OK", "Envoyé", subject=subject, body=body, to_email=mail, attachment_name=(fname if want_pdf else ""))
 
                 except Exception as e:
-                    log_send(ch, "MAIL", periode_label, "ERREUR", str(e))
+                    log_send(ch, "MAIL", periode_label, "ERREUR", str(e), subject=(locals().get("subject", "")), body=(locals().get("body", "")), to_email=(locals().get("mail", "")))
                     errors.append((ch, str(e)))
 
             # -------------------
@@ -12983,6 +13078,7 @@ def main():
             tab6,
             tab7,
             tab8,
+            tab_send_history,
             tab9,
             tab10,
             tab11,
@@ -12997,6 +13093,7 @@ def main():
                 "👨‍✈️ Feuil2 / Chauffeurs",
                 "📄 Feuil3",
                 "📦 Admin transferts",
+                "📤 Messages envoyés",
                 "📂 Excel ↔ DB",
                 "🚫 Indispos chauffeurs",
                 "⛽ Surcharge carburant",
@@ -13021,6 +13118,8 @@ def main():
             render_tab_feuil3()
         with tab8:
             render_tab_admin_transferts()
+        with tab_send_history:
+            render_tab_send_history()
         with tab9:
             render_tab_excel_sync()
         with tab10:
