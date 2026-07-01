@@ -4018,7 +4018,7 @@ SMTP_PORT = 587
 SMTP_USER = "airportslinesbureau@gmail.com"
 FROM_EMAIL = SMTP_USER
 ADMIN_NOTIFICATION_EMAIL = "airportslinesbureau@gmail.com"
-SEND_ARCHIVE_BCC_EMAIL = ADMIN_NOTIFICATION_EMAIL  # CCI automatique sur les mails chauffeurs
+SEND_ARCHIVE_BCC_EMAIL = ""  # CCI désactivée
 
 
 def get_smtp_password():
@@ -4906,9 +4906,6 @@ def send_email_smtp(to_email: str, subject: str, body: str) -> bool:
         msg["Subject"] = subject
         msg["From"] = FROM_EMAIL
         msg["To"] = to_email
-        archive_bcc = str(globals().get("SEND_ARCHIVE_BCC_EMAIL", "") or "").strip()
-        if archive_bcc and archive_bcc.lower() != str(to_email).strip().lower():
-            msg["Bcc"] = archive_bcc
 
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
             server.starttls()
@@ -4939,9 +4936,6 @@ def send_email_smtp_with_attachments(
         msg["Subject"] = subject
         msg["From"] = FROM_EMAIL
         msg["To"] = to_email
-        archive_bcc = str(globals().get("SEND_ARCHIVE_BCC_EMAIL", "") or "").strip()
-        if archive_bcc and archive_bcc.lower() != str(to_email).strip().lower():
-            msg["Bcc"] = archive_bcc
 
         msg.attach(MIMEText(body or "", "plain", "utf-8"))
 
