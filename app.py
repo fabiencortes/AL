@@ -13992,15 +13992,84 @@ def _clienthub_group_mask(df, group: str):
     return bdc.str.startswith(tuple(aliases))
 
 
-def _clienthub_payment_filter(df, *, show_bancontact: bool = True):
-    """Permet de masquer/afficher les transferts avec paiement Bancontact sans toucher à la DB."""
+def _clienthub_payment_filter(df, *, show_bancontact: bool = True, show_caisse: bool = True):
+    """Permet de masquer/afficher Bancontact et/ou Caisse sans toucher à la DB."""
     import pandas as pd
-    if df is None or df.empty or show_bancontact or "PAIEMENT" not in df.columns:
+    if df is None or df.empty or "PAIEMENT" not in df.columns:
         return df
+
+    # Si les deux sont visibles, on ne copie rien : plus rapide.
+    if show_bancontact and show_caisse:
+        return df
+
     pay = df["PAIEMENT"].fillna("").astype(str).str.strip().str.upper()
-    # tolérant : BANCONTACT, BAN CONTACT, BC, BANCONT.
-    is_bancontact = pay.str.contains(r"BAN\s*CONTACT|BANCONT|\bBC\b", regex=True, na=False)
-    return df[~is_bancontact].copy()
+    mask_hide = pd.Series(False, index=df.index)
+
+    if not show_bancontact:
+        # Tolérant : BANCONTACT, BAN CONTACT, BC, BANCONT.
+        mask_hide = mask_hide | pay.str.contains(r"BAN\s*CONTACT|BANCONT|\bBC\b", regex=True, na=False)
+
+    if not show_caisse:
+        # Tolérant : CAISSE, CASH, liquide.
+        mask_hide = mask_hide | pay.str.contains(r"CAISSE|CASH|LIQUIDE", regex=True, na=False)
+
+    return df[~mask_hide].copy()
+
+
+def _clienthub_attente_to_number(val) -> float:
+    """Convertit ATTENTE en nombre additionnable.
+    Accepte : 10, 10.5, 10,5, 1h30, 1:30, 1h, 30min.
+    Règle : si format horaire => heures décimales ; sinon valeur numérique telle qu'écrite.
+    """
+    import re
+    try:
+        if pd.isna(val):
+            return 0.0
+    except Exception:
+        pass
+    s = str(val or "").strip().lower()
+    if not s:
+        return 0.0
+    s = s.replace("€", "").replace("eur", "").strip()
+
+    # 1h30 / 1 h 30 / 1h
+    m = re.search(r"(\d+(?:[\.,]\d+)?)\s*h(?:eure|eur|rs)?\s*(\d+)?", s)
+    if m:
+        h = float(m.group(1).replace(",", "."))
+        mn = float(m.group(2) or 0)
+        return h + (mn / 60.0)
+
+    # 1:30 => heures décimales
+    m = re.search(r"^(\d+)\s*[:;]\s*(\d{1,2})$", s)
+    if m:
+        return float(m.group(1)) + (float(m.group(2)) / 60.0)
+
+    # 30 min
+    m = re.search(r"(\d+(?:[\.,]\d+)?)\s*(?:min|mn)\b", s)
+    if m:
+        return float(m.group(1).replace(",", ".")) / 60.0
+
+    # nombre simple
+    m = re.search(r"-?\d+(?:[\.,]\d+)?", s.replace(" ", ""))
+    if m:
+        return float(m.group(0).replace(",", "."))
+    return 0.0
+
+
+def _clienthub_total_attente(df) -> float:
+    if df is None or df.empty or "ATTENTE" not in df.columns:
+        return 0.0
+    return float(df["ATTENTE"].map(_clienthub_attente_to_number).sum())
+
+
+def _clienthub_format_attente(total: float) -> str:
+    try:
+        total = float(total or 0)
+    except Exception:
+        total = 0.0
+    if abs(total - round(total)) < 0.005:
+        return f"{int(round(total))}"
+    return f"{total:.2f}"
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -14063,7 +14132,7 @@ def render_tab_clients():
         if df_full is not None and not df_full.empty:
             df_full = df_full.copy()
             client_options = _clienthub_dynamic_client_options(df_full)
-            colf1, colf2, colf3, colf4, colf5 = st.columns([1,1,1,1.2,1])
+            colf1, colf2, colf3, colf4, colf5, colf6 = st.columns([1,1,1,1.2,1,1])
             with colf1:
                 client_label = st.selectbox("Client / groupe", client_options, key="clienthub_client_group")
                 go_gl_selected = ["GO", "GL"]
@@ -14084,6 +14153,13 @@ def render_tab_clients():
                     value=True,
                     key="clienthub_show_bancontact",
                     help="Décoche pour masquer les transferts dont le paiement est Bancontact.",
+                )
+            with colf6:
+                show_caisse = st.checkbox(
+                    "Voir Caisse",
+                    value=True,
+                    key="clienthub_show_caisse",
+                    help="Décoche pour masquer les transferts dont le paiement est Caisse / cash / liquide.",
                 )
 
             # Filtre date d'abord : réduit le volume avant le classement sous-société.
@@ -14106,9 +14182,13 @@ def render_tab_clients():
             except Exception:
                 pass
 
-            # Paiement : option rapide pour masquer Bancontact sans modifier les données.
+            # Paiement : options rapides pour masquer Bancontact et/ou Caisse sans modifier les données.
             try:
-                df_full = _clienthub_payment_filter(df_full, show_bancontact=bool(show_bancontact))
+                df_full = _clienthub_payment_filter(
+                    df_full,
+                    show_bancontact=bool(show_bancontact),
+                    show_caisse=bool(show_caisse),
+                )
             except Exception:
                 pass
 
@@ -14150,11 +14230,13 @@ def render_tab_clients():
                 total_km = pd.to_numeric(df_full.get("KM", pd.Series(dtype=float)), errors="coerce").fillna(0).sum() if "KM" in df_full.columns else 0
                 total_prix = pd.to_numeric(df_full.get("H TVA", pd.Series(dtype=float)), errors="coerce").fillna(0).sum() if "H TVA" in df_full.columns else 0
                 total_surcharge = pd.to_numeric(df_full.get("SURCHARGE_CARBURANT", pd.Series(dtype=float)), errors="coerce").fillna(0).sum() if "SURCHARGE_CARBURANT" in df_full.columns else 0
-                m1, m2, m3, m4 = st.columns(4)
+                total_attente = _clienthub_total_attente(df_full)
+                m1, m2, m3, m4, m5 = st.columns(5)
                 m1.metric("Navettes", f"{total_rows}")
                 m2.metric("KM", f"{float(total_km):.0f}")
                 m3.metric("Prix officiel", f"{float(total_prix):.2f} €")
                 m4.metric("Surcharge", f"{float(total_surcharge):.2f} €")
+                m5.metric("Attente", _clienthub_format_attente(total_attente))
 
                 if "SOUS_SOCIETE" in df_full.columns:
                     st.markdown("#### Sous-sociétés trouvées")
@@ -14162,8 +14244,18 @@ def render_tab_clients():
                         df_full.groupby("SOUS_SOCIETE", dropna=False)
                         .size()
                         .reset_index(name="Navettes")
-                        .sort_values("Navettes", ascending=False)
                     )
+                    if "ATTENTE" in df_full.columns:
+                        attente_summary = (
+                            df_full.assign(ATTENTE_CALC=df_full["ATTENTE"].map(_clienthub_attente_to_number))
+                            .groupby("SOUS_SOCIETE", dropna=False)["ATTENTE_CALC"]
+                            .sum()
+                            .reset_index()
+                        )
+                        sub_summary = sub_summary.merge(attente_summary, on="SOUS_SOCIETE", how="left")
+                        sub_summary["Attente"] = sub_summary["ATTENTE_CALC"].fillna(0).map(_clienthub_format_attente)
+                        sub_summary = sub_summary.drop(columns=["ATTENTE_CALC"])
+                    sub_summary = sub_summary.sort_values("Navettes", ascending=False)
                     st.dataframe(sub_summary, use_container_width=True, height=min(220, 38 + 35 * len(sub_summary)))
 
                 wanted = ["SOUS_SOCIETE", "DATE", "HEURE", "Unnamed: 8", "DESIGNATION", "Type Nav", "GO", "Num BDC", "NOM", "ADRESSE", "CP", "Localité", "PAIEMENT", "Caisse", "KM", "H TVA", "SURCHARGE_CARBURANT", "PARKING", "ATTENTE", "PEAGE", "ADM", "REMARQUE", "DEMANDEUR", "IMPUTATION", "FACTURE_ENVOYEE", "DATE_HEURE_YELLOW"]
