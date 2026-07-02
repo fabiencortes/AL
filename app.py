@@ -13832,12 +13832,24 @@ CLIENTHUB_GROUP_ALIASES = {
     "FN": ["FN"],
     "JC": ["JC"],
     "KI": ["KNAUF INSULATION", "KI HQ", "KNAUF", "KI"],
+    "KIOMED": ["KIOMED"],
+    "CM": ["CM"],
+    "ULIEGE": ["ULIEGE", "ULG", "UNIVERSITE DE LIEGE", "UNIVERSITÉ DE LIÈGE"],
+    "PART": ["PART", "PARTICULIER"],
+    "SOCIETE": ["SOCIETE", "SOCIÉTÉ", "STE"],
+    "NEOT": ["NEOT"],
+    "ABB": ["ABB"],
+    "GUT": ["GUT"],
     "BT": ["BT"],
     "LEO": ["LEO", "LE"],
     "LBE": ["LBE", "LB"],
     "BUZON": ["BUZON", "BU"],
     "AC": ["AC"],
 }
+
+# Groupes qui ne se cherchent pas dans Num BDC.
+CLIENTHUB_TYPE_NAV_GROUPS = {"GET-E": ["GET-E", "GETE", "GET E"], "TUI": ["TUI"]}
+CLIENTHUB_GO_GL_GROUP = "GO / GL"
 
 CLIENTHUB_CHAUFFEUR_VIEWS = ["FA", "AD", "LILLO"]
 
@@ -13909,8 +13921,39 @@ def _clienthub_detect_sub_from_bdc(num_bdc, group: str) -> str:
 
 def _clienthub_dynamic_client_options(df) -> list[str]:
     """Client/groupe comme avant : liste stable, pas de création de groupes par 2 lettres sauf FN/JC internes."""
-    base = ["FN", "JC", "KI", "BT", "LEO", "LBE", "BUZON", "AC"]
+    base = [
+        "FN", "JC", "KI", "KIOMED", "CM", "ULIEGE", "PART", "SOCIETE",
+        "NEOT", "ABB", "GUT", "GET-E", "TUI", CLIENTHUB_GO_GL_GROUP,
+        "BT", "LEO", "LBE", "BUZON", "AC",
+    ]
     return list(dict.fromkeys(base + CLIENTHUB_CHAUFFEUR_VIEWS))
+
+
+def _clienthub_type_nav_mask(df, group: str):
+    import pandas as pd
+    if df is None or df.empty:
+        return pd.Series([], dtype=bool)
+    if "Type Nav" not in df.columns:
+        return pd.Series(False, index=df.index)
+    group = str(group or "").strip().upper()
+    aliases = CLIENTHUB_TYPE_NAV_GROUPS.get(group, [group])
+    typ = df["Type Nav"].fillna("").astype(str).map(_clienthub_compact)
+    aliases = [_clienthub_compact(a) for a in aliases if str(a).strip()]
+    aliases = [a for a in aliases if a]
+    if not aliases:
+        return pd.Series(False, index=df.index)
+    return typ.str.contains("|".join(aliases), regex=True, na=False)
+
+
+def _clienthub_go_gl_mask(df, selected: list[str] | None = None):
+    import pandas as pd
+    if df is None or df.empty:
+        return pd.Series([], dtype=bool)
+    if "GO" not in df.columns:
+        return pd.Series(False, index=df.index)
+    selected = [str(x or "").strip().upper() for x in (selected or ["GO", "GL"]) if str(x or "").strip()]
+    go_col = df["GO"].fillna("").astype(str).str.strip().str.upper()
+    return go_col.isin(selected)
 
 
 def _clienthub_group_mask(df, group: str):
@@ -13924,6 +13967,12 @@ def _clienthub_group_mask(df, group: str):
         if group == "FA":
             return ch.str.contains("FA|PO|RO", regex=True)
         return ch.str.contains(group, regex=False)
+
+    if group in CLIENTHUB_TYPE_NAV_GROUPS:
+        return _clienthub_type_nav_mask(df, group)
+
+    if group == CLIENTHUB_GO_GL_GROUP:
+        return _clienthub_go_gl_mask(df, ["GO", "GL"])
 
     if "Num BDC" not in df.columns:
         return pd.Series(False, index=df.index)
@@ -13966,8 +14015,13 @@ def _clienthub_add_subcompany_column(df, group: str):
     if df is None or df.empty:
         return df
     out = df.copy()
-    if str(group or "").strip().upper() in CLIENTHUB_CHAUFFEUR_VIEWS:
+    group_u = str(group or "").strip().upper()
+    if group_u in CLIENTHUB_CHAUFFEUR_VIEWS:
         out["SOUS_SOCIETE"] = out.get("CH", "").fillna("").astype(str).str.upper() if "CH" in out.columns else ""
+    elif group_u in CLIENTHUB_TYPE_NAV_GROUPS:
+        out["SOUS_SOCIETE"] = out.get("Type Nav", "").fillna("").astype(str).str.strip().str.upper() if "Type Nav" in out.columns else "Autres / non classé"
+    elif group_u == CLIENTHUB_GO_GL_GROUP:
+        out["SOUS_SOCIETE"] = out.get("GO", "").fillna("").astype(str).str.strip().str.upper() if "GO" in out.columns else "Autres / non classé"
     else:
         out["SOUS_SOCIETE"] = out.get("Num BDC", "").apply(lambda v: _clienthub_detect_sub_from_bdc(v, group)) if "Num BDC" in out.columns else "Autres / non classé"
     return out
@@ -14012,6 +14066,14 @@ def render_tab_clients():
             colf1, colf2, colf3, colf4, colf5 = st.columns([1,1,1,1.2,1])
             with colf1:
                 client_label = st.selectbox("Client / groupe", client_options, key="clienthub_client_group")
+                go_gl_selected = ["GO", "GL"]
+                if str(client_label).strip().upper() == CLIENTHUB_GO_GL_GROUP:
+                    go_gl_selected = st.multiselect(
+                        "Afficher",
+                        options=["GO", "GL"],
+                        default=["GO", "GL"],
+                        key="clienthub_go_gl_selected",
+                    )
             with colf2:
                 d1 = st.date_input("Date début", value=date.today().replace(day=1), key="clienthub_d1")
             with colf3:
@@ -14037,7 +14099,10 @@ def render_tab_clients():
             # Filtre groupe : ancien système pour les clients classiques,
             # exception automatique par 2 lettres uniquement pour FN et JC.
             try:
-                df_full = df_full[_clienthub_group_mask(df_full, client_label)].copy()
+                if str(client_label).strip().upper() == CLIENTHUB_GO_GL_GROUP:
+                    df_full = df_full[_clienthub_go_gl_mask(df_full, go_gl_selected)].copy()
+                else:
+                    df_full = df_full[_clienthub_group_mask(df_full, client_label)].copy()
             except Exception:
                 pass
 
@@ -14101,7 +14166,7 @@ def render_tab_clients():
                     )
                     st.dataframe(sub_summary, use_container_width=True, height=min(220, 38 + 35 * len(sub_summary)))
 
-                wanted = ["SOUS_SOCIETE", "DATE", "HEURE", "Unnamed: 8", "DESIGNATION", "GO", "Num BDC", "NOM", "ADRESSE", "CP", "Localité", "PAIEMENT", "Caisse", "KM", "H TVA", "SURCHARGE_CARBURANT", "PARKING", "ATTENTE", "PEAGE", "ADM", "REMARQUE", "DEMANDEUR", "IMPUTATION", "FACTURE_ENVOYEE", "DATE_HEURE_YELLOW"]
+                wanted = ["SOUS_SOCIETE", "DATE", "HEURE", "Unnamed: 8", "DESIGNATION", "Type Nav", "GO", "Num BDC", "NOM", "ADRESSE", "CP", "Localité", "PAIEMENT", "Caisse", "KM", "H TVA", "SURCHARGE_CARBURANT", "PARKING", "ATTENTE", "PEAGE", "ADM", "REMARQUE", "DEMANDEUR", "IMPUTATION", "FACTURE_ENVOYEE", "DATE_HEURE_YELLOW"]
                 cols = [c for c in wanted if c in df_full.columns]
                 view = df_full[cols].copy().fillna("")
                 st.dataframe(_clienthub_style_facture(view), use_container_width=True, height=420)
