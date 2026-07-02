@@ -1239,6 +1239,21 @@ def is_blankish(val) -> bool:
     return s == "" or s.lower() in {"nan", "none", "nat"}
 
 
+def get_row_first_value(row, *cols):
+    """Retourne la première valeur non vide parmi plusieurs variantes de nom de colonne.
+    Utile car Excel garde parfois la casse/les accents: Reh, Siège, PAX...
+    """
+    for c in cols:
+        try:
+            v = row.get(c, "")
+        except Exception:
+            v = ""
+        if is_blankish(v):
+            continue
+        return v
+    return ""
+
+
 def clean_display(val, default: str = "") -> str:
     if is_blankish(val):
         return default
@@ -2464,8 +2479,8 @@ def format_navette_full_details(row, chauffeur_code: str) -> str:
     # VÉHICULE (RÈGLES STRICTES)
     # =========================
     immat = g("IMMAT", "PLAQUE", "IMMATRICULATION")
-    reh_n = extract_positive_int(row.get("REH"))
-    siege_n = extract_positive_int(row.get("SIEGE", "SIÈGE"))
+    reh_n = extract_positive_int(get_row_first_value(row, "Reh", "REH", "reh", "Rehausseur", "REHAUSSEUR", "Rehausseurs", "REHAUSSEURS"))
+    siege_n = extract_positive_int(get_row_first_value(row, "Siège", "SIÈGE", "SIEGE", "siege", "SIEGE BEBE", "Siège bébé"))
 
     # =========================
     # CONSTRUCTION MAIL
@@ -2568,8 +2583,8 @@ def format_navette_ack(row, ch_selected, trajet, probleme):
     # VÉHICULE (RÈGLES STRICTES)
     # =========================
     immat = str(row.get("IMMAT", "") or "").strip()
-    reh_n = extract_positive_int(row.get("REH"))
-    siege_n = extract_positive_int(row.get("SIEGE", "SIÈGE"))
+    reh_n = extract_positive_int(get_row_first_value(row, "Reh", "REH", "reh", "Rehausseur", "REHAUSSEUR", "Rehausseurs", "REHAUSSEURS"))
+    siege_n = extract_positive_int(get_row_first_value(row, "Siège", "SIÈGE", "SIEGE", "siege", "SIEGE BEBE", "Siège bébé"))
 
     vehicule_lines = []
     if immat:
@@ -4557,11 +4572,11 @@ def build_planning_mail_body(
         if row.get("IMMAT"):
             lines.append(f"🚘 Plaque : {row.get('IMMAT')}")
 
-        siege_bebe = extract_positive_int(row.get("SIEGE", row.get("SIÈGE")))
+        siege_bebe = extract_positive_int(get_row_first_value(row, "Siège", "SIÈGE", "SIEGE", "siege", "SIEGE BEBE", "Siège bébé"))
         if siege_bebe:
             lines.append(f"🍼 Siège bébé : {siege_bebe}")
 
-        reh_n = extract_positive_int(row.get("REH"))
+        reh_n = extract_positive_int(get_row_first_value(row, "Reh", "REH", "reh", "Rehausseur", "REHAUSSEUR", "Rehausseurs", "REHAUSSEURS"))
         if reh_n:
             lines.append(f"🪑 Rehausseur : {reh_n}")
 
@@ -7991,10 +8006,10 @@ def export_chauffeur_planning_pdf(df_ch: pd.DataFrame, ch: str):
         immat = str(row.get("IMMAT", "") or "").strip()
 
         # 🍼 Siège bébé (SIEGE / SIÈGE)
-        siege_bebe = extract_positive_int(row.get("SIEGE", row.get("SIÈGE")))
+        siege_bebe = extract_positive_int(get_row_first_value(row, "Siège", "SIÈGE", "SIEGE", "siege", "SIEGE BEBE", "Siège bébé"))
 
         # 🪑 Rehausseur
-        reh_n = extract_positive_int(row.get("REH"))
+        reh_n = extract_positive_int(get_row_first_value(row, "Reh", "REH", "reh", "Rehausseur", "REHAUSSEUR", "Rehausseurs", "REHAUSSEURS"))
 
 
         # --- Paiement / caisse / pax ---
@@ -9004,8 +9019,8 @@ def render_tab_chauffeur_driver():
         nom = clean_display(row.get("NOM", ""))
         pax = clean_numeric_display(row.get("PAX"))
         immat = clean_display(row.get("PLAQUE") or row.get("IMMAT"), "")
-        siege_bebe = extract_positive_int(row.get("SIEGE", row.get("SIÈGE")))
-        reh_n = extract_positive_int(row.get("REH"))
+        siege_bebe = extract_positive_int(get_row_first_value(row, "Siège", "SIÈGE", "SIEGE", "siege", "SIEGE BEBE", "Siège bébé"))
+        reh_n = extract_positive_int(get_row_first_value(row, "Reh", "REH", "reh", "Rehausseur", "REHAUSSEUR", "Rehausseurs", "REHAUSSEURS"))
 
         adr = clean_display(build_full_address_from_row(row), "")
         nav_adr = clean_display(build_navigation_address_from_row(row), "")
