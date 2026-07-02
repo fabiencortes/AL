@@ -13806,6 +13806,97 @@ def _clienthub_export_pdf_exact(df, title_txt):
     doc.build(story)
     return buf.getvalue()
 
+
+
+# ============================================================
+#   CLIENT HUB — GROUPES / SOUS-SOCIÉTÉS RAPIDES (OpenAI)
+#   Objectif : garder le système actuel + ajouter une couche
+#   groupe -> sous-société sans ralentir l'onglet.
+# ============================================================
+CLIENTHUB_GROUP_ALIASES = {
+    "FN": ["FN BROWNING", "FN HERSTAL", "FNH", "BROWNING", "FN"],
+    "JC": ["JOHN COCKERILL", "JCSA", "JCD", "JCMI", "JCC", "JCO", "JC"],
+    "KI": ["KNAUF INSULATION", "KI HQ", "KNAUF", "KI"],
+    "BT": ["BT"],
+    "LEO": ["LEO"],
+    "LBE": ["LBE"],
+    "BUZON": ["BUZON"],
+    "AC": ["AC"],
+}
+
+CLIENTHUB_CHAUFFEUR_VIEWS = ["FA", "AD", "LILLO"]
+
+
+def _clienthub_clean_code(val) -> str:
+    import re
+    s = str(val or "").strip().upper()
+    s = s.replace("-", " ").replace("_", " ").replace("/", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _clienthub_compact(val) -> str:
+    import re
+    return re.sub(r"[^A-Z0-9]+", "", _clienthub_clean_code(val))
+
+
+def _clienthub_aliases_for_group(group: str) -> list[str]:
+    group = str(group or "").strip().upper()
+    aliases = CLIENTHUB_GROUP_ALIASES.get(group, [group])
+    # Tri longueur décroissante : FNBROWNING avant FN, JCSA avant JC.
+    return sorted({str(a).strip().upper() for a in aliases if str(a).strip()}, key=lambda x: len(_clienthub_compact(x)), reverse=True)
+
+
+def _clienthub_detect_sub_from_bdc(num_bdc, group: str) -> str:
+    bdc = _clienthub_compact(num_bdc)
+    if not bdc:
+        return "Autres / non classé"
+    for alias in _clienthub_aliases_for_group(group):
+        a = _clienthub_compact(alias)
+        if a and bdc.startswith(a):
+            return alias
+    return "Autres / non classé"
+
+
+def _clienthub_group_mask(df, group: str):
+    import pandas as pd
+    group = str(group or "").strip().upper()
+    if df is None or df.empty:
+        return pd.Series([], dtype=bool)
+    if group in CLIENTHUB_CHAUFFEUR_VIEWS:
+        ch = df.get("CH", pd.Series("", index=df.index)).fillna("").astype(str).str.upper()
+        if group == "FA":
+            return ch.str.contains("FA|PO|RO", regex=True)
+        return ch.str.contains(group, regex=False)
+    if "Num BDC" not in df.columns:
+        return pd.Series(False, index=df.index)
+    bdc = df["Num BDC"].fillna("").astype(str).map(_clienthub_compact)
+    aliases = [_clienthub_compact(a) for a in _clienthub_aliases_for_group(group)]
+    aliases = [a for a in aliases if a]
+    if not aliases:
+        return pd.Series(False, index=df.index)
+    # Vectorisé et léger : startswith sur tuple.
+    return bdc.str.startswith(tuple(aliases))
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _clienthub_load_full_cached_for_ui():
+    df = get_planning(source="full", max_rows=50000)
+    if df is None:
+        return pd.DataFrame()
+    return df.copy()
+
+
+def _clienthub_add_subcompany_column(df, group: str):
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if str(group or "").strip().upper() in CLIENTHUB_CHAUFFEUR_VIEWS:
+        out["SOUS_SOCIETE"] = out.get("CH", "").fillna("").astype(str).str.upper() if "CH" in out.columns else ""
+    else:
+        out["SOUS_SOCIETE"] = out.get("Num BDC", "").apply(lambda v: _clienthub_detect_sub_from_bdc(v, group)) if "Num BDC" in out.columns else "Autres / non classé"
+    return out
+
 _old_render_tab_clients = render_tab_clients
 
 def render_tab_clients():
@@ -13823,59 +13914,121 @@ def render_tab_clients():
                     rebuild_planning_views()
                 except Exception:
                     pass
+                try:
+                    st.cache_data.clear()
+                except Exception:
+                    pass
                 st.success("Base planning vidée.")
         with c2:
             if st.button("🚀 Recharger historique depuis Excel", key="clienthub_rebuild_db"):
                 n = clienthub_reset_and_rebuild_db()
+                try:
+                    st.cache_data.clear()
+                except Exception:
+                    pass
                 st.success(f"Historique rechargé : {n} ligne(s).")
         with c3:
             st.caption("Repart sur une base propre : DB vidée puis rechargée depuis l'Excel jusqu'à aujourd'hui.")
 
-        df_full = get_planning(source="full", max_rows=50000)
+        df_full = _clienthub_load_full_cached_for_ui()
         if df_full is not None and not df_full.empty:
             df_full = df_full.copy()
-            client_options = ["FNH","JC","BT","LEO","LBE","BUZON","KI","AC","AD","FA","LILLO"]
-            colf1, colf2, colf3 = st.columns([1,1,1])
+            client_options = ["FN", "JC", "KI", "BT", "LEO", "LBE", "BUZON", "AC", "AD", "FA", "LILLO"]
+            colf1, colf2, colf3, colf4 = st.columns([1,1,1,1.2])
             with colf1:
-                client_label = st.selectbox("Client", client_options, key="clienthub_client")
+                client_label = st.selectbox("Client / groupe", client_options, key="clienthub_client_group")
             with colf2:
                 d1 = st.date_input("Date début", value=date.today().replace(day=1), key="clienthub_d1")
             with colf3:
                 d2 = st.date_input("Date fin", value=date.today(), key="clienthub_d2")
 
-            if "Num BDC" in df_full.columns:
-                if client_label in {"FA","AD","LILLO"}:
-                    pass
-                else:
-                    df_full = df_full[df_full["Num BDC"].fillna("").astype(str).str.upper().str.startswith(client_label)]
-            # exact date range
+            # Filtre date d'abord : réduit le volume avant le classement sous-société.
             try:
-                df_full["DATE_FILT"] = pd.to_datetime(df_full["DATE"], dayfirst=True, errors="coerce").dt.date
-                df_full = df_full[(df_full["DATE_FILT"] >= d1) & (df_full["DATE_FILT"] <= d2)].copy()
+                if "DATE_ISO" in df_full.columns:
+                    date_s = pd.to_datetime(df_full["DATE_ISO"], errors="coerce").dt.date
+                else:
+                    date_s = pd.to_datetime(df_full["DATE"], dayfirst=True, errors="coerce").dt.date
+                df_full = df_full[(date_s >= d1) & (date_s <= d2)].copy()
             except Exception:
                 pass
 
-            # chauffeur complementary views
-            if client_label == "FA" and "CH" in df_full.columns:
-                mask = df_full["CH"].fillna("").astype(str).str.upper().str.contains("FA|PO|RO", regex=True)
-                df_full = df_full[mask].copy()
-            elif client_label in {"AD","LILLO"} and "CH" in df_full.columns:
-                mask = df_full["CH"].fillna("").astype(str).str.upper().str.contains(client_label, regex=False)
-                df_full = df_full[mask].copy()
+            # Filtre groupe : conserve l'ancien principe Num BDC startswith,
+            # mais accepte maintenant toutes les variantes/sous-sociétés.
+            try:
+                df_full = df_full[_clienthub_group_mask(df_full, client_label)].copy()
+            except Exception:
+                pass
 
-            wanted = ["DATE","HEURE","Unnamed: 8","DESIGNATION","GO","Num BDC","NOM","ADRESSE","CP","Localité","PAIEMENT","Caisse","KM","H TVA","SURCHARGE_CARBURANT","PARKING","ATTENTE","PEAGE","ADM","REMARQUE","DEMANDEUR","IMPUTATION","FACTURE_ENVOYEE","DATE_HEURE_YELLOW"]
-            cols = [c for c in wanted if c in df_full.columns]
-            view = df_full[cols].copy().fillna("")
-            st.dataframe(_clienthub_style_facture(view), use_container_width=True, height=420)
-            pdf_bytes = _clienthub_export_pdf_exact(view, f"{client_label} du {d1.strftime('%d/%m/%Y')} au {d2.strftime('%d/%m/%Y')}")
-            st.download_button(
-                "📄 Télécharger PDF client",
-                data=pdf_bytes,
-                file_name=f"{client_label}_{d1.isoformat()}_{d2.isoformat()}.pdf",
-                mime="application/pdf",
-                key="clienthub_pdf_exact",
-                use_container_width=True,
-            )
+            df_full = _clienthub_add_subcompany_column(df_full, client_label)
+
+            sub_options = []
+            if "SOUS_SOCIETE" in df_full.columns and not df_full.empty:
+                counts = df_full["SOUS_SOCIETE"].fillna("Autres / non classé").astype(str).value_counts()
+                sub_options = [f"{name} ({int(count)})" for name, count in counts.items()]
+                sub_values = list(counts.index)
+            else:
+                sub_values = []
+
+            with colf4:
+                selected_sub_display = st.multiselect(
+                    "Sous-société / sous-secteur",
+                    options=sub_options,
+                    default=sub_options,
+                    key="clienthub_subcompanies",
+                    help="Décoche pour voir uniquement une sous-société, ex. FNH ou FN BROWNING.",
+                )
+
+            if sub_options and selected_sub_display:
+                selected_sub_values = []
+                for item in selected_sub_display:
+                    try:
+                        idx = sub_options.index(item)
+                        selected_sub_values.append(sub_values[idx])
+                    except Exception:
+                        pass
+                if selected_sub_values:
+                    df_full = df_full[df_full["SOUS_SOCIETE"].isin(selected_sub_values)].copy()
+
+            if df_full.empty:
+                st.warning("Aucune ligne trouvée pour ce groupe / cette période.")
+            else:
+                # Résumé rapide sans coût important.
+                total_rows = len(df_full)
+                total_km = pd.to_numeric(df_full.get("KM", pd.Series(dtype=float)), errors="coerce").fillna(0).sum() if "KM" in df_full.columns else 0
+                total_prix = pd.to_numeric(df_full.get("H TVA", pd.Series(dtype=float)), errors="coerce").fillna(0).sum() if "H TVA" in df_full.columns else 0
+                total_surcharge = pd.to_numeric(df_full.get("SURCHARGE_CARBURANT", pd.Series(dtype=float)), errors="coerce").fillna(0).sum() if "SURCHARGE_CARBURANT" in df_full.columns else 0
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Navettes", f"{total_rows}")
+                m2.metric("KM", f"{float(total_km):.0f}")
+                m3.metric("Prix officiel", f"{float(total_prix):.2f} €")
+                m4.metric("Surcharge", f"{float(total_surcharge):.2f} €")
+
+                if "SOUS_SOCIETE" in df_full.columns:
+                    st.markdown("#### Sous-sociétés trouvées")
+                    sub_summary = (
+                        df_full.groupby("SOUS_SOCIETE", dropna=False)
+                        .size()
+                        .reset_index(name="Navettes")
+                        .sort_values("Navettes", ascending=False)
+                    )
+                    st.dataframe(sub_summary, use_container_width=True, height=min(220, 38 + 35 * len(sub_summary)))
+
+                wanted = ["SOUS_SOCIETE", "DATE", "HEURE", "Unnamed: 8", "DESIGNATION", "GO", "Num BDC", "NOM", "ADRESSE", "CP", "Localité", "PAIEMENT", "Caisse", "KM", "H TVA", "SURCHARGE_CARBURANT", "PARKING", "ATTENTE", "PEAGE", "ADM", "REMARQUE", "DEMANDEUR", "IMPUTATION", "FACTURE_ENVOYEE", "DATE_HEURE_YELLOW"]
+                cols = [c for c in wanted if c in df_full.columns]
+                view = df_full[cols].copy().fillna("")
+                st.dataframe(_clienthub_style_facture(view), use_container_width=True, height=420)
+                title = f"{client_label} du {d1.strftime('%d/%m/%Y')} au {d2.strftime('%d/%m/%Y')}"
+                if sub_options and selected_sub_display and len(selected_sub_display) < len(sub_options):
+                    title += " — " + ", ".join([x.rsplit(" (", 1)[0] for x in selected_sub_display[:4]])
+                pdf_bytes = _clienthub_export_pdf_exact(view, title)
+                st.download_button(
+                    "📄 Télécharger PDF client",
+                    data=pdf_bytes,
+                    file_name=f"{client_label}_{d1.isoformat()}_{d2.isoformat()}.pdf",
+                    mime="application/pdf",
+                    key="clienthub_pdf_exact",
+                    use_container_width=True,
+                )
         else:
             st.info("Aucune donnée en base. Recharge l'historique depuis Excel.")
         st.markdown("---")
