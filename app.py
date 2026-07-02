@@ -2243,6 +2243,42 @@ def get_latest_fuel_price_for_date(target_date):
     return None
 
 
+
+def _is_km_2026_marker(v) -> bool:
+    """True si la cellule KM contient un repère/texte commençant par 2026.
+    Exemple: "2026 ..." n'est pas un kilométrage et ne doit pas servir au calcul carburant.
+    """
+    try:
+        if v is None:
+            return False
+        s = str(v).strip()
+        return bool(s) and s.startswith("2026")
+    except Exception:
+        return False
+
+
+def normalize_real_km(v):
+    """Retourne un vrai nombre de km, ou None si la cellule contient du texte.
+    Sécurité importante: les valeurs KM qui commencent par 2026 sont des repères, pas des kilomètres.
+    """
+    import re
+    try:
+        import pandas as pd
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    if v is None or _is_km_2026_marker(v):
+        return None
+    s = str(v).strip().replace("km", "").replace("KM", "").replace(" ", "").replace(",", ".")
+    if not s or not re.fullmatch(r"\d+(?:\.\d+)?", s):
+        return None
+    try:
+        km = float(s)
+        return km if km > 0 else None
+    except Exception:
+        return None
+
 def compute_surcharge_for_row_display(row):
     import pandas as pd
     from datetime import date
@@ -13408,7 +13444,11 @@ def _clienthub_calc_surcharge(date_iso, km, h_tva, coef_map):
     if coef is None:
         return 0.0
     h = _clienthub_to_float(h_tva)
-    y = _clienthub_to_float(km)
+    # Si la colonne KM commence par 2026 (ex: "2026 ..."), c'est un repère/texte, pas des km.
+    if _is_km_2026_marker(km):
+        y = None
+    else:
+        y = _clienthub_to_float(km)
     if h in (47.5, 55.0):
         return 2.0
     if h in (115.0, 148.5):
