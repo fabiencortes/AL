@@ -4228,7 +4228,9 @@ def bool_from_flag(x) -> bool:
 # ============================================================
 
 def ensure_send_log_table():
-    """Historique léger : on garde les 5 derniers envois par chauffeur/canal."""
+    """Historique léger : on garde les 5 derniers envois par chauffeur/canal.
+    Version safe : ne plante pas si une colonne existe déjà dans une ancienne DB.
+    """
     with get_connection() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS send_log (
@@ -4238,17 +4240,24 @@ def ensure_send_log_table():
                 canal TEXT,
                 periode TEXT,
                 statut TEXT,
-                message TEXT,
-                subject TEXT,
-                body TEXT,
-                to_email TEXT,
-                attachment_name TEXT
+                message TEXT
             )
         """)
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(send_log)").fetchall()}
+
+        existing = {str(r[1] or "").strip().lower() for r in conn.execute("PRAGMA table_info(send_log)").fetchall()}
+
         for col in ["subject", "body", "to_email", "attachment_name"]:
-            if col not in cols:
-                conn.execute(f"ALTER TABLE send_log ADD COLUMN {col} TEXT")
+            if col.lower() in existing:
+                continue
+            try:
+                conn.execute(f'ALTER TABLE send_log ADD COLUMN "{col}" TEXT')
+                existing.add(col.lower())
+            except Exception as e:
+                # SQLite peut renvoyer duplicate column name si l'ancienne DB a déjà la colonne
+                # avec une casse différente ou si 2 sessions Streamlit l'ajoutent en même temps.
+                if "duplicate column" not in str(e).lower():
+                    raise
+
         conn.execute("CREATE INDEX IF NOT EXISTS idx_send_log_ch_ts ON send_log(chauffeur, canal, ts DESC)")
         conn.commit()
 
