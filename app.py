@@ -13380,6 +13380,27 @@ def _clienthub_money_series(df, *names):
         .fillna(0.0)
     )
 
+
+def _clienthub_net_caisse_bancontact_series(df):
+    """Montant net HTVA à ajouter au prix officiel.
+    - Caisse/cash/liquide : montant Caisse / 1,06
+    - Bancontact : montant Caisse - 2,75% de frais, puis / 1,06
+    Les autres paiements n'ajoutent rien ici.
+    """
+    import pandas as pd
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+    base = _clienthub_money_series(df, "Caisse", "CAISSE")
+    if "PAIEMENT" not in df.columns:
+        return pd.Series(0.0, index=df.index)
+    pay = df["PAIEMENT"].fillna("").astype(str).str.strip().str.upper()
+    is_bancontact = pay.str.contains(r"BAN\s*CONTACT|BANCONT|\bBC\b", regex=True, na=False)
+    is_caisse = pay.str.contains(r"CAISSE|CASH|LIQUIDE", regex=True, na=False)
+    net = pd.Series(0.0, index=df.index)
+    net.loc[is_caisse] = base.loc[is_caisse] / 1.06
+    net.loc[is_bancontact] = (base.loc[is_bancontact] * 0.9725) / 1.06
+    return net.fillna(0.0)
+
 def _clienthub_calc_surcharge(date_iso, km, h_tva, coef_map):
     if not date_iso or date_iso < "2026-04-01":
         return 0.0
@@ -13824,7 +13845,7 @@ def _clienthub_export_pdf_exact(df, title_txt):
         ["Total ajusté HTVA", f"{total_adjusted:.2f} €"],
         ["KM total", f"{total_km:.2f} km"],
         ["Coef moyen appliqué", f"{coef_moyen:.4f} €/km"],
-        ["Règle rappel", "Prix officiel (= H TVA + Caisse) + surcharge carburant"],
+        ["Règle rappel", "Prix officiel (= H TVA + Caisse/Bancontact net HTVA) + surcharge carburant"],
     ]
     calc_table = Table(calc_data, colWidths=[4.5 * cm, 4.2 * cm])
     calc_table.setStyle(TableStyle([
@@ -14289,9 +14310,10 @@ def render_tab_clients():
                 total_rows = len(df_full)
                 total_km = _clienthub_money_series(df_full, "KM").sum()
                 total_prix_base = _clienthub_money_series(df_full, "H TVA", "HTVA").sum()
-                total_caisse = _clienthub_money_series(df_full, "Caisse", "CAISSE").sum()
-                # Prix officiel affiché = H TVA/HTVA + montant Caisse (sur les lignes visibles après filtres)
-                total_prix = float(total_prix_base) + float(total_caisse)
+                total_caisse_net_htva = _clienthub_net_caisse_bancontact_series(df_full).sum()
+                # Prix officiel affiché = H TVA/HTVA + montant Caisse/Bancontact net HTVA
+                # Caisse : /1,06 ; Bancontact : -2,75% puis /1,06.
+                total_prix = float(total_prix_base) + float(total_caisse_net_htva)
                 total_surcharge = _clienthub_money_series(df_full, "SURCHARGE_CARBURANT").sum()
                 total_parking = _clienthub_money_series(df_full, "PARKING").sum()
                 total_px_vente = _clienthub_money_series(df_full, "PX VENTE", "PX_VENTE", "PRIX VENTE").sum()
@@ -14337,7 +14359,7 @@ def render_tab_clients():
                         sub_summary = sub_summary.drop(columns=["ATTENTE_CALC"])
                     if str(client_label).strip().upper() in {"FA", "CM", "LILLO", "AD"}:
                         tmp_money = df_full.copy()
-                        tmp_money["_PRIX_OFFICIEL"] = _clienthub_money_series(tmp_money, "H TVA", "HTVA") + _clienthub_money_series(tmp_money, "Caisse", "CAISSE")
+                        tmp_money["_PRIX_OFFICIEL"] = _clienthub_money_series(tmp_money, "H TVA", "HTVA") + _clienthub_net_caisse_bancontact_series(tmp_money)
                         tmp_money["_SURCHARGE"] = _clienthub_money_series(tmp_money, "SURCHARGE_CARBURANT")
                         tmp_money["_PARKING"] = _clienthub_money_series(tmp_money, "PARKING")
                         tmp_money["_PX_VENTE"] = _clienthub_money_series(tmp_money, "PX VENTE", "PX_VENTE", "PRIX VENTE")
@@ -14358,7 +14380,7 @@ def render_tab_clients():
                 if str(client_label).strip().upper() in {"FA", "CM", "LILLO", "AD"}:
                     df_full["DIFFERENCE"] = (
                         _clienthub_money_series(df_full, "H TVA", "HTVA")
-                        + _clienthub_money_series(df_full, "Caisse", "CAISSE")
+                        + _clienthub_net_caisse_bancontact_series(df_full)
                         + _clienthub_money_series(df_full, "SURCHARGE_CARBURANT")
                         + _clienthub_money_series(df_full, "PARKING")
                         - _clienthub_money_series(df_full, "PX VENTE", "PX_VENTE", "PRIX VENTE")
