@@ -13813,14 +13813,17 @@ def _clienthub_export_pdf_exact(df, title_txt):
 #   Objectif : garder le système actuel + ajouter une couche
 #   groupe -> sous-société sans ralentir l'onglet.
 # ============================================================
+# Règle demandée : la société = les 2 premières lettres du Num BDC.
+# Exemple : JC retrouve automatiquement JC, JCSA, JCH, JCMI, etc.
+# Les anciennes valeurs restent utilisables, mais ne limitent plus la recherche.
 CLIENTHUB_GROUP_ALIASES = {
-    "FN": ["FN BROWNING", "FN HERSTAL", "FNH", "BROWNING", "FN"],
-    "JC": ["JOHN COCKERILL", "JCSA", "JCD", "JCMI", "JCC", "JCO", "JC"],
-    "KI": ["KNAUF INSULATION", "KI HQ", "KNAUF", "KI"],
+    "FN": ["FN"],
+    "JC": ["JC"],
+    "KI": ["KI"],
     "BT": ["BT"],
-    "LEO": ["LEO"],
-    "LBE": ["LBE"],
-    "BUZON": ["BUZON"],
+    "LEO": ["LE"],
+    "LBE": ["LB"],
+    "BUZON": ["BU"],
     "AC": ["AC"],
 }
 
@@ -13847,15 +13850,59 @@ def _clienthub_aliases_for_group(group: str) -> list[str]:
     return sorted({str(a).strip().upper() for a in aliases if str(a).strip()}, key=lambda x: len(_clienthub_compact(x)), reverse=True)
 
 
-def _clienthub_detect_sub_from_bdc(num_bdc, group: str) -> str:
+def _clienthub_company_prefix(group: str) -> str:
+    """Retourne le préfixe société à 2 lettres à utiliser sur Num BDC."""
+    group = str(group or "").strip().upper()
+    aliases = CLIENTHUB_GROUP_ALIASES.get(group)
+    base = aliases[0] if aliases else group
+    base = _clienthub_compact(base)
+    return base[:2] if len(base) >= 2 else base
+
+
+def _clienthub_detect_sub_auto_from_bdc(num_bdc, group: str) -> str:
+    """
+    Détecte automatiquement la sous-société depuis Num BDC.
+    Société = 2 premières lettres, sous-société = tout le préfixe lettres trouvé.
+    Exemples :
+      JC2026...   -> JC
+      JCSA2026... -> JCSA
+      JCH-...     -> JCH
+      JCMI...     -> JCMI
+      FNH...      -> FNH
+      FNBROWNING -> FNBROWNING
+    """
+    import re
     bdc = _clienthub_compact(num_bdc)
-    if not bdc:
+    prefix = _clienthub_company_prefix(group)
+    if not bdc or not prefix or not bdc.startswith(prefix):
         return "Autres / non classé"
-    for alias in _clienthub_aliases_for_group(group):
-        a = _clienthub_compact(alias)
-        if a and bdc.startswith(a):
-            return alias
-    return "Autres / non classé"
+
+    m = re.match(r"^[A-Z]+", bdc)
+    sub = m.group(0) if m else prefix
+
+    # sécurité : minimum le code société à 2 lettres
+    if len(sub) < len(prefix):
+        sub = prefix
+    return sub
+
+
+def _clienthub_dynamic_client_options(df) -> list[str]:
+    """Options client légères depuis la DB : codes société 2 lettres trouvés dans Num BDC."""
+    base = ["FN", "JC", "KI", "BT", "LE", "LB", "BU", "AC"]
+    try:
+        if df is not None and not df.empty and "Num BDC" in df.columns:
+            s = df["Num BDC"].fillna("").astype(str).map(_clienthub_compact)
+            dyn = sorted({x[:2] for x in s if len(x) >= 2 and x[:2].isalpha()})
+            base = list(dict.fromkeys(base + dyn))
+    except Exception:
+        pass
+    # Garder les vues chauffeurs à la fin, sans casser l'existant.
+    return list(dict.fromkeys(base + CLIENTHUB_CHAUFFEUR_VIEWS))
+
+
+def _clienthub_detect_sub_from_bdc(num_bdc, group: str) -> str:
+    # Nouvelle logique automatique : sous-société = préfixe lettres complet du Num BDC.
+    return _clienthub_detect_sub_auto_from_bdc(num_bdc, group)
 
 
 def _clienthub_group_mask(df, group: str):
@@ -13871,12 +13918,11 @@ def _clienthub_group_mask(df, group: str):
     if "Num BDC" not in df.columns:
         return pd.Series(False, index=df.index)
     bdc = df["Num BDC"].fillna("").astype(str).map(_clienthub_compact)
-    aliases = [_clienthub_compact(a) for a in _clienthub_aliases_for_group(group)]
-    aliases = [a for a in aliases if a]
-    if not aliases:
+    prefix = _clienthub_company_prefix(group)
+    if not prefix:
         return pd.Series(False, index=df.index)
-    # Vectorisé et léger : startswith sur tuple.
-    return bdc.str.startswith(tuple(aliases))
+    # Vectorisé et léger : 2 premières lettres = société.
+    return bdc.str.startswith(prefix)
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -13933,7 +13979,7 @@ def render_tab_clients():
         df_full = _clienthub_load_full_cached_for_ui()
         if df_full is not None and not df_full.empty:
             df_full = df_full.copy()
-            client_options = ["FN", "JC", "KI", "BT", "LEO", "LBE", "BUZON", "AC", "AD", "FA", "LILLO"]
+            client_options = _clienthub_dynamic_client_options(df_full)
             colf1, colf2, colf3, colf4 = st.columns([1,1,1,1.2])
             with colf1:
                 client_label = st.selectbox("Client / groupe", client_options, key="clienthub_client_group")
@@ -13974,8 +14020,8 @@ def render_tab_clients():
                     "Sous-société / sous-secteur",
                     options=sub_options,
                     default=sub_options,
-                    key="clienthub_subcompanies",
-                    help="Décoche pour voir uniquement une sous-société, ex. FNH ou FN BROWNING.",
+                    key=f"clienthub_subcompanies_{client_label}",
+                    help="Décoche pour voir uniquement une sous-société, ex. JCSA, JCH, JCMI ou FNH.",
                 )
 
             if sub_options and selected_sub_display:
