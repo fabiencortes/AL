@@ -13813,17 +13813,20 @@ def _clienthub_export_pdf_exact(df, title_txt):
 #   Objectif : garder le système actuel + ajouter une couche
 #   groupe -> sous-société sans ralentir l'onglet.
 # ============================================================
-# Règle demandée : la société = les 2 premières lettres du Num BDC.
-# Exemple : JC retrouve automatiquement JC, JCSA, JCH, JCMI, etc.
-# Les anciennes valeurs restent utilisables, mais ne limitent plus la recherche.
+# Règle finale :
+# - client/groupe comme avant pour les clients classiques (aliases fixes).
+# - exception uniquement pour FN et JC : société = les 2 premières lettres du Num BDC,
+#   sous-société = préfixe lettres complet trouvé automatiquement (JCSA, JCH, JCMI, FNH...).
+CLIENTHUB_AUTO_SUBCOMPANY_GROUPS = {"FN", "JC"}
+
 CLIENTHUB_GROUP_ALIASES = {
     "FN": ["FN"],
     "JC": ["JC"],
-    "KI": ["KI"],
+    "KI": ["KNAUF INSULATION", "KI HQ", "KNAUF", "KI"],
     "BT": ["BT"],
-    "LEO": ["LE"],
-    "LBE": ["LB"],
-    "BUZON": ["BU"],
+    "LEO": ["LEO", "LE"],
+    "LBE": ["LBE", "LB"],
+    "BUZON": ["BUZON", "BU"],
     "AC": ["AC"],
 }
 
@@ -13846,12 +13849,11 @@ def _clienthub_compact(val) -> str:
 def _clienthub_aliases_for_group(group: str) -> list[str]:
     group = str(group or "").strip().upper()
     aliases = CLIENTHUB_GROUP_ALIASES.get(group, [group])
-    # Tri longueur décroissante : FNBROWNING avant FN, JCSA avant JC.
     return sorted({str(a).strip().upper() for a in aliases if str(a).strip()}, key=lambda x: len(_clienthub_compact(x)), reverse=True)
 
 
 def _clienthub_company_prefix(group: str) -> str:
-    """Retourne le préfixe société à 2 lettres à utiliser sur Num BDC."""
+    """Préfixe société pour FN/JC uniquement : 2 premières lettres du Num BDC."""
     group = str(group or "").strip().upper()
     aliases = CLIENTHUB_GROUP_ALIASES.get(group)
     base = aliases[0] if aliases else group
@@ -13859,50 +13861,47 @@ def _clienthub_company_prefix(group: str) -> str:
     return base[:2] if len(base) >= 2 else base
 
 
+def _clienthub_is_auto_subcompany_group(group: str) -> bool:
+    return str(group or "").strip().upper() in CLIENTHUB_AUTO_SUBCOMPANY_GROUPS
+
+
 def _clienthub_detect_sub_auto_from_bdc(num_bdc, group: str) -> str:
     """
-    Détecte automatiquement la sous-société depuis Num BDC.
-    Société = 2 premières lettres, sous-société = tout le préfixe lettres trouvé.
-    Exemples :
-      JC2026...   -> JC
-      JCSA2026... -> JCSA
-      JCH-...     -> JCH
-      JCMI...     -> JCMI
-      FNH...      -> FNH
-      FNBROWNING -> FNBROWNING
+    Uniquement pour FN et JC :
+    société = 2 premières lettres ; sous-société = préfixe lettres complet.
+    Exemples : JC -> JC, JCSA, JCH, JCMI ; FN -> FN, FNH, FNBROWNING.
     """
     import re
     bdc = _clienthub_compact(num_bdc)
     prefix = _clienthub_company_prefix(group)
     if not bdc or not prefix or not bdc.startswith(prefix):
         return "Autres / non classé"
-
     m = re.match(r"^[A-Z]+", bdc)
     sub = m.group(0) if m else prefix
-
-    # sécurité : minimum le code société à 2 lettres
     if len(sub) < len(prefix):
         sub = prefix
     return sub
 
 
-def _clienthub_dynamic_client_options(df) -> list[str]:
-    """Options client légères depuis la DB : codes société 2 lettres trouvés dans Num BDC."""
-    base = ["FN", "JC", "KI", "BT", "LE", "LB", "BU", "AC"]
-    try:
-        if df is not None and not df.empty and "Num BDC" in df.columns:
-            s = df["Num BDC"].fillna("").astype(str).map(_clienthub_compact)
-            dyn = sorted({x[:2] for x in s if len(x) >= 2 and x[:2].isalpha()})
-            base = list(dict.fromkeys(base + dyn))
-    except Exception:
-        pass
-    # Garder les vues chauffeurs à la fin, sans casser l'existant.
-    return list(dict.fromkeys(base + CLIENTHUB_CHAUFFEUR_VIEWS))
-
-
 def _clienthub_detect_sub_from_bdc(num_bdc, group: str) -> str:
-    # Nouvelle logique automatique : sous-société = préfixe lettres complet du Num BDC.
-    return _clienthub_detect_sub_auto_from_bdc(num_bdc, group)
+    """Sous-société : automatique pour FN/JC, ancien système alias pour les autres."""
+    if _clienthub_is_auto_subcompany_group(group):
+        return _clienthub_detect_sub_auto_from_bdc(num_bdc, group)
+
+    bdc = _clienthub_compact(num_bdc)
+    if not bdc:
+        return "Autres / non classé"
+    for alias in _clienthub_aliases_for_group(group):
+        a = _clienthub_compact(alias)
+        if a and bdc.startswith(a):
+            return alias
+    return "Autres / non classé"
+
+
+def _clienthub_dynamic_client_options(df) -> list[str]:
+    """Client/groupe comme avant : liste stable, pas de création de groupes par 2 lettres sauf FN/JC internes."""
+    base = ["FN", "JC", "KI", "BT", "LEO", "LBE", "BUZON", "AC"]
+    return list(dict.fromkeys(base + CLIENTHUB_CHAUFFEUR_VIEWS))
 
 
 def _clienthub_group_mask(df, group: str):
@@ -13910,19 +13909,40 @@ def _clienthub_group_mask(df, group: str):
     group = str(group or "").strip().upper()
     if df is None or df.empty:
         return pd.Series([], dtype=bool)
+
     if group in CLIENTHUB_CHAUFFEUR_VIEWS:
         ch = df.get("CH", pd.Series("", index=df.index)).fillna("").astype(str).str.upper()
         if group == "FA":
             return ch.str.contains("FA|PO|RO", regex=True)
         return ch.str.contains(group, regex=False)
+
     if "Num BDC" not in df.columns:
         return pd.Series(False, index=df.index)
+
     bdc = df["Num BDC"].fillna("").astype(str).map(_clienthub_compact)
-    prefix = _clienthub_company_prefix(group)
-    if not prefix:
+
+    # Exception demandée : seulement FN et JC utilisent la règle des 2 premières lettres.
+    if _clienthub_is_auto_subcompany_group(group):
+        prefix = _clienthub_company_prefix(group)
+        return bdc.str.startswith(prefix) if prefix else pd.Series(False, index=df.index)
+
+    # Tous les autres clients restent sur l'ancien système client/groupe avec aliases fixes.
+    aliases = [_clienthub_compact(a) for a in _clienthub_aliases_for_group(group)]
+    aliases = [a for a in aliases if a]
+    if not aliases:
         return pd.Series(False, index=df.index)
-    # Vectorisé et léger : 2 premières lettres = société.
-    return bdc.str.startswith(prefix)
+    return bdc.str.startswith(tuple(aliases))
+
+
+def _clienthub_payment_filter(df, *, show_bancontact: bool = True):
+    """Permet de masquer/afficher les transferts avec paiement Bancontact sans toucher à la DB."""
+    import pandas as pd
+    if df is None or df.empty or show_bancontact or "PAIEMENT" not in df.columns:
+        return df
+    pay = df["PAIEMENT"].fillna("").astype(str).str.strip().str.upper()
+    # tolérant : BANCONTACT, BAN CONTACT, BC, BANCONT.
+    is_bancontact = pay.str.contains(r"BAN\s*CONTACT|BANCONT|\bBC\b", regex=True, na=False)
+    return df[~is_bancontact].copy()
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -13980,13 +14000,20 @@ def render_tab_clients():
         if df_full is not None and not df_full.empty:
             df_full = df_full.copy()
             client_options = _clienthub_dynamic_client_options(df_full)
-            colf1, colf2, colf3, colf4 = st.columns([1,1,1,1.2])
+            colf1, colf2, colf3, colf4, colf5 = st.columns([1,1,1,1.2,1])
             with colf1:
                 client_label = st.selectbox("Client / groupe", client_options, key="clienthub_client_group")
             with colf2:
                 d1 = st.date_input("Date début", value=date.today().replace(day=1), key="clienthub_d1")
             with colf3:
                 d2 = st.date_input("Date fin", value=date.today(), key="clienthub_d2")
+            with colf5:
+                show_bancontact = st.checkbox(
+                    "Voir Bancontact",
+                    value=True,
+                    key="clienthub_show_bancontact",
+                    help="Décoche pour masquer les transferts dont le paiement est Bancontact.",
+                )
 
             # Filtre date d'abord : réduit le volume avant le classement sous-société.
             try:
@@ -13998,10 +14025,16 @@ def render_tab_clients():
             except Exception:
                 pass
 
-            # Filtre groupe : conserve l'ancien principe Num BDC startswith,
-            # mais accepte maintenant toutes les variantes/sous-sociétés.
+            # Filtre groupe : ancien système pour les clients classiques,
+            # exception automatique par 2 lettres uniquement pour FN et JC.
             try:
                 df_full = df_full[_clienthub_group_mask(df_full, client_label)].copy()
+            except Exception:
+                pass
+
+            # Paiement : option rapide pour masquer Bancontact sans modifier les données.
+            try:
+                df_full = _clienthub_payment_filter(df_full, show_bancontact=bool(show_bancontact))
             except Exception:
                 pass
 
