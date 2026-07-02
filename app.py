@@ -13809,7 +13809,9 @@ def _clienthub_export_pdf_exact(df, title_txt):
     story.append(Spacer(1, 0.35 * cm))
 
     total_km = round(sum(_to_float(v) for v in pdf_df.get("KM", pd.Series(dtype=float))), 2) if "KM" in pdf_df.columns else 0.0
-    total_official = round(sum(_to_float(v) for v in pdf_df.get("H TVA", pd.Series(dtype=float))), 2) if "H TVA" in pdf_df.columns else 0.0
+    total_official_base = round(sum(_to_float(v) for v in pdf_df.get("H TVA", pd.Series(dtype=float))), 2) if "H TVA" in pdf_df.columns else 0.0
+    total_caisse_pdf = round(sum(_to_float(v) for v in pdf_df.get("Caisse", pd.Series(dtype=float))), 2) if "Caisse" in pdf_df.columns else 0.0
+    total_official = round(total_official_base + total_caisse_pdf, 2)
     total_surcharge = round(sum(_to_float(v) for v in pdf_df.get("SURCHARGE_CARBURANT", pd.Series(dtype=float))), 2) if "SURCHARGE_CARBURANT" in pdf_df.columns else 0.0
     total_adjusted = round(total_official + total_surcharge, 2)
     coef_moyen = round((total_surcharge / total_km), 4) if total_km > 0 else 0.0
@@ -13822,7 +13824,7 @@ def _clienthub_export_pdf_exact(df, title_txt):
         ["Total ajusté HTVA", f"{total_adjusted:.2f} €"],
         ["KM total", f"{total_km:.2f} km"],
         ["Coef moyen appliqué", f"{coef_moyen:.4f} €/km"],
-        ["Règle rappel", "Prix officiel + surcharge carburant"],
+        ["Règle rappel", "Prix officiel (= H TVA + Caisse) + surcharge carburant"],
     ]
     calc_table = Table(calc_data, colWidths=[4.5 * cm, 4.2 * cm])
     calc_table.setStyle(TableStyle([
@@ -13877,9 +13879,11 @@ CLIENTHUB_GROUP_ALIASES = {
 
 # Groupes qui ne se cherchent pas dans Num BDC.
 CLIENTHUB_TYPE_NAV_GROUPS = {"GET-E": ["GET-E", "GETE", "GET E"], "TUI": ["TUI"]}
-CLIENTHUB_GO_GL_GROUP = "GO / GL"
+CLIENTHUB_GO_GL_GROUP = "GO / GL / AL"
 
 CLIENTHUB_CHAUFFEUR_VIEWS = ["FA", "CM", "LILLO", "AD"]
+CLIENTHUB_SUPPLIER_MODE_CLIENTS = {"FA", "CM", "LILLO", "AD"}
+CLIENTHUB_GO_BUCKETS = ["AL", "GO", "GL"]
 
 
 def _clienthub_clean_code(val) -> str:
@@ -13973,24 +13977,39 @@ def _clienthub_type_nav_mask(df, group: str):
     return typ.str.contains("|".join(aliases), regex=True, na=False)
 
 
+def _clienthub_go_bucket_series(df):
+    """Classe la colonne GO : GO, GL, sinon AL (vide ou autre texte)."""
+    import pandas as pd
+    if df is None or df.empty:
+        return pd.Series([], dtype=str)
+    if "GO" not in df.columns:
+        return pd.Series("AL", index=df.index, dtype=str)
+    go_col = df["GO"].fillna("").astype(str).str.strip().str.upper()
+    return go_col.map(lambda x: x if x in {"GO", "GL"} else "AL")
+
+
 def _clienthub_go_gl_mask(df, selected: list[str] | None = None):
     import pandas as pd
     if df is None or df.empty:
         return pd.Series([], dtype=bool)
-    if "GO" not in df.columns:
+    selected = [str(x or "").strip().upper() for x in (selected or CLIENTHUB_GO_BUCKETS) if str(x or "").strip()]
+    selected = [x for x in selected if x in set(CLIENTHUB_GO_BUCKETS)]
+    if not selected:
         return pd.Series(False, index=df.index)
-    selected = [str(x or "").strip().upper() for x in (selected or ["GO", "GL"]) if str(x or "").strip()]
-    go_col = df["GO"].fillna("").astype(str).str.strip().str.upper()
-    return go_col.isin(selected)
+    return _clienthub_go_bucket_series(df).isin(selected)
 
 
-def _clienthub_group_mask(df, group: str):
+def _clienthub_group_mask(df, group: str, mode: str = "chauffeur"):
     import pandas as pd
     group = str(group or "").strip().upper()
+    mode = str(mode or "chauffeur").strip().lower()
     if df is None or df.empty:
         return pd.Series([], dtype=bool)
 
-    if group in CLIENTHUB_CHAUFFEUR_VIEWS:
+    # FA / CM / LILLO / AD :
+    # - mode chauffeur = ancien comportement sur CH
+    # - mode fournisseur = recherche dans Num BDC
+    if group in CLIENTHUB_CHAUFFEUR_VIEWS and mode != "fournisseur":
         ch = df.get("CH", pd.Series("", index=df.index)).fillna("").astype(str).str.upper()
         if group == "FA":
             return ch.str.contains("FA|PO|RO", regex=True)
@@ -14000,7 +14019,7 @@ def _clienthub_group_mask(df, group: str):
         return _clienthub_type_nav_mask(df, group)
 
     if group == CLIENTHUB_GO_GL_GROUP:
-        return _clienthub_go_gl_mask(df, ["GO", "GL"])
+        return _clienthub_go_gl_mask(df, CLIENTHUB_GO_BUCKETS)
 
     if "Num BDC" not in df.columns:
         return pd.Series(False, index=df.index)
@@ -14108,17 +14127,18 @@ def _clienthub_load_full_cached_for_ui():
     return df.copy()
 
 
-def _clienthub_add_subcompany_column(df, group: str):
+def _clienthub_add_subcompany_column(df, group: str, mode: str = "chauffeur"):
     if df is None or df.empty:
         return df
     out = df.copy()
     group_u = str(group or "").strip().upper()
-    if group_u in CLIENTHUB_CHAUFFEUR_VIEWS:
+    mode = str(mode or "chauffeur").strip().lower()
+    if group_u in CLIENTHUB_CHAUFFEUR_VIEWS and mode != "fournisseur":
         out["SOUS_SOCIETE"] = out.get("CH", "").fillna("").astype(str).str.upper() if "CH" in out.columns else ""
     elif group_u in CLIENTHUB_TYPE_NAV_GROUPS:
         out["SOUS_SOCIETE"] = out.get("Type Nav", "").fillna("").astype(str).str.strip().str.upper() if "Type Nav" in out.columns else "Autres / non classé"
     elif group_u == CLIENTHUB_GO_GL_GROUP:
-        out["SOUS_SOCIETE"] = out.get("GO", "").fillna("").astype(str).str.strip().str.upper() if "GO" in out.columns else "Autres / non classé"
+        out["SOUS_SOCIETE"] = _clienthub_go_bucket_series(out)
     else:
         out["SOUS_SOCIETE"] = out.get("Num BDC", "").apply(lambda v: _clienthub_detect_sub_from_bdc(v, group)) if "Num BDC" in out.columns else "Autres / non classé"
     return out
@@ -14163,13 +14183,23 @@ def render_tab_clients():
             colf1, colf2, colf3, colf4, colf5, colf6 = st.columns([1,1,1,1.2,1,1])
             with colf1:
                 client_label = st.selectbox("Client / groupe", client_options, key="clienthub_client_group")
-                go_gl_selected = ["GO", "GL"]
-                if str(client_label).strip().upper() == CLIENTHUB_GO_GL_GROUP:
+                client_mode = "chauffeur"
+                if str(client_label).strip().upper() in CLIENTHUB_SUPPLIER_MODE_CLIENTS:
+                    client_mode = st.radio(
+                        "Mode",
+                        options=["chauffeur", "fournisseur"],
+                        format_func=lambda x: "Chauffeur (CH)" if x == "chauffeur" else "Fournisseur (Num BDC)",
+                        horizontal=True,
+                        key=f"clienthub_mode_{client_label}",
+                    )
+                go_gl_selected = CLIENTHUB_GO_BUCKETS.copy()
+                if str(client_label).strip().upper() == CLIENTHUB_GO_GL_GROUP or str(client_label).strip().upper() in CLIENTHUB_SUPPLIER_MODE_CLIENTS:
                     go_gl_selected = st.multiselect(
-                        "Afficher",
-                        options=["GO", "GL"],
-                        default=["GO", "GL"],
-                        key="clienthub_go_gl_selected",
+                        "GO / GL / AL",
+                        options=CLIENTHUB_GO_BUCKETS,
+                        default=CLIENTHUB_GO_BUCKETS,
+                        key=f"clienthub_go_gl_selected_{client_label}",
+                        help="AL = colonne GO vide ou différente de GO/GL.",
                     )
             with colf2:
                 d1 = st.date_input("Date début", value=date.today().replace(day=1), key="clienthub_d1")
@@ -14206,7 +14236,9 @@ def render_tab_clients():
                 if str(client_label).strip().upper() == CLIENTHUB_GO_GL_GROUP:
                     df_full = df_full[_clienthub_go_gl_mask(df_full, go_gl_selected)].copy()
                 else:
-                    df_full = df_full[_clienthub_group_mask(df_full, client_label)].copy()
+                    df_full = df_full[_clienthub_group_mask(df_full, client_label, client_mode)].copy()
+                    if str(client_label).strip().upper() in CLIENTHUB_SUPPLIER_MODE_CLIENTS:
+                        df_full = df_full[_clienthub_go_gl_mask(df_full, go_gl_selected)].copy()
             except Exception:
                 pass
 
@@ -14220,7 +14252,7 @@ def render_tab_clients():
             except Exception:
                 pass
 
-            df_full = _clienthub_add_subcompany_column(df_full, client_label)
+            df_full = _clienthub_add_subcompany_column(df_full, client_label, client_mode)
 
             sub_options = []
             if "SOUS_SOCIETE" in df_full.columns and not df_full.empty:
@@ -14256,7 +14288,10 @@ def render_tab_clients():
                 # Résumé rapide sans coût important.
                 total_rows = len(df_full)
                 total_km = _clienthub_money_series(df_full, "KM").sum()
-                total_prix = _clienthub_money_series(df_full, "H TVA", "HTVA").sum()
+                total_prix_base = _clienthub_money_series(df_full, "H TVA", "HTVA").sum()
+                total_caisse = _clienthub_money_series(df_full, "Caisse", "CAISSE").sum()
+                # Prix officiel affiché = H TVA/HTVA + montant Caisse (sur les lignes visibles après filtres)
+                total_prix = float(total_prix_base) + float(total_caisse)
                 total_surcharge = _clienthub_money_series(df_full, "SURCHARGE_CARBURANT").sum()
                 total_parking = _clienthub_money_series(df_full, "PARKING").sum()
                 total_px_vente = _clienthub_money_series(df_full, "PX VENTE", "PX_VENTE", "PRIX VENTE").sum()
@@ -14302,7 +14337,7 @@ def render_tab_clients():
                         sub_summary = sub_summary.drop(columns=["ATTENTE_CALC"])
                     if str(client_label).strip().upper() in {"FA", "CM", "LILLO", "AD"}:
                         tmp_money = df_full.copy()
-                        tmp_money["_PRIX_OFFICIEL"] = _clienthub_money_series(tmp_money, "H TVA", "HTVA")
+                        tmp_money["_PRIX_OFFICIEL"] = _clienthub_money_series(tmp_money, "H TVA", "HTVA") + _clienthub_money_series(tmp_money, "Caisse", "CAISSE")
                         tmp_money["_SURCHARGE"] = _clienthub_money_series(tmp_money, "SURCHARGE_CARBURANT")
                         tmp_money["_PARKING"] = _clienthub_money_series(tmp_money, "PARKING")
                         tmp_money["_PX_VENTE"] = _clienthub_money_series(tmp_money, "PX VENTE", "PX_VENTE", "PRIX VENTE")
@@ -14323,6 +14358,7 @@ def render_tab_clients():
                 if str(client_label).strip().upper() in {"FA", "CM", "LILLO", "AD"}:
                     df_full["DIFFERENCE"] = (
                         _clienthub_money_series(df_full, "H TVA", "HTVA")
+                        + _clienthub_money_series(df_full, "Caisse", "CAISSE")
                         + _clienthub_money_series(df_full, "SURCHARGE_CARBURANT")
                         + _clienthub_money_series(df_full, "PARKING")
                         - _clienthub_money_series(df_full, "PX VENTE", "PX_VENTE", "PRIX VENTE")
