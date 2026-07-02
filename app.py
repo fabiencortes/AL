@@ -13353,6 +13353,33 @@ def _clienthub_to_float(v):
     except Exception:
         return None
 
+
+def _clienthub_money_series(df, *names):
+    """Retourne une série numérique robuste pour une colonne montant (€, virgules, espaces)."""
+    import pandas as pd
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+    col = None
+    norm_map = {str(c).strip().upper().replace("_", " "): c for c in df.columns}
+    for name in names:
+        key = str(name or "").strip().upper().replace("_", " ")
+        if key in norm_map:
+            col = norm_map[key]
+            break
+    if col is None:
+        return pd.Series(0.0, index=df.index)
+    return (
+        df[col]
+        .fillna("")
+        .astype(str)
+        .str.replace("€", "", regex=False)
+        .str.replace("EUR", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .str.replace(",", ".", regex=False)
+        .pipe(pd.to_numeric, errors="coerce")
+        .fillna(0.0)
+    )
+
 def _clienthub_calc_surcharge(date_iso, km, h_tva, coef_map):
     if not date_iso or date_iso < "2026-04-01":
         return 0.0
@@ -13840,6 +13867,7 @@ CLIENTHUB_GROUP_ALIASES = {
     "NEOT": ["NEOT"],
     "ABB": ["ABB"],
     "GUT": ["GUT"],
+    "RRS": ["RRS"],
     "BT": ["BT"],
     "LEO": ["LEO", "LE"],
     "LBE": ["LBE", "LB"],
@@ -13851,7 +13879,7 @@ CLIENTHUB_GROUP_ALIASES = {
 CLIENTHUB_TYPE_NAV_GROUPS = {"GET-E": ["GET-E", "GETE", "GET E"], "TUI": ["TUI"]}
 CLIENTHUB_GO_GL_GROUP = "GO / GL"
 
-CLIENTHUB_CHAUFFEUR_VIEWS = ["FA", "AD", "LILLO"]
+CLIENTHUB_CHAUFFEUR_VIEWS = ["FA", "CM", "LILLO", "AD"]
 
 
 def _clienthub_clean_code(val) -> str:
@@ -13923,7 +13951,7 @@ def _clienthub_dynamic_client_options(df) -> list[str]:
     """Client/groupe comme avant : liste stable, pas de création de groupes par 2 lettres sauf FN/JC internes."""
     base = [
         "FN", "JC", "KI", "KIOMED", "CM", "ULIEGE", "PART", "SOCIETE",
-        "NEOT", "ABB", "GUT", "GET-E", "TUI", CLIENTHUB_GO_GL_GROUP,
+        "NEOT", "ABB", "GUT", "RRS", "GET-E", "TUI", CLIENTHUB_GO_GL_GROUP,
         "BT", "LEO", "LBE", "BUZON", "AC",
     ]
     return list(dict.fromkeys(base + CLIENTHUB_CHAUFFEUR_VIEWS))
@@ -14227,16 +14255,33 @@ def render_tab_clients():
             else:
                 # Résumé rapide sans coût important.
                 total_rows = len(df_full)
-                total_km = pd.to_numeric(df_full.get("KM", pd.Series(dtype=float)), errors="coerce").fillna(0).sum() if "KM" in df_full.columns else 0
-                total_prix = pd.to_numeric(df_full.get("H TVA", pd.Series(dtype=float)), errors="coerce").fillna(0).sum() if "H TVA" in df_full.columns else 0
-                total_surcharge = pd.to_numeric(df_full.get("SURCHARGE_CARBURANT", pd.Series(dtype=float)), errors="coerce").fillna(0).sum() if "SURCHARGE_CARBURANT" in df_full.columns else 0
+                total_km = _clienthub_money_series(df_full, "KM").sum()
+                total_prix = _clienthub_money_series(df_full, "H TVA", "HTVA").sum()
+                total_surcharge = _clienthub_money_series(df_full, "SURCHARGE_CARBURANT").sum()
+                total_parking = _clienthub_money_series(df_full, "PARKING").sum()
+                total_px_vente = _clienthub_money_series(df_full, "PX VENTE", "PX_VENTE", "PRIX VENTE").sum()
                 total_attente = _clienthub_total_attente(df_full)
-                m1, m2, m3, m4, m5 = st.columns(5)
-                m1.metric("Navettes", f"{total_rows}")
-                m2.metric("KM", f"{float(total_km):.0f}")
-                m3.metric("Prix officiel", f"{float(total_prix):.2f} €")
-                m4.metric("Surcharge", f"{float(total_surcharge):.2f} €")
-                m5.metric("Attente", _clienthub_format_attente(total_attente))
+                total_difference = float(total_prix) + float(total_surcharge) + float(total_parking) - float(total_px_vente)
+
+                show_px_vente = str(client_label).strip().upper() in {"FA", "CM", "LILLO", "AD"}
+                if show_px_vente:
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Navettes", f"{total_rows}")
+                    m2.metric("KM", f"{float(total_km):.0f}")
+                    m3.metric("Prix officiel", f"{float(total_prix):.2f} €")
+                    m4.metric("Attente", _clienthub_format_attente(total_attente))
+                    m5, m6, m7, m8 = st.columns(4)
+                    m5.metric("Surcharge", f"{float(total_surcharge):.2f} €")
+                    m6.metric("Parking", f"{float(total_parking):.2f} €")
+                    m7.metric("PX VENTE", f"{float(total_px_vente):.2f} €")
+                    m8.metric("Différence", f"{float(total_difference):.2f} €")
+                else:
+                    m1, m2, m3, m4, m5 = st.columns(5)
+                    m1.metric("Navettes", f"{total_rows}")
+                    m2.metric("KM", f"{float(total_km):.0f}")
+                    m3.metric("Prix officiel", f"{float(total_prix):.2f} €")
+                    m4.metric("Surcharge", f"{float(total_surcharge):.2f} €")
+                    m5.metric("Attente", _clienthub_format_attente(total_attente))
 
                 if "SOUS_SOCIETE" in df_full.columns:
                     st.markdown("#### Sous-sociétés trouvées")
@@ -14255,10 +14300,34 @@ def render_tab_clients():
                         sub_summary = sub_summary.merge(attente_summary, on="SOUS_SOCIETE", how="left")
                         sub_summary["Attente"] = sub_summary["ATTENTE_CALC"].fillna(0).map(_clienthub_format_attente)
                         sub_summary = sub_summary.drop(columns=["ATTENTE_CALC"])
+                    if str(client_label).strip().upper() in {"FA", "CM", "LILLO", "AD"}:
+                        tmp_money = df_full.copy()
+                        tmp_money["_PRIX_OFFICIEL"] = _clienthub_money_series(tmp_money, "H TVA", "HTVA")
+                        tmp_money["_SURCHARGE"] = _clienthub_money_series(tmp_money, "SURCHARGE_CARBURANT")
+                        tmp_money["_PARKING"] = _clienthub_money_series(tmp_money, "PARKING")
+                        tmp_money["_PX_VENTE"] = _clienthub_money_series(tmp_money, "PX VENTE", "PX_VENTE", "PRIX VENTE")
+                        money_summary = (
+                            tmp_money.groupby("SOUS_SOCIETE", dropna=False)[["_PRIX_OFFICIEL", "_SURCHARGE", "_PARKING", "_PX_VENTE"]]
+                            .sum()
+                            .reset_index()
+                        )
+                        money_summary["Différence"] = money_summary["_PRIX_OFFICIEL"] + money_summary["_SURCHARGE"] + money_summary["_PARKING"] - money_summary["_PX_VENTE"]
+                        money_summary = money_summary.rename(columns={"_PX_VENTE": "PX VENTE", "_PARKING": "Parking", "_SURCHARGE": "Surcharge", "_PRIX_OFFICIEL": "Prix officiel"})
+                        sub_summary = sub_summary.merge(money_summary, on="SOUS_SOCIETE", how="left")
+                        for c in ["Prix officiel", "Surcharge", "Parking", "PX VENTE", "Différence"]:
+                            if c in sub_summary.columns:
+                                sub_summary[c] = sub_summary[c].fillna(0).map(lambda x: f"{float(x):.2f} €")
                     sub_summary = sub_summary.sort_values("Navettes", ascending=False)
                     st.dataframe(sub_summary, use_container_width=True, height=min(220, 38 + 35 * len(sub_summary)))
 
-                wanted = ["SOUS_SOCIETE", "DATE", "HEURE", "Unnamed: 8", "DESIGNATION", "Type Nav", "GO", "Num BDC", "NOM", "ADRESSE", "CP", "Localité", "PAIEMENT", "Caisse", "KM", "H TVA", "SURCHARGE_CARBURANT", "PARKING", "ATTENTE", "PEAGE", "ADM", "REMARQUE", "DEMANDEUR", "IMPUTATION", "FACTURE_ENVOYEE", "DATE_HEURE_YELLOW"]
+                if str(client_label).strip().upper() in {"FA", "CM", "LILLO", "AD"}:
+                    df_full["DIFFERENCE"] = (
+                        _clienthub_money_series(df_full, "H TVA", "HTVA")
+                        + _clienthub_money_series(df_full, "SURCHARGE_CARBURANT")
+                        + _clienthub_money_series(df_full, "PARKING")
+                        - _clienthub_money_series(df_full, "PX VENTE", "PX_VENTE", "PRIX VENTE")
+                    )
+                wanted = ["SOUS_SOCIETE", "DATE", "HEURE", "Unnamed: 8", "DESIGNATION", "Type Nav", "GO", "Num BDC", "NOM", "ADRESSE", "CP", "Localité", "PAIEMENT", "Caisse", "KM", "H TVA", "SURCHARGE_CARBURANT", "PARKING", "PX VENTE", "DIFFERENCE", "ATTENTE", "PEAGE", "ADM", "REMARQUE", "DEMANDEUR", "IMPUTATION", "FACTURE_ENVOYEE", "DATE_HEURE_YELLOW"]
                 cols = [c for c in wanted if c in df_full.columns]
                 view = df_full[cols].copy().fillna("")
                 st.dataframe(_clienthub_style_facture(view), use_container_width=True, height=420)
